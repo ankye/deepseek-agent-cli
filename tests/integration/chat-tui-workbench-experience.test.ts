@@ -30,11 +30,11 @@ describe("chat TUI workbench interaction experience", () => {
     await tui.afterTurn(chatState({ turns: 1, visibleReasoning: reasoningProjection() }));
     const snapshot = tui.snapshot();
 
-    assert.equal(lines.some((line) => line.startsWith("DeepSeek Workbench") && line.includes("layout=balanced")), true);
-    assert.equal(lines.some((line) => line.startsWith("Command |") && line.includes("/help")), true);
+    assert.equal(lines.some((line) => line.startsWith("Workbench [ready]") && line.includes("layout=balanced")), true);
+    assert.equal(lines.some((line) => line.startsWith("Input |") && line.includes("deepseek> _")), true);
     assert.deepEqual(inline, ["deepseek> "]);
     assert.equal(resultListFocus.kind, "focus");
-    assert.equal(resultListFocus.focusPanel, "result-list");
+    assert.equal(resultListFocus.focusPanel, "reasoning");
     assert.equal(reasoningFocus.kind, "focus");
     assert.equal(reasoningFocus.focusPanel, "reasoning");
     assert.equal(commandBar.state.workbench.commandBar.open, true);

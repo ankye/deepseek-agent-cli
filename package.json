@@ -29,6 +29,7 @@
     "acceptance:index": "node scripts/write-acceptance-index.mjs"
   },
   "devDependencies": {
+    "@fission-ai/openspec": "^1.4.0",
     "@types/node": "^22.15.3",
     "esbuild": "^0.28.0",
     "tsx": "^4.19.4",

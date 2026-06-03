@@ -122,7 +122,7 @@ function renderFullscreenWorkbench(workbench: ChatTuiWorkbench, columns: number,
 
 function headerLines(workbench: ChatTuiWorkbench, columns: number, rows: number): readonly string[] {
   const title = fitColumns(
-    ` DeepSeek Chat  ${workbench.commandBar.open ? "command" : "ready"}  focus:${workbench.focus.activePanel}`,
+    ` DeepSeek Workbench  ${workbench.commandBar.open ? "command" : "ready"}  focus:${workbench.focus.activePanel}`,
     "/ commands  Tab panels  Ctrl+C exit",
     columns
   );
@@ -263,9 +263,11 @@ function distributePanelHeights(totalRows: number, panelCount: number): readonly
 function renderExpandedWorkbench(workbench: ChatTuiWorkbench): readonly string[] {
   return [
     `Workbench [${workbenchModeLabel(workbench)}] | layout=${workbench.layout} | focus=${workbench.focus.activePanel}`,
+    ...statusTelemetryLines(workbench),
     `Main [transcript] | ${regionSummary(workbench, "transcript")}`,
     `Focus | active=${workbench.focus.activePanel} | previous=${workbench.focus.previousPanel ?? "none"}`,
     `Panels | ${panelSummaryText(workbench)}`,
+    ...reasoningSummaryLines(workbench),
     `Activity | ${activityText(workbench.activityFeed, 3)}`,
     `Keys | ${keyHintText(workbench)}`,
     `Input | ${suggestionText(workbench.commandBar, 4)}`
@@ -275,11 +277,25 @@ function renderExpandedWorkbench(workbench: ChatTuiWorkbench): readonly string[]
 function renderCompactWorkbench(workbench: ChatTuiWorkbench): readonly string[] {
   return [
     `Workbench [${workbenchModeLabel(workbench)}] | focus=${workbench.focus.activePanel}`,
+    ...statusTelemetryLines(workbench),
     `Main | ${regionSummary(workbench, "transcript")}`,
     activeAreaText(workbench),
     `Keys | ${keyHintText(workbench)}`,
     `Input | ${suggestionText(workbench.commandBar, 3)}`
   ];
+}
+
+function statusTelemetryLines(workbench: ChatTuiWorkbench): readonly string[] {
+  const telemetry = workbench.statusTelemetry;
+  if (!telemetry) return [];
+  return [
+    `Status | model=${telemetry.modelId} think=${telemetry.thinkingMode} cache=${cacheText(telemetry)} ctx=${telemetry.context.selectedTokens}/${telemetry.context.hardLimitTokens}`
+  ];
+}
+
+function reasoningSummaryLines(workbench: ChatTuiWorkbench): readonly string[] {
+  if (!workbench.reasoningRail.enabled) return [];
+  return [`Reasoning | ${reasoningText(workbench.reasoningRail, 3)}`];
 }
 
 function regionSummary(workbench: ChatTuiWorkbench, id: ChatTuiWorkbenchPanelId): string {

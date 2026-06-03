@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   CHAT_TUI_ALT_SCREEN_ENTER,
   CHAT_TUI_ALT_SCREEN_EXIT,
+  CHAT_TUI_CLEAR_HOME,
   CHAT_TUI_REPAINT_HOME
 } from "../../src/apps/cli/src/commands/chat-tui-workbench-renderer.js";
 import {
@@ -25,7 +26,7 @@ describe("professional TUI renderer golden replay", () => {
     });
     const tornDown = renderChatTuiFullscreenFrame({ workbench: state.workbench, phase: "teardown", rows: 24 });
 
-    assert.deepEqual(entered.chunks.slice(0, 2), [CHAT_TUI_ALT_SCREEN_ENTER, CHAT_TUI_REPAINT_HOME]);
+    assert.deepEqual(entered.chunks.slice(0, 2), [CHAT_TUI_ALT_SCREEN_ENTER, CHAT_TUI_CLEAR_HOME]);
     assert.equal(entered.lifecycle.alternateScreen, true);
     assert.equal(entered.lifecycle.cursorVisible, false);
     assert.equal(repainted.chunks[0], CHAT_TUI_REPAINT_HOME);
@@ -59,7 +60,7 @@ describe("professional TUI renderer golden replay", () => {
     ];
 
     assert.deepEqual(profiles.map((profile) => profile.rendererProfile), ["interactive", "plain", "plain", "json", "jsonl"]);
-    assert.deepEqual(profiles.map((profile) => profile.inputStrategy), ["line", "line", "scripted", "line", "line"]);
+    assert.deepEqual(profiles.map((profile) => profile.inputStrategy), ["raw", "line", "scripted", "line", "line"]);
     assert.equal(profiles.every((profile) => profile.rendererProfile !== "full-screen"), true);
     assert.equal(isChatTuiEnabled({ output: "text" }, profiles[0]!), true);
     assert.equal(profiles.slice(1).every((profile) => !isChatTuiEnabled({ output: profile.rendererProfile === "json" ? "json" : profile.rendererProfile === "jsonl" ? "jsonl" : "text" }, profile)), true);

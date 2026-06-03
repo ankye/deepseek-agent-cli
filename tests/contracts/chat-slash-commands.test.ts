@@ -98,9 +98,9 @@ describe("chat slash commands", () => {
       { createRuntime: async () => ({ deps: harness.deps, kernel: harness.kernel }) }
     );
 
-    assert.equal(lines.some((line) => line.startsWith("DeepSeek Workbench") && line.includes("focus=transcript")), true);
-    assert.equal(lines.some((line) => line.includes("focus keys — Tab/Shift+Tab move panels")), true);
-    assert.equal(lines.some((line) => line.includes("plugins — native metadata shelf")), true);
+    assert.equal(lines.some((line) => line.startsWith("Workbench [ready]") && line.includes("focus=transcript")), true);
+    assert.equal(lines.some((line) => line.includes("Keys | / commands | Tab next panel")), true);
+    assert.equal(lines.some((line) => line.includes("Panels |") && line.includes("plugins=ready")), true);
     assert.equal(inline.filter((chunk) => chunk === "deepseek> ").length >= 3, true, `expected prompt redraws, got ${JSON.stringify(inline)}`);
     assert.equal(harness.modelCallCount, 1);
   });

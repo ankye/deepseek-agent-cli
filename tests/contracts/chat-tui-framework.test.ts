@@ -57,10 +57,10 @@ describe("chat TUI framework", () => {
     assert.equal(state.frameworkId, CHAT_TUI_FRAMEWORK_ID);
     assert.equal(state.workbench.layout, "balanced");
     assert.equal(state.workbench.regions.some((region) => region.id === "command-bar" && region.visible), true);
-    assert.equal(startup.some((line) => line.startsWith("DeepSeek Workbench") && line.includes("focus=transcript")), true);
-    assert.equal(startup.some((line) => line.startsWith("Command |") && line.includes("/help")), true);
+    assert.equal(startup.some((line) => line.startsWith("Workbench [ready]") && line.includes("focus=transcript")), true);
+    assert.equal(startup.some((line) => line.startsWith("Input |") && line.includes("deepseek> _")), true);
     assert.equal(startup.every((line) => line.length <= 100), true);
-    assert.equal(status.some((line) => line.startsWith("Plugins |") && line.includes("governed-descriptors")), true);
+    assert.equal(status.some((line) => line.startsWith("Panels |") && line.includes("plugins=ready")), true);
   });
 
   it("renders bounded cache-aware statusline telemetry", () => {
@@ -184,7 +184,7 @@ describe("chat TUI framework", () => {
 
     assert.equal(resultList.ok, true);
     assert.equal(resultList.kind, "focus");
-    assert.equal(resultList.focusPanel, "result-list");
+    assert.equal(resultList.focusPanel, "reasoning");
     assert.equal(reasoning.ok, true);
     assert.equal(reasoning.kind, "focus");
     assert.equal(reasoning.focusPanel, "reasoning");
@@ -404,7 +404,7 @@ describe("chat TUI framework", () => {
     const lines = renderChatTuiStartup(state);
 
     assert.equal(state.workbench.layout, "compact");
-    assert.equal(lines.filter((line) => line.startsWith("DeepSeek Workbench")).length, 1);
+    assert.equal(lines.filter((line) => line.startsWith("Workbench [ready]")).length, 1);
     assert.equal(lines.length <= 7, true);
     assert.equal(lines.every((line) => line.length <= 100), true);
   });

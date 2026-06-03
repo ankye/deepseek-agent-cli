@@ -105,7 +105,7 @@ describe("professional vi TUI contracts", () => {
     assert.equal(lines.some((line) => line.includes("+ Reasoning")), true);
     assert.equal(lines.some((line) => line.includes("+ Inspector")), true);
     assert.equal(lines.some((line) => line.includes("+ Plugins")), true);
-    assert.equal(lines.some((line) => line.includes("+ Command")), true);
+    assert.equal(lines.some((line) => line.includes("+ Input")), true);
     assert.equal(lines.some((line) => line.includes("No assistant turn is streaming yet.")), true);
   });
 

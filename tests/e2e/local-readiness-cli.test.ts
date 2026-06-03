@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCli } from "../../src/apps/cli/src/index.js";
@@ -67,7 +67,11 @@ describe("local readiness CLI", () => {
       assert.equal(parsed.command, "init");
       assert.equal(parsed.metadata?.initialized, false);
       assert.equal(parsed.metadata?.initializedThisRun, true);
-      assert.equal(parsed.metadata?.workspaceMetadataPath, configPath);
+      const workspaceMetadataPath = parsed.metadata?.workspaceMetadataPath;
+      if (typeof workspaceMetadataPath !== "string") {
+        assert.fail("expected workspace metadata path");
+      }
+      assert.equal(await realpath(workspaceMetadataPath), await realpath(configPath));
       assert.equal(document.values?.model, "deepseek-v4-flash");
       assert.equal(document.values?.telemetry, "disabled");
       assert.equal(JSON.stringify(document).includes("sk-live-secret-value"), false);
