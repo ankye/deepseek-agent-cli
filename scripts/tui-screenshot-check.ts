@@ -20,6 +20,8 @@ const requiredFrameText = [
   "+ Plugins",
   "+ Input",
   "No assistant turn is streaming yet.",
+  "No active turn",
+  "Current selection",
   "Keys | / commands",
   "Mode Ready"
 ];

@@ -393,6 +393,18 @@ describe("chat TUI workbench interactions", () => {
     assert.ok(!commandFrame.includes("mode slash"));
   });
 
+  it("renders full-screen side-rail empty states without clipped internal copy", () => {
+    const tui = createTuiWithProfile(createFullScreenTerminalProfile());
+    const frame = renderChatTuiFullscreenFrame({ workbench: tui.snapshot().workbench, rows: 24, phase: "repaint" }).chunks.join("\n");
+
+    assert.ok(frame.includes("No active turn"));
+    assert.ok(frame.includes("Reasoning appears during runs."));
+    assert.ok(frame.includes("Current selection"));
+    assert.ok(frame.includes("Result | Command cancel"));
+    assert.ok(!frame.includes("Reasoning details appear here during..."));
+    assert.ok(!frame.includes("result-list: command cancel"));
+  });
+
   it("repaints full-screen frames instead of line-mode prompt fragments", async () => {
     const input = createRawTtyInput(["/", "h", "\x03"]);
     const lines: string[] = [];

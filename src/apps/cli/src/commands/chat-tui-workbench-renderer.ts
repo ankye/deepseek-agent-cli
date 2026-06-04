@@ -201,8 +201,8 @@ function reasoningLines(rail: ChatTuiReasoningRail): readonly string[] {
   if (!rail.enabled) {
     return [
       "Idle",
-      reasoningStatusLabel(rail),
-      "Reasoning details appear here during a turn."
+      rail.recordCount > 0 ? "Ready for review" : "No active turn",
+      "Reasoning appears during runs."
     ];
   }
   const steps = rail.steps.map((step) => {
@@ -217,12 +217,23 @@ function reasoningLines(rail: ChatTuiReasoningRail): readonly string[] {
 }
 
 function inspectorLines(inspector: ChatTuiInspectorState): readonly string[] {
-  if (inspector.items.length === 0) return ["Empty", "Targets and evidence appear here."];
+  if (inspector.items.length === 0) return ["No selection", "Targets and evidence appear here."];
   return [
-    inspector.title,
-    ...inspector.items.map((item) => `${item.source}: ${item.kind} ${item.label}`),
+    inspectorTitle(inspector.title),
+    ...inspector.items.map((item) => `${inspectorSourceLabel(item.source)} | ${titleCase(item.kind)} ${item.label}`),
     ...(inspector.overflowCount > 0 ? [`+${inspector.overflowCount} more targets`] : [])
   ];
+}
+
+function inspectorTitle(title: string): string {
+  if (title === "Active target") return "Current selection";
+  return title;
+}
+
+function inspectorSourceLabel(source: ChatTuiInspectorState["items"][number]["source"]): string {
+  if (source === "result-list") return "Result";
+  if (source === "active-target") return "Selection";
+  return "Evidence";
 }
 
 function pluginLines(shelf: ChatTuiPluginShelf): readonly string[] {
@@ -519,6 +530,14 @@ function boundLine(line: string, maxWidth: number): string {
 
 function boundSegment(text: string, maxWidth: number): string {
   return boundLine(text.replace(/\s+/g, " ").trim(), maxWidth);
+}
+
+function titleCase(text: string): string {
+  return text
+    .split(/[\s-]+/)
+    .filter(Boolean)
+    .map((part) => `${part.slice(0, 1).toUpperCase()}${part.slice(1)}`)
+    .join(" ");
 }
 
 function formatInputAnchor(text: string, maxColumns?: number): string {
