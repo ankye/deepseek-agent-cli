@@ -3603,6 +3603,55 @@ describe("cli host adapter", () => {
     });
   });
 
+  it("passes live GLM provider selection and credentials to the isolated evaluation child process", async () => {
+    await withTempCwd("deepseek-cli-eval-glm-env-", async () => {
+      await writeFile(".env", "GLM_ANTHROPIC_API_KEY=fixture-glm-eval-secret\n", "utf8");
+      await mkdir("tests/evaluation", { recursive: true });
+      await writeFile("tests/evaluation/task-catalog.json", JSON.stringify({
+        catalogVersion: "test-catalog",
+        tasks: [{
+          taskId: "eval.webpage.generation",
+          title: "Generate webpage",
+          category: "webpage-generation",
+          fixtureId: "fixture.web",
+          workspaceSnapshotId: "snapshot.web",
+          promptDigest: "sha256:web",
+          promptSummary: "Create local webpage files.",
+          allowedCapabilityProfile: "local-create-web-assets",
+          timeBudgetMs: 1000,
+          checkCommands: ["node scripts/check-webpage-generation.mjs tests/evaluation/generated-webpage"],
+          scoringRubricId: "rubric.web",
+          mode: "full"
+        }]
+      }), "utf8");
+      const platform = new FakeWebpageAgentPlatform();
+      const evaluationOptions = {
+        mode: "full" as const,
+        dryRun: false,
+        live: true,
+        baselineId: "deepseek-cli",
+        compareBaselineIds: ["deepseek-cli"],
+        allowExternalBaseline: false,
+        baselineArgs: [],
+        executeTaskId: "eval.webpage.generation",
+        extraArgs: [],
+        modelProvider: "glm" as const,
+        model: "glm-5.1",
+        platform
+      };
+      const summary = await collectCliEvaluation(evaluationOptions);
+      const deepseekCommand = platform.executedCommands.find((command) => command.command === process.execPath);
+
+      assert.equal(summary.taskRuns.find((run) => run.task.taskId === "eval.webpage.generation")?.baseline.baselineId, "deepseek-cli");
+      assert.equal(deepseekCommand?.args.includes("--provider"), true);
+      assert.equal(deepseekCommand?.args.includes("glm"), true);
+      assert.equal(deepseekCommand?.args.includes("--model"), true);
+      assert.equal(deepseekCommand?.args.includes("glm-5.1"), true);
+      assert.equal(deepseekCommand?.env?.GLM_ANTHROPIC_API_KEY, "fixture-glm-eval-secret");
+      assert.equal(JSON.stringify(summary).includes("fixture-glm-eval-secret"), false);
+    });
+  });
+
   it("accepts diagnostics evaluate --live without unsupported-argument diagnostics", async () => {
     const lines: string[] = [];
     await runCli([

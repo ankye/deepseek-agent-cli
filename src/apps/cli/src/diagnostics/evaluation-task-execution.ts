@@ -1,5 +1,4 @@
 import { join } from "node:path";
-import { deepSeekLiveCredentialProcessEnv } from "@deepseek/credential-auth-management";
 import type {
   CliEvaluationBaselineDefinition,
   CliEvaluationDiagnostic,
@@ -10,6 +9,7 @@ import type {
   PlatformRuntime
 } from "@deepseek/platform-contracts";
 import { CLI_TASK_EVALUATION_SCHEMA_VERSION } from "@deepseek/platform-contracts";
+import { evaluationLiveCredentialEnv, evaluationModelSelectionArgs } from "./evaluation-provider-selection.js";
 import { generatedArtifactMetrics } from "./generated-artifacts.js";
 import {
   emptyMetrics,
@@ -380,10 +380,11 @@ async function baselineCommandForExecution(
     if (options.live) {
       args.push("--live", "--tool-projection", "read-write");
     }
+    args.push(...evaluationModelSelectionArgs(options));
     return {
       command: process.execPath,
       args,
-      ...(options.live ? { env: await liveCredentialEnv(platform) } : {})
+      ...(options.live ? { env: await evaluationLiveCredentialEnv(platform, options.modelProvider) } : {})
     };
   }
   if (baselineId === "codex") {
@@ -723,10 +724,6 @@ async function invalidRun(
     evidencePaths: [workspaceRoot],
     redaction: { class: "internal", fields: ["task.promptDigest", "checks.command", "evidencePaths", "diagnostics.metadata"] }
   };
-}
-
-async function liveCredentialEnv(platform: PlatformRuntime): Promise<JsonObject> {
-  return Object.fromEntries(Object.entries(await deepSeekLiveCredentialProcessEnv(platform)).filter((entry): entry is [string, string] => typeof entry[1] === "string" && entry[1].trim().length > 0));
 }
 
 async function isolatedWorkspaceRoot(platform: PlatformRuntime, runId: string): Promise<string> {

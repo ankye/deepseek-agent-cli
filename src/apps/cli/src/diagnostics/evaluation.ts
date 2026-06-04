@@ -39,6 +39,8 @@ export interface CliEvaluationOptions {
   readonly codexCommand?: string;
   readonly claudeCommand?: string;
   readonly executeTaskId?: string;
+  readonly modelProvider?: "deepseek" | "glm";
+  readonly model?: string;
   readonly baselineArgs: readonly string[];
   readonly extraArgs: readonly string[];
   readonly platform?: PlatformRuntime;

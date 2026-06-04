@@ -120,6 +120,12 @@ CLI task-completion evaluation 必须包含带本地产物校验的 deterministi
 - **THEN** the task run is not marked solved; success requires the generated local HTML/CSS/JS artifacts to pass the webpage checker
 - **中文** 当 live DeepSeek 模型返回文本但没有创建有效本地网页产物时，task run 不得标记为 solved；成功必须要求生成的本地 HTML/CSS/JS 产物通过 webpage checker。
 
+#### Scenario: Live evaluation forwards GLM provider selection / Live Evaluation 透传 GLM Provider 选择
+
+- **WHEN** `deepseek diagnostics evaluate --live --full --execute-task eval.webpage.generation --compare-baseline deepseek-cli --provider glm --model glm-5.1` runs with GLM credentials available
+- **THEN** the isolated `deepseek run` subprocess receives `--provider glm --model glm-5.1`, uses the live path, and receives only redacted/presence-safe credential evidence in diagnostics output
+- **中文** 当带可用 GLM credentials 运行 `deepseek diagnostics evaluate --live --full --execute-task eval.webpage.generation --compare-baseline deepseek-cli --provider glm --model glm-5.1` 时，隔离的 `deepseek run` 子进程必须收到 `--provider glm --model glm-5.1`，使用 live path，并且 diagnostics output 只包含脱敏或 presence-safe 的 credential evidence。
+
 ### Requirement: CLI Evaluation Records Prompt Assembly Evidence / CLI 评估记录 Prompt Assembly 证据
 
 CLI task-completion evaluation SHALL record prompt assembly evidence for DeepSeek CLI runs so task outcomes can be correlated with prompt structure, context inclusion, tool projection, and provider readiness.
@@ -434,4 +440,3 @@ CLI task-completion evaluation 必须跨 project rules、tools and permissions�
 - **WHEN** a run reports delivery capability score `1.0`
 - **THEN** every required layer for that evaluated scope has passed evidence or is explicitly not applicable
 - **中文** 当某次运行报告 delivery capability score `1.0` 时，被评估范围内的每个 required layer 都必须具备 passed evidence 或明确 not applicable。
-

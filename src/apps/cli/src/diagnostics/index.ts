@@ -327,6 +327,8 @@ async function evaluateDiagnostics(options: CliOptions): Promise<CliDiagnosticsR
     ...(typeof options.diagnosticsInput?.codexCommand === "string" ? { codexCommand: options.diagnosticsInput.codexCommand } : {}),
     ...(typeof options.diagnosticsInput?.claudeCommand === "string" ? { claudeCommand: options.diagnosticsInput.claudeCommand } : {}),
     ...(typeof options.diagnosticsInput?.executeTask === "string" ? { executeTaskId: options.diagnosticsInput.executeTask } : {}),
+    ...(options.modelProvider ? { modelProvider: options.modelProvider } : {}),
+    ...(options.model ? { model: options.model } : {}),
     baselineArgs: Array.isArray(options.diagnosticsInput?.baselineArgs)
       ? options.diagnosticsInput.baselineArgs.filter((item): item is string => typeof item === "string")
       : [],
