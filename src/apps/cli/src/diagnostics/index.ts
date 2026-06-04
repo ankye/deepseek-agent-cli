@@ -23,6 +23,8 @@ import { activationEvidenceText, missingActivationEvidence } from "../commands/i
 import { collectReleaseReadinessEvidence, diagnosticPitIds, diagnosticsSchemaVersion } from "./release-evidence.js";
 import { refreshAcceptanceEvidence, refreshStepRecord } from "./refresh-evidence.js";
 import { collectCliEvaluation, evaluationJsonLines } from "./evaluation.js";
+import type { CliEvaluationOptions } from "./evaluation.js";
+import { buildEvaluationDeliveryCapabilityEvidence } from "./evaluation-delivery-evidence.js";
 import { collectModeMatrix } from "./mode-matrix.js";
 import type { CliModeMatrixSummary } from "./mode-matrix.js";
 import { collectDeliveryCapabilitySummary } from "./delivery-capability.js";
@@ -314,7 +316,7 @@ async function refreshDiagnostics(options: CliOptions): Promise<CliDiagnosticsRe
 }
 
 async function evaluateDiagnostics(options: CliOptions): Promise<CliDiagnosticsResult> {
-  const evaluation = await collectCliEvaluation({
+  const evaluationOptions: CliEvaluationOptions = {
     mode: options.diagnosticsInput?.full === true ? "full" : "smoke",
     dryRun: options.diagnosticsInput?.dryRun === true,
     live: options.live === true,
@@ -335,7 +337,8 @@ async function evaluateDiagnostics(options: CliOptions): Promise<CliDiagnosticsR
     extraArgs: Array.isArray(options.diagnosticsInput?.extraArgs)
       ? options.diagnosticsInput.extraArgs.filter((item): item is string => typeof item === "string")
       : []
-  });
+  };
+  const evaluation = await collectCliEvaluation(evaluationOptions);
   const modeMatrix = await collectModeMatrix();
   const overallDeliveryCapability = collectDeliveryCapabilitySummary(evaluation, modeMatrix);
   if (
@@ -344,7 +347,7 @@ async function evaluateDiagnostics(options: CliOptions): Promise<CliDiagnosticsR
     options.diagnosticsInput?.executeTask === "all" &&
     overallDeliveryCapability
   ) {
-    await writeEvaluationDeliveryCapabilityEvidence(evaluation, modeMatrix, overallDeliveryCapability);
+    await writeEvaluationDeliveryCapabilityEvidence(evaluation, overallDeliveryCapability, evaluationOptions, options.output);
   }
   return {
     schemaVersion: diagnosticsSchemaVersion,
@@ -361,105 +364,12 @@ async function evaluateDiagnostics(options: CliOptions): Promise<CliDiagnosticsR
 
 async function writeEvaluationDeliveryCapabilityEvidence(
   evaluation: CliEvaluationComparisonSummary,
-  modeMatrix: CliModeMatrixSummary,
-  overallDeliveryCapability: CliDeliveryCapabilitySummary
+  overallDeliveryCapability: CliDeliveryCapabilitySummary,
+  evaluationOptions: CliEvaluationOptions,
+  outputMode: AgentLoopOutputMode
 ): Promise<void> {
   const outputPath = join(process.cwd(), "tests", "acceptance", "latest", "overall-delivery-capability-score.json");
-  const evidence = {
-    schemaVersion: "1.0.0",
-    kind: "cli.overall-delivery-capability-score.evidence",
-    generatedAt: new Date().toISOString(),
-    command: "npx tsx src/apps/cli/src/index.ts diagnostics evaluate --full --execute-task all --live --output text",
-    status: overallDeliveryCapability.status === "pass" ? "pass" : "blocked",
-    scoringMethod: overallDeliveryCapability.scoringMethod,
-    score: overallDeliveryCapability.score,
-    targetScore: overallDeliveryCapability.targetScore,
-    unfinishedPenaltyPerItem: overallDeliveryCapability.unfinishedPenaltyPerItem,
-    unfinishedTargetCount: overallDeliveryCapability.unfinishedTargetCount,
-    unfinishedTargetIds: overallDeliveryCapability.unfinishedTargetIds,
-    passedTargetCount: overallDeliveryCapability.passedTargetCount,
-    totalTargetCount: overallDeliveryCapability.totalTargetCount,
-    dimensions: overallDeliveryCapability.dimensions,
-    toolFamily: {
-      score: overallDeliveryCapability.toolFamilyScore,
-      passedFamilyCount: overallDeliveryCapability.toolFamilyPassedCount,
-      totalFamilyCount: overallDeliveryCapability.toolFamilyTotalCount,
-      gate: overallDeliveryCapability.toolFamilyGatePassed ? "pass" : "blocked",
-      fakeCoveredFamilyCount: evaluation.toolFamilyParityMatrix?.fakeCoveredFamilyCount,
-      replayedCoveredFamilyCount: evaluation.toolFamilyParityMatrix?.replayedCoveredFamilyCount,
-      liveCoveredFamilyCount: evaluation.toolFamilyParityMatrix?.liveCoveredFamilyCount,
-      taskCoveredFamilyCount: evaluation.toolFamilyParityMatrix?.taskCoveredFamilyCount,
-      safetyCoveredFamilyCount: evaluation.toolFamilyParityMatrix?.safetyCoveredFamilyCount,
-      providerNativeSupportedFamilyCount: evaluation.toolFamilyParityMatrix?.providerNativeSupportedFamilyCount,
-      sourceEvidencePath: "tests/acceptance/latest/live-tool-coverage.json"
-    },
-    modeMatrix: {
-      score: overallDeliveryCapability.modeScore,
-      completedModeCount: overallDeliveryCapability.modeCompleteCount,
-      totalModeCount: overallDeliveryCapability.modeTotalCount,
-      gate: overallDeliveryCapability.modeGatePassed ? "pass" : "blocked",
-      blockingModeIds: overallDeliveryCapability.blockingModeIds
-    },
-    packageScorecards: {
-      score: overallDeliveryCapability.packageScore,
-      passedPackageCount: overallDeliveryCapability.packagePassedCount,
-      totalPackageCount: overallDeliveryCapability.packageTotalCount,
-      gate: overallDeliveryCapability.packageGatePassed ? "pass" : "blocked",
-      blockingPackageIds: overallDeliveryCapability.blockingPackageIds
-    },
-    evaluationTasks: {
-      score: overallDeliveryCapability.evaluationTaskScore,
-      solvedTaskCount: overallDeliveryCapability.evaluationTaskSolvedCount,
-      totalTaskCount: overallDeliveryCapability.evaluationTaskTotalCount,
-      gate: overallDeliveryCapability.evaluationTaskGatePassed ? "pass" : "blocked",
-      blockingTaskIds: overallDeliveryCapability.blockingEvaluationTaskIds,
-      taskRuns: evaluation.taskRuns
-        .filter((run) => run.baseline.baselineId === "deepseek-cli")
-        .map((run) => ({
-          taskId: run.task.taskId,
-          outcome: run.outcome,
-          checkPassRate: run.metrics.checkPassRate,
-          retryCount: run.metrics.retryCount,
-          evidenceManifestStatus: run.metrics.evidenceManifestStatus,
-          unsupportedClaimCount: run.metrics.unsupportedClaimCount,
-          hallucinatedCommandCount: run.metrics.hallucinatedCommandCount,
-          repairMetricsAvailability: run.metrics.repairMetricsAvailability,
-          repairActivationCount: run.metrics.repairActivationCount,
-          repairSuccessCount: run.metrics.repairSuccessCount
-        }))
-    },
-    deepSeekApi: {
-      score: overallDeliveryCapability.deepSeekApiScore,
-      passedCount: overallDeliveryCapability.deepSeekApiPassedCount,
-      totalCount: overallDeliveryCapability.deepSeekApiTotalCount,
-      gate: overallDeliveryCapability.deepSeekApiGatePassed ? "pass" : "blocked"
-    },
-    memory: {
-      score: overallDeliveryCapability.memoryScore,
-      passedCount: overallDeliveryCapability.memoryPassedCount,
-      totalCount: overallDeliveryCapability.memoryTotalCount,
-      gate: overallDeliveryCapability.memoryGatePassed ? "pass" : "blocked"
-    },
-    cacheObservability: {
-      score: overallDeliveryCapability.cacheObservabilityScore,
-      passedCount: overallDeliveryCapability.cacheObservabilityPassedCount,
-      totalCount: overallDeliveryCapability.cacheObservabilityTotalCount,
-      gate: overallDeliveryCapability.cacheObservabilityGatePassed ? "pass" : "blocked"
-    },
-    blockingCapabilityIds: overallDeliveryCapability.blockingCapabilityIds,
-    calculation: `max(0, 1 - ${overallDeliveryCapability.unfinishedTargetCount} unfinished targets * ${overallDeliveryCapability.unfinishedPenaltyPerItem})`,
-    redaction: {
-      class: "internal",
-      fields: [
-        "modeMatrix.blockingModeIds",
-        "packageScorecards.blockingPackageIds",
-        "evaluationTasks.blockingTaskIds",
-        "dimensions.blockingIds",
-        "blockingCapabilityIds",
-        "unfinishedTargetIds"
-      ]
-    }
-  };
+  const evidence = buildEvaluationDeliveryCapabilityEvidence(evaluation, overallDeliveryCapability, evaluationOptions, outputMode);
   const platform = new NodePlatformRuntime();
   await platform.ensureDirectory(join(process.cwd(), "tests", "acceptance", "latest"));
   await platform.writeFile(outputPath, `${JSON.stringify(evidence, null, 2)}\n`);

@@ -13,6 +13,9 @@ import { DurablePermanentMemoryProvider, InMemoryLosslessContextManager, InMemor
 import { chatPageIndexPagesFromSnapshot, explainChatPageIndexRecallItem, markStalePageIndexPagesAfterWorkspaceEdits, markStalePageIndexPagesFromWorkspaceWatermark, recordChatPageIndexTurn, renderChatPageIndexRecallExplain, resolveChatPageIndexRecall } from "../src/commands/pageindex.js";
 import { createChatPaletteState } from "../src/commands/palette-state.js";
 import { collectCliEvaluation } from "../src/diagnostics/evaluation.js";
+import { collectDeliveryCapabilitySummary } from "../src/diagnostics/delivery-capability.js";
+import { buildEvaluationDeliveryCapabilityEvidence } from "../src/diagnostics/evaluation-delivery-evidence.js";
+import { collectModeMatrix } from "../src/diagnostics/mode-matrix.js";
 import { refreshAcceptanceEvidence } from "../src/diagnostics/refresh-evidence.js";
 import {
   cliUsageLines,
@@ -3671,6 +3674,62 @@ describe("cli host adapter", () => {
       assert.equal(deepseekCommand?.env?.GLM_ANTHROPIC_API_KEY, "fixture-glm-eval-secret");
       assert.equal(deepseekCommand?.env?.DEEPSEEK_CLI_LAUNCH_CWD, process.cwd());
       assert.equal(JSON.stringify(summary).includes("fixture-glm-eval-secret"), false);
+    });
+  });
+
+  it("records GLM provider invocation in overall delivery score evidence", async () => {
+    await withTempCwd("deepseek-cli-eval-glm-score-", async () => {
+      await writeFile(".env", "GLM_ANTHROPIC_API_KEY=fixture-glm-score-secret\n", "utf8");
+      await mkdir("tests/evaluation", { recursive: true });
+      await writeFile("tests/evaluation/task-catalog.json", JSON.stringify({
+        catalogVersion: "test-catalog",
+        tasks: [{
+          taskId: "eval.webpage.generation",
+          title: "Generate webpage",
+          category: "webpage-generation",
+          fixtureId: "fixture.web",
+          workspaceSnapshotId: "snapshot.web",
+          promptDigest: "sha256:web",
+          promptSummary: "Create local webpage files.",
+          allowedCapabilityProfile: "local-create-web-assets",
+          timeBudgetMs: 1000,
+          checkCommands: ["node scripts/check-webpage-generation.mjs tests/evaluation/generated-webpage"],
+          scoringRubricId: "rubric.web",
+          mode: "full"
+        }]
+      }), "utf8");
+      const platform = new FakeWebpageAgentPlatform();
+      const evaluationOptions = {
+        mode: "full" as const,
+        dryRun: false,
+        live: true,
+        baselineId: "deepseek-cli",
+        compareBaselineIds: ["deepseek-cli"],
+        allowExternalBaseline: false,
+        baselineArgs: [],
+        executeTaskId: "all",
+        extraArgs: [],
+        modelProvider: "glm" as const,
+        model: "glm-5.1",
+        platform
+      };
+      const evaluation = await collectCliEvaluation(evaluationOptions);
+      const modeMatrix = await collectModeMatrix();
+      const delivery = collectDeliveryCapabilitySummary(evaluation, modeMatrix);
+      assert.ok(delivery);
+
+      const evidence = buildEvaluationDeliveryCapabilityEvidence(evaluation, delivery, evaluationOptions, "json");
+      const serialized = JSON.stringify(evidence);
+      const invocation = evidence.invocation as { provider?: string; model?: string; live?: boolean; baselines?: readonly string[] } | undefined;
+
+      assert.equal(invocation?.provider, "glm");
+      assert.equal(invocation?.model, "glm-5.1");
+      assert.equal(invocation?.live, true);
+      assert.deepEqual(invocation?.baselines, ["deepseek-cli"]);
+      assert.equal(String(evidence.command).includes("--provider glm"), true);
+      assert.equal(String(evidence.command).includes("--model glm-5.1"), true);
+      assert.equal(String(evidence.command).includes("--output json"), true);
+      assert.equal(serialized.includes("fixture-glm-score-secret"), false);
     });
   });
 

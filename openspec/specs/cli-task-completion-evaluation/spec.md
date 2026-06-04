@@ -4,7 +4,6 @@
 Define CLI task completion evaluation requirements for measuring task outcomes, evidence quality, correction behavior, and delivery capability.
 
 定义 CLI task completion evaluation 对任务结果、evidence quality、correction behavior 与交付能力衡量的要求。
-
 ## Requirements
 ### Requirement: CLI Evaluation Defines Repeatable Task Completion Protocol / CLI 评估定义可重复任务完成协议
 
@@ -70,7 +69,14 @@ The system SHALL write evaluation summaries and per-task records as redacted, ma
 
 - **WHEN** an evaluation run completes
 - **THEN** it writes a JSON summary, JSONL task records, bounded sanitized output snippets, patch metadata, and check outputs under stable local evidence paths, without ANSI cursor state, raw secrets, or unbounded transcripts
-- **中文** 当 evaluation run 完成时，它必须在稳定本地 evidence paths 下写入 JSON summary、JSONL task records、bounded sanitized output snippets、patch metadata 与 check outputs，且不得包含 ANSI cursor state、raw secrets 或 unbounded transcripts。
+- **中文** 当 evaluation run 完成时，它必须在稳定本地 evidence paths 下写入 JSON summary、JSONL task records、有界脱敏输出片段、patch metadata 与 check outputs，且不得包含 ANSI cursor state、raw secrets 或 unbounded transcripts。
+
+#### Scenario: Overall score evidence records provider invocation / 总分证据记录 Provider 调用
+
+- **WHEN** `deepseek diagnostics evaluate --full --execute-task all --live --provider glm --model glm-5.1 --output json` writes `tests/acceptance/latest/overall-delivery-capability-score.json`
+- **THEN** the evidence includes a redacted invocation record with `provider=glm`, `model=glm-5.1`, `live=true`, selected baselines, and a reproducible command string containing the provider/model flags
+- **AND** the evidence does not include raw credential values
+- **中文** 当 `deepseek diagnostics evaluate --full --execute-task all --live --provider glm --model glm-5.1 --output json` 写入 `tests/acceptance/latest/overall-delivery-capability-score.json` 时，证据必须包含脱敏 invocation record，记录 `provider=glm`、`model=glm-5.1`、`live=true`、已选择 baselines，以及包含 provider/model flags 的可复现 command string；同时证据不得包含 raw credential values。
 
 ### Requirement: CLI Evaluation Can Probe Explicit External Baselines / CLI 评估可探测显式外部 Baseline
 
@@ -470,3 +476,4 @@ CLI task-completion evaluation 必须跨 project rules、tools and permissions�
 - **WHEN** a run reports delivery capability score `1.0`
 - **THEN** every required layer for that evaluated scope has passed evidence or is explicitly not applicable
 - **中文** 当某次运行报告 delivery capability score `1.0` 时，被评估范围内的每个 required layer 都必须具备 passed evidence 或明确 not applicable。
+

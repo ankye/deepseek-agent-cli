@@ -1,8 +1,28 @@
 {
   "schemaVersion": "1.0.0",
   "kind": "cli.overall-delivery-capability-score.evidence",
-  "generatedAt": "2026-05-18T00:02:44.841Z",
-  "command": "npx tsx src/apps/cli/src/index.ts diagnostics evaluate --full --execute-task all --live --output text",
+  "generatedAt": "2026-06-04T16:16:28.590Z",
+  "command": "npx tsx src/apps/cli/src/index.ts diagnostics evaluate --full --execute-task all --live --compare-baseline deepseek-cli --provider glm --model glm-5.1 --output json",
+  "invocation": {
+    "schemaVersion": "1.0.0",
+    "kind": "cli.evaluation.invocation",
+    "mode": "full",
+    "live": true,
+    "dryRun": false,
+    "executeTask": "all",
+    "provider": "glm",
+    "providerSource": "explicit",
+    "model": "glm-5.1",
+    "baselineId": "deepseek-cli",
+    "baselines": [
+      "deepseek-cli"
+    ],
+    "output": "json",
+    "redaction": {
+      "class": "internal",
+      "fields": []
+    }
+  },
   "status": "pass",
   "scoringMethod": "unfinished-penalty",
   "score": 1,
@@ -10,8 +30,8 @@
   "unfinishedPenaltyPerItem": 0.1,
   "unfinishedTargetCount": 0,
   "unfinishedTargetIds": [],
-  "passedTargetCount": 153,
-  "totalTargetCount": 153,
+  "passedTargetCount": 158,
+  "totalTargetCount": 158,
   "dimensions": [
     {
       "dimensionId": "tool-family",
@@ -47,8 +67,8 @@
       "dimensionId": "package",
       "score": 1,
       "targetScore": 0.9,
-      "passedCount": 29,
-      "totalCount": 29,
+      "passedCount": 34,
+      "totalCount": 34,
       "status": "pass",
       "blockingIds": [],
       "redaction": {
@@ -141,8 +161,8 @@
   },
   "packageScorecards": {
     "score": 1,
-    "passedPackageCount": 29,
-    "totalPackageCount": 29,
+    "passedPackageCount": 34,
+    "totalPackageCount": 34,
     "gate": "pass",
     "blockingPackageIds": []
   },
@@ -160,7 +180,7 @@
         "retryCount": 0,
         "evidenceManifestStatus": "passed",
         "repairMetricsAvailability": "available",
-        "repairActivationCount": 2,
+        "repairActivationCount": 0,
         "repairSuccessCount": 0
       },
       {
@@ -170,7 +190,7 @@
         "retryCount": 0,
         "evidenceManifestStatus": "passed",
         "repairMetricsAvailability": "available",
-        "repairActivationCount": 2,
+        "repairActivationCount": 0,
         "repairSuccessCount": 0
       },
       {
@@ -180,8 +200,8 @@
         "retryCount": 0,
         "evidenceManifestStatus": "passed",
         "repairMetricsAvailability": "available",
-        "repairActivationCount": 1,
-        "repairSuccessCount": 1
+        "repairActivationCount": 0,
+        "repairSuccessCount": 0
       },
       {
         "taskId": "eval.context.recall",
@@ -200,7 +220,7 @@
         "retryCount": 0,
         "evidenceManifestStatus": "passed",
         "repairMetricsAvailability": "available",
-        "repairActivationCount": 0,
+        "repairActivationCount": 2,
         "repairSuccessCount": 0
       },
       {
@@ -234,8 +254,8 @@
         "unsupportedClaimCount": 0,
         "hallucinatedCommandCount": 0,
         "repairMetricsAvailability": "available",
-        "repairActivationCount": 1,
-        "repairSuccessCount": 1
+        "repairActivationCount": 0,
+        "repairSuccessCount": 0
       },
       {
         "taskId": "eval.coding.failing-first-typecheck",
@@ -244,8 +264,8 @@
         "retryCount": 0,
         "evidenceManifestStatus": "passed",
         "repairMetricsAvailability": "available",
-        "repairActivationCount": 2,
-        "repairSuccessCount": 0
+        "repairActivationCount": 1,
+        "repairSuccessCount": 1
       }
     ]
   },
