@@ -10,6 +10,7 @@ import type {
 } from "@deepseek/platform-contracts";
 import { CLI_TASK_EVALUATION_SCHEMA_VERSION } from "@deepseek/platform-contracts";
 import { evaluationLiveCredentialEnv, evaluationModelSelectionArgs } from "./evaluation-provider-selection.js";
+import { buildEvaluationStageGraph } from "./evaluation-stage-graph.js";
 import { generatedArtifactMetrics } from "./generated-artifacts.js";
 import {
   emptyMetrics,
@@ -66,6 +67,7 @@ async function executeWebpageTask(
   options: CliEvaluationOptions
 ): Promise<CliEvaluationTaskRunRecord> {
   const runId = `eval:${baseline.baselineId}:${task.taskId}`;
+  buildEvaluationStageGraph(task);
   const events = createEventRecorder(runId, baseline.baselineId, task.taskId);
   events.record("run_started", { dryRun: false });
   const workspaceRoot = await isolatedWorkspaceRoot(platform, runId);

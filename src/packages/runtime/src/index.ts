@@ -33,3 +33,19 @@ export { collectRuntimeEvents } from "./events.js";
 export { projectReasoningForOutput, recordVisibleReasoning, recordVisibleReasoningProjection, visibleReasoningEvidence } from "./visible-reasoning.js";
 export { createAgentSpawner, isAgentScopeEnforcementError } from "./agent-spawner.js";
 export { loadUserHooks } from "./user-hooks.js";
+export {
+  applyStagedTaskEvent,
+  createStagedTaskRunState,
+  readyStagedTaskStages,
+  replayStagedTaskRun,
+  runReadyStage,
+  validateStagedTaskGraph
+} from "./staged-task.js";
+export type {
+  CreateStagedTaskRunStateOptions,
+  ReplayStagedTaskRunOptions,
+  RunReadyStageOptions,
+  RunReadyStageResult,
+  StageExecutionContext,
+  StageExecutor
+} from "./staged-task.js";

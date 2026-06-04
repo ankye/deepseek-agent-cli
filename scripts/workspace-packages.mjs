@@ -30,6 +30,7 @@ export const packages = [
   "session-store",
   "config",
   "observability",
+  "task-profiles",
   "testing-regression"
 ];
 
@@ -65,6 +66,7 @@ export const packageDependencies = {
   "runtime-message-bus": ["platform-contracts"],
   "session-store": ["platform-contracts"],
   "skill-system": ["platform-contracts"],
+  "task-profiles": ["platform-contracts"],
   "usage-budget-management": ["platform-contracts"],
   "workflow-orchestration": ["platform-contracts"],
   "workspace-state-management": ["platform-contracts"],
@@ -145,7 +147,8 @@ export const appDependencies = {
     "model-gateway",
     "session-store",
     "mcp-gateway",
-    "index-provider"
+    "index-provider",
+    "task-profiles"
   ],
   "vscode-extension": ["platform-contracts", "communication-protocol", "runtime"]
 };

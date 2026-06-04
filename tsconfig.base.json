@@ -118,6 +118,9 @@
       "@deepseek/testing-regression": [
         "src/packages/testing-regression/src/index.ts"
       ],
+      "@deepseek/task-profiles": [
+        "src/packages/task-profiles/src/index.ts"
+      ],
       "@deepseek/usage-budget-management": [
         "src/packages/usage-budget-management/src/index.ts"
       ],

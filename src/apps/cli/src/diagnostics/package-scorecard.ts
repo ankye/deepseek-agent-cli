@@ -81,6 +81,7 @@ const roleAcceptanceEvidenceByRole: Readonly<Record<string, readonly string[]>> 
   "runtime-message-bus": ["src/packages/runtime-message-bus/test/bus.test.ts", "tests/golden/runtime-kernel-replay.test.ts"],
   "session-store": ["src/packages/session-store/src/index.test.ts", "tests/contracts/session-store-resume-fork.test.ts", "tests/integration/session-resume-fork-runtime.test.ts"],
   "skill-system": ["src/packages/skill-system/src/index.test.ts", "tests/contracts/skill-system-contracts.test.ts", "tests/matrix/skill-system-matrix.test.ts"],
+  "task-profiles": ["src/packages/task-profiles/test/profile-compiler.test.ts", "tests/contracts/task-profile-catalog.test.ts"],
   "testing-regression": ["src/packages/testing-regression/src/family-evidence/index.test.ts", "tests/integration/live-factory-real-fs.test.ts"],
   "tool-intent-preflight": ["src/packages/tool-intent-preflight/test/preflight.test.ts", "tests/matrix/live-tool-preflight.test.ts"],
   "usage-budget-management": ["src/packages/usage-budget-management/src/index.test.ts"],
