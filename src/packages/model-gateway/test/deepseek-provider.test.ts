@@ -744,6 +744,32 @@ describe("GLM Anthropic-compatible provider", () => {
     assert.equal(events.every((event) => event.kind !== "tool-call" || event.provider?.provider === "glm"), true);
   });
 
+  it("expands GLM raw JSON tool input wrappers before runtime policy sees them", () => {
+    const provider = { provider: "glm", protocol: "anthropic-messages" as const, model: "glm-5.1" };
+    const events = [
+      ...normalizeGlmAnthropicChunk({ data: { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "tool-raw", name: "core_file_write", input: {} } } }, provider),
+      ...normalizeGlmAnthropicChunk({
+        data: {
+          type: "content_block_delta",
+          index: 0,
+          delta: {
+            type: "input_json_delta",
+            partial_json: "{\"raw\":\"{\\\"path\\\":\\\"generated-webpage/index.html\\\",\\\"content\\\":\\\"<h1>ok</h1>\\\"}\"}"
+          }
+        }
+      }, provider),
+      ...normalizeGlmAnthropicChunk({ data: { type: "content_block_stop", index: 0 } }, provider)
+    ];
+
+    const toolCall = events.find((event) => event.kind === "tool-call");
+
+    assert.equal(toolCall?.kind, "tool-call");
+    assert.deepEqual(toolCall?.kind === "tool-call" ? toolCall.input : {}, {
+      path: "generated-webpage/index.html",
+      content: "<h1>ok</h1>"
+    });
+  });
+
   it("defers GLM placeholder zero usage until the real message delta usage arrives", () => {
     const normalize = createGlmAnthropicChunkNormalizer();
     const provider = { provider: "glm", protocol: "anthropic-messages" as const, model: "glm-5.1" };

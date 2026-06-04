@@ -1,6 +1,6 @@
 import type { CliOptions, CliRunOptions } from "../types.js";
 import { createCliAgentRuntime } from "../host/runtime.js";
-import { resolveCliModelProfile } from "../host/model-selection.js";
+import { resolveCliAgentLoopLimits, resolveCliModelProfile } from "../host/model-selection.js";
 import { collectCliProjectRuleEvidence } from "../host/project-rules.js";
 import type { CliTerminalCapabilityProfile } from "../host/terminal-profile.js";
 import { emitAgentLoop, finalAgentLoopEvent, renderFinalJsonIfNeeded, resumeHint } from "../renderers/runtime-events.js";
@@ -18,6 +18,7 @@ export async function runOneShotCommand(
   const reasoning = options.reasoning ?? (options.live ? { enabled: false } : undefined);
   const projectRules = await collectCliProjectRuleEvidence(runtime.deps.platform, workspaceRoot);
   const profile = resolveCliModelProfile(options);
+  const limits = resolveCliAgentLoopLimits(options.prompt);
   try {
     const events = await emitAgentLoop(runtime.deps, runtime.kernel, {
       prompt: options.prompt,
@@ -37,13 +38,7 @@ export async function runOneShotCommand(
       },
       ...(options.toolProjection ? { toolProjection: options.toolProjection } : {}),
       ...(options.timeoutMs ? { timeoutMs: options.timeoutMs } : {}),
-      ...(usesExpandedTaskBudget(options.prompt) ? {
-        limits: {
-          maxModelIterations: 12,
-          maxToolCalls: 32,
-          maxOutputBytes: 48_000
-        }
-      } : {})
+      ...(limits ? { limits } : {})
     }, write, writeInline, bufferedInline, undefined, terminalProfile);
     await renderFinalJsonIfNeeded(options.output, events, write);
     if (options.output === "text") {
@@ -53,17 +48,4 @@ export async function runOneShotCommand(
   } finally {
     await runtime.kernel.shutdown("cli-run-completed");
   }
-}
-
-function usesExpandedTaskBudget(prompt: string): boolean {
-  const lower = prompt.toLowerCase();
-  return (
-    lower.includes("evaluation task id:") ||
-    lower.includes("website") ||
-    lower.includes("webpage") ||
-    lower.includes("html") ||
-    lower.includes("网页") ||
-    lower.includes("网站") ||
-    lower.includes("页面")
-  );
 }

@@ -393,6 +393,12 @@ model gateway 必须提供 GLM provider adapter，面向 Anthropic Messages-comp
 - **THEN** it emits a typed missing-credential error and sends no provider request
 - **中文** 当 GLM provider 存在 credential reference 但无法解析 credential 时，必须发出 typed missing-credential error，且不得发送 provider request。
 
+#### Scenario: Raw JSON wrapper is expanded / Raw JSON wrapper 被展开
+
+- **WHEN** a GLM Anthropic-compatible tool call emits input as `{ "raw": "{\"path\":\"generated-webpage/index.html\",\"content\":\"...\"}" }`
+- **THEN** the provider emits a tool-call event with input `{ "path": "generated-webpage/index.html", "content": "..." }`
+- **中文** 当 GLM Anthropic-compatible tool call 将 input 输出为 `{ "raw": "{\"path\":\"generated-webpage/index.html\",\"content\":\"...\"}" }` 时，provider 必须发出 input 为 `{ "path": "generated-webpage/index.html", "content": "..." }` 的 tool-call event。
+
 ### Requirement: Vendor Protocol Adapter Units / Vendor Protocol Adapter Units
 
 The model gateway SHALL organize live provider adapters by vendor and wire protocol so that each adapter unit owns exactly one vendor/protocol pair, such as DeepSeek OpenAI-compatible, DeepSeek Anthropic-compatible, or GLM Anthropic-compatible.

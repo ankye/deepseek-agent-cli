@@ -126,6 +126,22 @@ CLI task-completion evaluation 必须包含带本地产物校验的 deterministi
 - **THEN** the isolated `deepseek run` subprocess receives `--provider glm --model glm-5.1`, uses the live path, and receives only redacted/presence-safe credential evidence in diagnostics output
 - **中文** 当带可用 GLM credentials 运行 `deepseek diagnostics evaluate --live --full --execute-task eval.webpage.generation --compare-baseline deepseek-cli --provider glm --model glm-5.1` 时，隔离的 `deepseek run` 子进程必须收到 `--provider glm --model glm-5.1`，使用 live path，并且 diagnostics output 只包含脱敏或 presence-safe 的 credential evidence。
 
+#### Scenario: GLM expanded webpage tasks receive a larger provider budget / GLM expanded webpage tasks 获得更大 provider budget
+
+- **WHEN** a live CLI run selects provider `glm` for a prompt containing webpage/html evaluation task markers
+- **THEN** the resolved model profile includes a larger Anthropic `max_tokens` provider option
+- **AND** the one-shot agent-loop limits are widened for model iterations, tool calls, and output bytes
+- **AND** simple non-webpage prompts keep the default GLM provider options
+- **中文** 当 live CLI run 为包含 webpage/html evaluation task 标记的 prompt 选择 `glm` provider 时，resolved model profile 必须包含更大的 Anthropic `max_tokens` provider option；one-shot agent-loop limits 必须放宽 model iterations、tool calls 与 output bytes；普通非网页 prompt 必须保持默认 GLM provider options。
+
+#### Scenario: Webpage final answer stays artifact-neutral / 网页最终回复保持 artifact-neutral
+
+- **WHEN** a webpage evaluation prompt is assembled
+- **THEN** it instructs the agent to write evidence into `generated-webpage/evidence.json`
+- **AND** it constrains the final assistant answer to the fixed short sentence `generated-webpage complete`
+- **AND** it forbids product-copy, package-name, executable-name, command, file-table, markdown-bullet, and verification-detail recaps in the final answer
+- **中文** 当 webpage evaluation prompt 被组装时，它必须要求 agent 将 evidence 写入 `generated-webpage/evidence.json`；并将最终 assistant answer 约束为固定短句 `generated-webpage complete`；同时禁止在 final answer 中复述 product-copy、package-name、executable-name、command、file-table、markdown-bullet 与 verification-detail。
+
 ### Requirement: CLI Evaluation Records Prompt Assembly Evidence / CLI 评估记录 Prompt Assembly 证据
 
 CLI task-completion evaluation SHALL record prompt assembly evidence for DeepSeek CLI runs so task outcomes can be correlated with prompt structure, context inclusion, tool projection, and provider readiness.

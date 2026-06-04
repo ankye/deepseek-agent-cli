@@ -121,13 +121,23 @@ export function numberValue(value: unknown): number | undefined {
 }
 
 export function parseToolInput(value: unknown): JsonObject {
-  if (isJsonObject(value)) return value;
+  if (isJsonObject(value)) return normalizeRawToolInput(value);
   if (typeof value !== "string" || value.trim() === "") return {};
   try {
     const parsed: unknown = JSON.parse(value);
-    return isJsonObject(parsed) ? parsed : { value: parsed as JsonValue };
+    return isJsonObject(parsed) ? normalizeRawToolInput(parsed) : { value: parsed as JsonValue };
   } catch {
     return { raw: value };
+  }
+}
+
+function normalizeRawToolInput(value: JsonObject): JsonObject {
+  if (Object.keys(value).length !== 1 || typeof value.raw !== "string" || value.raw.trim() === "") return value;
+  try {
+    const parsed: unknown = JSON.parse(value.raw);
+    return isJsonObject(parsed) ? parsed : value;
+  } catch {
+    return value;
   }
 }
 
