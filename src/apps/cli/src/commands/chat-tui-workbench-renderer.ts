@@ -240,7 +240,7 @@ function pluginLines(shelf: ChatTuiPluginShelf): readonly string[] {
   return [
     shelf.readiness === "disabled" ? "Plugins off" : "Plugins ready",
     shelf.totalPlugins > 0 ? `${shelf.totalPlugins} plugins available` : "No plugin activity yet",
-    ...shelf.items.map((item) => `${item.status} ${item.pluginId}`),
+    ...shelf.items.map((item) => `${titleCase(item.status)} | ${pluginDisplayName(item.pluginId)}`),
     ...(shelf.overflowCount > 0 ? [`+${shelf.overflowCount} more plugins`] : [])
   ];
 }
@@ -538,6 +538,12 @@ function titleCase(text: string): string {
     .filter(Boolean)
     .map((part) => `${part.slice(0, 1).toUpperCase()}${part.slice(1)}`)
     .join(" ");
+}
+
+function pluginDisplayName(pluginId: string): string {
+  const withoutScope = pluginId.replace(/^@[^/]+\//, "");
+  const withoutPrefix = withoutScope.replace(/^plugin-/, "");
+  return titleCase(withoutPrefix);
 }
 
 function formatInputAnchor(text: string, maxColumns?: number): string {

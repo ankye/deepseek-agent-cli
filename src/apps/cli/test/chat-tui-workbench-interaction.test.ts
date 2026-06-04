@@ -405,6 +405,14 @@ describe("chat TUI workbench interactions", () => {
     assert.ok(!frame.includes("result-list: command cancel"));
   });
 
+  it("renders full-screen plugin shelf with human-readable plugin labels", () => {
+    const tui = createTuiWithProfile(createFullScreenTerminalProfile());
+    const frame = renderChatTuiFullscreenFrame({ workbench: tui.snapshot().workbench, rows: 24, phase: "repaint" }).chunks.join("\n");
+
+    assert.ok(frame.includes("Ready | Context Compactor"));
+    assert.ok(!frame.includes("@deepseek/plugin-context-compa"));
+  });
+
   it("repaints full-screen frames instead of line-mode prompt fragments", async () => {
     const input = createRawTtyInput(["/", "h", "\x03"]);
     const lines: string[] = [];

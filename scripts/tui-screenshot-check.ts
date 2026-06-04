@@ -22,6 +22,7 @@ const requiredFrameText = [
   "No assistant turn is streaming yet.",
   "No active turn",
   "Current selection",
+  "Ready | Context Compactor",
   "Keys | / commands",
   "Mode Ready"
 ];
