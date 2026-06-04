@@ -4,7 +4,6 @@
 Define model gateway requirements for provider-neutral streaming, request normalization, capability flags, cache metrics, and error handling.
 
 定义 model gateway 对 provider-neutral streaming、request normalization、capability flags、cache metrics 与 error handling 的要求。
-
 ## Requirements
 ### Requirement: Provider-Neutral Model Gateway
 
@@ -364,3 +363,86 @@ Model gateway 必须归一化 provider cache hit/miss token metrics，并在可�
 - **THEN** the gateway records cache metric status as unavailable rather than fabricating hit or miss counts
 - **中文** 当 provider 未返回 cache usage metrics 时，gateway 必须将 cache metric status 记录为 unavailable，而不得伪造 hit 或 miss counts。
 
+### Requirement: GLM Anthropic-Compatible Provider / GLM Anthropic-Compatible Provider
+
+The model gateway SHALL provide a GLM provider adapter that targets an Anthropic Messages-compatible endpoint while exposing only provider-neutral `ModelGateway` contracts to runtime, CLI, VSCode, tests, and future hosts.
+
+model gateway 必须提供 GLM provider adapter，面向 Anthropic Messages-compatible endpoint，但只向 runtime、CLI、VSCode、tests 和未来 hosts 暴露 provider-neutral `ModelGateway` contracts。
+
+#### Scenario: Provider builds Anthropic Messages request / Provider 构造 Anthropic Messages request
+
+- **WHEN** a `ModelRequest` is streamed through the GLM provider with prompt, profile, messages, tools, tool choice, and output options
+- **THEN** the provider sends an Anthropic-compatible `POST /v1/messages` request through the injected transport with `x-api-key` credentials and `anthropic-version`
+- **中文** 当 `ModelRequest` 通过 GLM provider stream，并包含 prompt、profile、messages、tools、tool choice 与 output options 时，provider 必须通过 injected transport 发送 Anthropic-compatible `POST /v1/messages` request，并使用 `x-api-key` 凭据与 `anthropic-version`。
+
+#### Scenario: Provider normalizes Anthropic response / Provider 归一化 Anthropic response
+
+- **WHEN** the Anthropic-compatible endpoint returns text blocks, tool-use blocks, stop reasons, usage, or provider errors
+- **THEN** the adapter emits provider-neutral delta, tool-call, finish, usage, done, or error events with GLM provider metadata and without executing tools
+- **中文** 当 Anthropic-compatible endpoint 返回 text blocks、tool-use blocks、stop reasons、usage 或 provider errors 时，adapter 必须发出带有 GLM provider metadata 的 provider-neutral delta、tool-call、finish、usage、done 或 error events，且不得执行工具。
+
+#### Scenario: Placeholder usage does not hide final usage / 占位 usage 不得掩盖最终 usage
+
+- **WHEN** GLM streams a `message_start` usage placeholder with zero input and output tokens before later `message_delta` usage
+- **THEN** the adapter defers the usage event until the real `message_delta` token counts are available and maps provider cache-read metadata into normalized cache usage
+- **中文** 当 GLM 在后续 `message_delta` usage 前先 stream 一个 input/output tokens 为零的 `message_start` usage placeholder 时，adapter 必须推迟 usage event，直到真实 `message_delta` token counts 可用，并把 provider cache-read metadata 映射为 normalized cache usage。
+
+#### Scenario: Provider fails closed without credential / 缺少凭据时 fail closed
+
+- **WHEN** the GLM provider has a credential reference but no credential can be resolved
+- **THEN** it emits a typed missing-credential error and sends no provider request
+- **中文** 当 GLM provider 存在 credential reference 但无法解析 credential 时，必须发出 typed missing-credential error，且不得发送 provider request。
+
+### Requirement: Vendor Protocol Adapter Units / Vendor Protocol Adapter Units
+
+The model gateway SHALL organize live provider adapters by vendor and wire protocol so that each adapter unit owns exactly one vendor/protocol pair, such as DeepSeek OpenAI-compatible, DeepSeek Anthropic-compatible, or GLM Anthropic-compatible.
+
+model gateway 必须按 vendor 与 wire protocol 组织 live provider adapters，使每个 adapter unit 只拥有一个 vendor/protocol pair，例如 DeepSeek OpenAI-compatible、DeepSeek Anthropic-compatible 或 GLM Anthropic-compatible。
+
+#### Scenario: Adapter identity includes protocol / Adapter identity 包含 protocol
+
+- **WHEN** a model provider supports multiple wire protocols
+- **THEN** each protocol-specific implementation is represented as a separate adapter unit with its own request builder, stream normalizer, provider metadata, and focused tests
+- **中文** 当一个 model provider 支持多个 wire protocols 时，每个 protocol-specific implementation 必须表示为独立 adapter unit，并拥有自己的 request builder、stream normalizer、provider metadata 与 focused tests。
+
+#### Scenario: DeepSeek protocol lanes stay distinct / DeepSeek protocol lanes 保持区分
+
+- **WHEN** DeepSeek OpenAI-compatible and DeepSeek Anthropic-compatible lanes are implemented
+- **THEN** their wire request construction and response normalization live in separate adapter modules even though they share the same vendor
+- **中文** 当实现 DeepSeek OpenAI-compatible 与 DeepSeek Anthropic-compatible lanes 时，即使它们共享同一 vendor，其 wire request construction 与 response normalization 也必须位于不同 adapter modules。
+
+#### Scenario: GLM Anthropic adapter owns GLM quirks / GLM Anthropic adapter 拥有 GLM 差异
+
+- **WHEN** GLM Anthropic-compatible streaming includes provider-specific details such as placeholder usage or GLM metadata
+- **THEN** those details are handled inside the GLM Anthropic adapter and are not generalized into DeepSeek or shared adapter policy
+- **中文** 当 GLM Anthropic-compatible streaming 包含 placeholder usage 或 GLM metadata 等 provider-specific details 时，这些细节必须在 GLM Anthropic adapter 内处理，不得泛化进 DeepSeek 或 shared adapter policy。
+
+### Requirement: Provider Package Root Compatibility / Provider Package Root Compatibility
+
+The model gateway package root SHALL preserve stable public exports while internal provider files are reorganized.
+
+model gateway package root 必须在 reorganize internal provider files 时保持稳定 public exports。
+
+#### Scenario: Public imports remain stable / Public imports 保持稳定
+
+- **WHEN** runtime, CLI, tests, or future hosts import provider classes, default profiles, transports, or credential refs from `@deepseek/model-gateway`
+- **THEN** those imports continue to resolve from the package root without requiring callers to import provider internal file paths
+- **中文** 当 runtime、CLI、tests 或未来 hosts 从 `@deepseek/model-gateway` import provider classes、default profiles、transports 或 credential refs 时，这些 imports 必须继续从 package root 解析，不要求 callers import provider internal file paths。
+
+#### Scenario: Runtime contract remains provider-neutral / Runtime contract 保持 provider-neutral
+
+- **WHEN** a provider adapter emits text, reasoning, tool-call, usage, finish, done, or error events
+- **THEN** runtime receives the same `ModelStreamEvent` shapes before and after adapter file reorganization
+- **中文** 当 provider adapter 发出 text、reasoning、tool-call、usage、finish、done 或 error events 时，runtime 在 adapter file reorganization 前后必须收到相同的 `ModelStreamEvent` shapes。
+
+### Requirement: Shared Helper Boundaries / Shared Helper Boundaries
+
+Shared model-gateway helper modules SHALL contain only provider-neutral or protocol-level mechanics and SHALL NOT own vendor-specific endpoint defaults, credential refs, model ids, quota policy, or provider-specific usage quirks.
+
+model-gateway shared helper modules 只能包含 provider-neutral 或 protocol-level mechanics，不得拥有 vendor-specific endpoint defaults、credential refs、model ids、quota policy 或 provider-specific usage quirks。
+
+#### Scenario: Shared Anthropic mechanics do not erase vendor policy / Shared Anthropic mechanics 不抹平 vendor policy
+
+- **WHEN** DeepSeek Anthropic-compatible and GLM Anthropic-compatible adapters reuse Anthropic content-block parsing helpers
+- **THEN** endpoint defaults, credential refs, provider ids, model ids, and provider-specific usage decisions remain in their adapter modules
+- **中文** 当 DeepSeek Anthropic-compatible 与 GLM Anthropic-compatible adapters 复用 Anthropic content-block parsing helpers 时，endpoint defaults、credential refs、provider ids、model ids 与 provider-specific usage decisions 必须留在各自 adapter modules。

@@ -4,7 +4,6 @@
 Define architecture scale guardrails that keep package boundaries, file size, import direction, and roadmap drift mechanically visible.
 
 定义架构规模护栏，使 package boundaries、文件规模、import direction 与 roadmap drift 可被机械化发现。
-
 ## Requirements
 ### Requirement: CLI Host Modules Remain Thin / CLI Host 模块保持轻量
 
@@ -230,4 +229,22 @@ Architecture guardrails SHALL compare roadmap labels, package-map ownership, wor
 - **WHEN** roadmap marks a capability as implemented but source evidence shows placeholder, deferred, missing package, or missing evidence status
 - **THEN** readiness reports a drift finding and blocks product-ready claims depending on the overstated status
 - **中文** 当 roadmap 将能力标记为 implemented，但源码证据显示 placeholder、deferred、missing package 或 missing evidence 状态时，readiness 必须报告 drift finding，并阻止依赖该夸大状态的产品就绪声明。
+
+### Requirement: Provider Internal Import Guardrail / Provider Internal Import Guardrail
+
+Application hosts, runtime packages, and non-model-gateway packages SHALL NOT import model-gateway provider internal implementation paths after provider adapters are split into vendor/protocol directories.
+
+provider adapters 拆入 vendor/protocol directories 后，application hosts、runtime packages 与 non-model-gateway packages 不得 import model-gateway provider internal implementation paths。
+
+#### Scenario: Package root is the only external provider import boundary / Package root 是唯一外部 provider import 边界
+
+- **WHEN** a non-model-gateway package needs a model provider class, profile, transport, or credential ref
+- **THEN** it imports from `@deepseek/model-gateway` rather than `@deepseek/model-gateway/providers/...` or cross-package relative paths
+- **中文** 当 non-model-gateway package 需要 model provider class、profile、transport 或 credential ref 时，必须从 `@deepseek/model-gateway` import，而不是从 `@deepseek/model-gateway/providers/...` 或 cross-package relative paths import。
+
+#### Scenario: Lint or boundary check protects adapter internals / Lint 或 boundary check 保护 adapter internals
+
+- **WHEN** an implementation introduces an external import of provider internal adapter files
+- **THEN** `npm run lint` or `node scripts/check-boundaries.mjs` fails before the change is accepted
+- **中文** 当 implementation 引入对 provider internal adapter files 的外部 import 时，`npm run lint` 或 `node scripts/check-boundaries.mjs` 必须在 change 被接受前失败。
 
