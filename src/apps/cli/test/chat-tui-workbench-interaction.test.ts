@@ -203,6 +203,32 @@ describe("chat TUI workbench interactions", () => {
     assert.ok(lines.some((line) => line.startsWith("Keys |")));
   });
 
+  it("renders command suggestions with category labels and selected preview", async () => {
+    const tui = createTui();
+    await readPrompts(tui, ["/", "h"]);
+
+    const inputFrame = createChatTuiInputFrame(tui.snapshot().workbench, { maxSuggestions: 3 });
+    const text = inputFrame.suggestionLines.join("\n");
+
+    assert.equal(inputFrame.suggestionLines[0], "Selected | Control | /help - Show commands and shortcuts");
+    assert.ok(text.includes(">/help - Show commands and shortcuts [Control]"));
+    assert.ok(inputFrame.compactSuggestionLine?.includes("Selected /help - Show commands and shortcuts"));
+    assert.ok(inputFrame.compactSuggestionLine?.includes("[Control]"));
+  });
+
+  it("gives command-bar no-match states a recoverable next step", async () => {
+    const tui = createTui();
+    await readPrompts(tui, ["/", "z", "z", "z"]);
+
+    const inputFrame = createChatTuiInputFrame(tui.snapshot().workbench, { maxSuggestions: 3 });
+
+    assert.deepEqual(inputFrame.suggestionLines, [
+      "No matches for /zzz",
+      "Try another command, or press Esc to close."
+    ]);
+    assert.equal(inputFrame.compactSuggestionLine, "Suggestions | No matches for /zzz | Esc close");
+  });
+
   it("keeps the initial line-mode screen low density and action oriented", () => {
     const tui = createTui();
     const lines = renderChatTuiWorkbench(tui.snapshot().workbench);
@@ -315,9 +341,10 @@ describe("chat TUI workbench interactions", () => {
     const commandFrame = inline.find((chunk) => chunk.includes("deepseek> /h_")) ?? "";
     assert.ok(renderedInline.includes("deepseek> /_"));
     assert.ok(renderedInline.includes("deepseek> /h_"));
-    assert.ok(renderedInline.includes("Suggestions | >/help - Show commands and shortcuts"));
+    assert.ok(renderedInline.includes("Suggestions | Selected /help - Show commands and shortcuts"));
+    assert.ok(renderedInline.includes(">/help - Show commands and shortcuts [Control]"));
     assert.ok(!renderedInline.includes("deepseek> /h_ |"));
-    assert.ok(commandFrame.indexOf("Suggestions | >/help - Show commands and shortcuts") < commandFrame.indexOf("deepseek> /h_"));
+    assert.ok(commandFrame.indexOf("Suggestions | Selected /help - Show commands and shortcuts") < commandFrame.indexOf("deepseek> /h_"));
     assert.ok(!commandFrame.includes("Tab move"));
     assert.ok(!commandFrame.includes("Enter accept"));
     assert.ok(!commandFrame.includes("Esc close"));
@@ -334,7 +361,8 @@ describe("chat TUI workbench interactions", () => {
 
     assert.ok(suggestionsIndex >= 0);
     assert.ok(inputIndex > suggestionsIndex);
-    assert.ok(frame.includes("| >/help - Show commands and shortcuts"));
+    assert.ok(frame.includes("| Selected | Control | /help - Show commands and shortcuts"));
+    assert.ok(frame.includes("| >/help - Show commands and shortcuts [Control]"));
     assert.ok(frame.includes("| deepseek> /h_"));
     assert.ok(!frame.includes("promptReady=true"));
     assert.ok(!frame.includes("governed-descriptors"));

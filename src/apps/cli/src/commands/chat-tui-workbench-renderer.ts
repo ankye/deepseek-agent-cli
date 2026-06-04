@@ -32,16 +32,22 @@ export function createChatTuiInputFrame(workbench: ChatTuiWorkbench, input: {
   readonly maxSuggestions?: number;
 } = {}): ChatTuiInputFrame {
   if (workbench.commandBar.open) {
+    const activeSuggestion = selectedSuggestion(workbench.commandBar);
     const visibleSuggestions = workbench.commandBar.suggestions
       .slice(0, input.maxSuggestions ?? 3)
       .map((entry) => suggestionLine(entry, entry.id === workbench.commandBar.activeSuggestionId));
-    const suggestionLines = visibleSuggestions.length > 0 ? visibleSuggestions : ["no matches"];
+    const suggestionLines = visibleSuggestions.length > 0
+      ? [
+        ...(activeSuggestion ? [selectedSuggestionLine(activeSuggestion)] : []),
+        ...visibleSuggestions
+      ]
+      : noMatchSuggestionLines(workbench.commandBar.query);
     return {
       commandBarOpen: true,
       inputLine: formatInputAnchor(`/${workbench.commandBar.query}`, input.maxInputColumns),
       promptPreviewLines: [],
       suggestionLines,
-      compactSuggestionLine: `Suggestions | ${suggestionLines.join("  ")}`
+      compactSuggestionLine: compactSuggestionText(workbench.commandBar, activeSuggestion, visibleSuggestions)
     };
   }
   const pending = input.pending ?? "";
@@ -106,7 +112,7 @@ function renderFullscreenWorkbench(workbench: ChatTuiWorkbench, columns: number,
   const header = headerLines(workbench, columns, rows);
   const promptPreviewVisible = !workbench.commandBar.open && hasMultipleDisplayLines(pending ?? "");
   const commandRows = workbench.commandBar.open
-    ? rows >= 18 ? 6 : 5
+    ? rows >= 18 ? 7 : 6
     : promptPreviewVisible ? rows >= 18 ? 7 : 5 : 3;
   const footerRows = 2;
   const mainRows = Math.max(3, rows - header.length - commandRows - footerRows);
@@ -315,7 +321,7 @@ function workbenchModeLabel(workbench: ChatTuiWorkbench): string {
 
 function suggestionText(commandBar: ChatTuiCommandBarState, maxSuggestions: number): string {
   if (!commandBar.open) return "deepseek> _";
-  const active = commandBar.suggestions.find((entry) => entry.id === commandBar.activeSuggestionId);
+  const active = selectedSuggestion(commandBar);
   const names = commandBar.suggestions
     .slice(0, maxSuggestions)
     .map((entry) => suggestionLine(entry, entry.id === commandBar.activeSuggestionId))
@@ -324,7 +330,7 @@ function suggestionText(commandBar: ChatTuiCommandBarState, maxSuggestions: numb
   return [
     `/${commandBar.query}_`,
     `suggestions=${names || "none"}`,
-    `selected=${active ? boundSegment(active.title, 22) : "none"}`,
+    `selected=${active ? boundSegment(suggestionSummary(active), 42) : "none"}`,
     `count=${commandBar.suggestions.length}/${commandBar.totalSuggestionCount}${overflow > 0 ? ` +${overflow}` : ""}`
   ].join(" | ");
 }
@@ -406,8 +412,48 @@ function keyLine(workbench: ChatTuiWorkbench, columns: number): string {
 
 function suggestionLine(entry: ChatTuiCommandSuggestion, active: boolean): string {
   const marker = active ? ">" : " ";
+  return `${marker}${suggestionSummary(entry)} [${suggestionKindLabel(entry.kind)}]`;
+}
+
+function selectedSuggestionLine(entry: ChatTuiCommandSuggestion): string {
+  return `Selected | ${suggestionKindLabel(entry.kind)} | ${suggestionSummary(entry)}`;
+}
+
+function compactSuggestionText(
+  commandBar: ChatTuiCommandBarState,
+  activeSuggestion: ChatTuiCommandSuggestion | undefined,
+  visibleSuggestions: readonly string[]
+): string {
+  if (visibleSuggestions.length === 0) return `Suggestions | No matches for /${commandBar.query} | Esc close`;
+  const selectedText = activeSuggestion ? `Selected ${suggestionSummary(activeSuggestion)}` : "Selected none";
+  return `Suggestions | ${selectedText} | ${visibleSuggestions.join("  ")}`;
+}
+
+function noMatchSuggestionLines(query: string): readonly string[] {
+  return [
+    `No matches for /${query}`,
+    "Try another command, or press Esc to close."
+  ];
+}
+
+function selectedSuggestion(commandBar: ChatTuiCommandBarState): ChatTuiCommandSuggestion | undefined {
+  return commandBar.suggestions.find((entry) => entry.id === commandBar.activeSuggestionId) ?? commandBar.suggestions[0];
+}
+
+function suggestionSummary(entry: ChatTuiCommandSuggestion): string {
   const description = entry.description ? ` - ${entry.description}` : "";
-  return `${marker}${entry.title}${description}`;
+  return `${entry.title}${description}`;
+}
+
+function suggestionKindLabel(kind: ChatTuiCommandSuggestion["kind"]): string {
+  if (kind === "plugin-action") return "Plugin";
+  if (kind === "reasoning-view") return "Reasoning";
+  if (kind === "navigation") return "Navigation";
+  if (kind === "context") return "Context";
+  if (kind === "reference") return "Reference";
+  if (kind === "history") return "History";
+  if (kind === "palette") return "Palette";
+  return "Control";
 }
 
 function conversationSummary(workbench: ChatTuiWorkbench): string {
