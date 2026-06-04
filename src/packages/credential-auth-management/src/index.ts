@@ -23,6 +23,7 @@ export type DeepSeekCredentialEnv = Readonly<Record<"DEEPSEEK_API_KEY" | "DEEPSE
 export type GlmAnthropicCredentialEnv = Readonly<Record<"GLM_ANTHROPIC_API_KEY" | "ZHIPU_API_KEY", string | undefined>>;
 
 const defaultDeepSeekCredentialRef = asId<"credentialRef">("credential-deepseek-api-key");
+export const liveCredentialLaunchCwdEnvKey = "DEEPSEEK_CLI_LAUNCH_CWD";
 
 export * from "./extension-auth.js";
 
@@ -173,18 +174,32 @@ export async function createDeepSeekCredentialAuthServiceFromEnv(env: Readonly<R
 
 export async function deepSeekLiveCredentialProcessEnv(platform: Pick<PlatformRuntime, "readFile">, cwd = process.cwd(), env: Readonly<Record<string, string | undefined>> = process.env): Promise<DeepSeekCredentialEnv> {
   const envFile = await readDeepSeekCredentialEnvFile(platform, join(cwd, ".env"));
+  const launchEnvFile = await readLaunchCredentialEnvFile(platform, cwd, env, readDeepSeekCredentialEnvFile, { DEEPSEEK_API_KEY: undefined, DEEPSEEK_TOKEN: undefined });
   return {
-    DEEPSEEK_API_KEY: firstNonEmpty(env.DEEPSEEK_API_KEY, envFile.DEEPSEEK_API_KEY),
-    DEEPSEEK_TOKEN: firstNonEmpty(env.DEEPSEEK_TOKEN, envFile.DEEPSEEK_TOKEN)
+    DEEPSEEK_API_KEY: firstNonEmpty(env.DEEPSEEK_API_KEY, envFile.DEEPSEEK_API_KEY, launchEnvFile.DEEPSEEK_API_KEY),
+    DEEPSEEK_TOKEN: firstNonEmpty(env.DEEPSEEK_TOKEN, envFile.DEEPSEEK_TOKEN, launchEnvFile.DEEPSEEK_TOKEN)
   };
 }
 
 export async function glmAnthropicLiveCredentialProcessEnv(platform: Pick<PlatformRuntime, "readFile">, cwd = process.cwd(), env: Readonly<Record<string, string | undefined>> = process.env): Promise<GlmAnthropicCredentialEnv> {
   const envFile = await readGlmAnthropicCredentialEnvFile(platform, join(cwd, ".env"));
+  const launchEnvFile = await readLaunchCredentialEnvFile(platform, cwd, env, readGlmAnthropicCredentialEnvFile, { GLM_ANTHROPIC_API_KEY: undefined, ZHIPU_API_KEY: undefined });
   return {
-    GLM_ANTHROPIC_API_KEY: firstNonEmpty(env.GLM_ANTHROPIC_API_KEY, envFile.GLM_ANTHROPIC_API_KEY),
-    ZHIPU_API_KEY: firstNonEmpty(env.ZHIPU_API_KEY, envFile.ZHIPU_API_KEY)
+    GLM_ANTHROPIC_API_KEY: firstNonEmpty(env.GLM_ANTHROPIC_API_KEY, envFile.GLM_ANTHROPIC_API_KEY, launchEnvFile.GLM_ANTHROPIC_API_KEY),
+    ZHIPU_API_KEY: firstNonEmpty(env.ZHIPU_API_KEY, envFile.ZHIPU_API_KEY, launchEnvFile.ZHIPU_API_KEY)
   };
+}
+
+async function readLaunchCredentialEnvFile<TEnv extends Record<string, string | undefined>>(
+  platform: Pick<PlatformRuntime, "readFile">,
+  cwd: string,
+  env: Readonly<Record<string, string | undefined>>,
+  readEnvFile: (platform: Pick<PlatformRuntime, "readFile">, path: string) => Promise<TEnv>,
+  empty: TEnv
+): Promise<TEnv> {
+  const launchCwd = firstNonEmpty(env[liveCredentialLaunchCwdEnvKey]);
+  if (!launchCwd || launchCwd === cwd) return empty;
+  return readEnvFile(platform, join(launchCwd, ".env"));
 }
 
 async function readDeepSeekCredentialEnvFile(platform: Pick<PlatformRuntime, "readFile">, path: string): Promise<DeepSeekCredentialEnv> {

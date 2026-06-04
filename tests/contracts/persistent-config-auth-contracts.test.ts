@@ -61,6 +61,18 @@ describe("persistent config and auth contracts", () => {
     assert.equal(JSON.stringify({ ...env, GLM_ANTHROPIC_API_KEY: "present" }).includes(fakeSecret), false);
   });
 
+  it("hydrates GLM Anthropic credentials from launch cwd when an isolated task cwd has no env file", async () => {
+    const env = await glmAnthropicLiveCredentialProcessEnv({
+      readFile: async (path: string) => {
+        if (path === "/launch/.env") return "GLM_ANTHROPIC_API_KEY=fixture-glm-launch-secret\n";
+        throw new Error(`unexpected env file path: ${path}`);
+      }
+    }, "/isolated-task", { DEEPSEEK_CLI_LAUNCH_CWD: "/launch" });
+
+    assert.equal(env.GLM_ANTHROPIC_API_KEY, "fixture-glm-launch-secret");
+    assert.equal(JSON.stringify({ ...env, GLM_ANTHROPIC_API_KEY: "present" }).includes("fixture-glm-launch-secret"), false);
+  });
+
   it("defines readiness live-check and live verification result shapes", () => {
     const input: ReadinessLiveCheckInput = { enabled: true, timeoutMs: 1000 };
     const result: ModelLiveVerificationResult = {

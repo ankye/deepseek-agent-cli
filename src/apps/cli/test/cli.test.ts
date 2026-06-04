@@ -3648,6 +3648,7 @@ describe("cli host adapter", () => {
       assert.equal(deepseekCommand?.args.includes("--model"), true);
       assert.equal(deepseekCommand?.args.includes("glm-5.1"), true);
       assert.equal(deepseekCommand?.env?.GLM_ANTHROPIC_API_KEY, "fixture-glm-eval-secret");
+      assert.equal(deepseekCommand?.env?.DEEPSEEK_CLI_LAUNCH_CWD, process.cwd());
       assert.equal(JSON.stringify(summary).includes("fixture-glm-eval-secret"), false);
     });
   });
