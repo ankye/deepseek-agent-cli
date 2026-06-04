@@ -6,10 +6,15 @@ import {
   DeterministicMockModelGateway,
   FetchModelProviderTransport,
   FixtureModelProviderTransport,
+  GlmAnthropicProvider,
   StaticCredentialProvider,
   defaultDeepSeekProfile,
+  defaultGlmAnthropicProfile,
   deepSeekOpenAIProviderConfig,
+  glmAnthropicProviderConfig,
+  createGlmAnthropicChunkNormalizer,
   estimateModelUsageCostMicros,
+  normalizeGlmAnthropicChunk,
   normalizeDeepSeekChunk,
   parseDeepSeekJsonOutputResponse,
   resolveModelMetadata,
@@ -634,5 +639,107 @@ describe("DeepSeek OpenAI provider", () => {
     const inspect = await capabilities.find((entry) => entry.manifest.toolFamily?.familyId === "image.inspect")?.execute({ bytesBase64: png1x1 }, {} as never);
     assert.equal((inspect?.value?.metadata as { width?: number } | undefined)?.width, 1);
     assert.equal((inspect?.value?.metadata as { height?: number } | undefined)?.height, 1);
+  });
+});
+
+describe("GLM Anthropic-compatible provider", () => {
+  it("fails closed when credential is missing", async () => {
+    const transport = new FixtureModelProviderTransport([]);
+    const provider = new GlmAnthropicProvider({ transport });
+    const events = await collect(provider.stream({ profile: defaultGlmAnthropicProfile, prompt: "hello" }));
+
+    assert.equal(events.length, 1);
+    assert.equal(events[0]?.kind, "error");
+    assert.equal(events[0]?.kind === "error" ? events[0].error.code : "", "PROVIDER_CREDENTIAL_MISSING");
+    assert.equal(transport.requests.length, 0);
+  });
+
+  it("builds an Anthropic Messages request with GLM metadata and x-api-key credentials", async () => {
+    const transport = new FixtureModelProviderTransport([]);
+    const provider = new GlmAnthropicProvider({
+      transport,
+      credentials: new StaticCredentialProvider("glm-test", glmAnthropicProviderConfig.credentialRef),
+      timeoutMs: 1234
+    });
+    const events = await collect(provider.stream({
+      profile: { ...defaultGlmAnthropicProfile, providerOptions: { max_tokens: 32 } },
+      prompt: "reply ok",
+      messages: [
+        { role: "system", content: "Be brief." },
+        { role: "user", content: "reply ok" }
+      ],
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "core_file_read",
+            description: "Read a file",
+            parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] }
+          }
+        }
+      ],
+      toolChoice: { type: "function", name: "core_file_read" }
+    }));
+
+    assert.equal(events.at(-1)?.kind, "done");
+    assert.equal(transport.requests.length, 1);
+    const request = transport.requests[0];
+    assert.equal(request?.url, "https://open.bigmodel.cn/api/anthropic/v1/messages");
+    assert.equal(request?.method, "POST");
+    assert.equal(request?.headers["x-api-key"], "glm-test");
+    assert.equal(request?.headers["anthropic-version"], "2023-06-01");
+    assert.equal(request?.timeoutMs, 1234);
+    assert.equal(request?.body.model, "glm-5.1");
+    assert.equal(request?.body.max_tokens, 32);
+    assert.equal(request?.body.system, "Be brief.");
+    assert.deepEqual(request?.body.messages, [{ role: "user", content: "reply ok" }]);
+    assert.deepEqual(request?.body.tools, [{
+      name: "core_file_read",
+      description: "Read a file",
+      input_schema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] }
+    }]);
+    assert.deepEqual(request?.body.tool_choice, { type: "tool", name: "core_file_read" });
+  });
+
+  it("normalizes Anthropic text, tool-use, usage, finish, and done events", () => {
+    const provider = { provider: "glm", protocol: "anthropic-messages" as const, model: "glm-5.1" };
+    const events = [
+      ...normalizeGlmAnthropicChunk({ data: { type: "message_start", message: { id: "msg-1", usage: { input_tokens: 4 } } } }, provider),
+      ...normalizeGlmAnthropicChunk({ data: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } } }, provider),
+      ...normalizeGlmAnthropicChunk({ data: { type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "tool-1", name: "core_file_read", input: {} } } }, provider),
+      ...normalizeGlmAnthropicChunk({ data: { type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: "{\"path\":\"README.md\"}" } } }, provider),
+      ...normalizeGlmAnthropicChunk({ data: { type: "content_block_stop", index: 1 } }, provider),
+      ...normalizeGlmAnthropicChunk({ data: { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 2 } } }, provider),
+      ...normalizeGlmAnthropicChunk({ data: { type: "message_stop" } }, provider)
+    ];
+
+    assert.deepEqual(events.map((event) => event.kind), ["delta", "tool-call", "finish", "usage", "done"]);
+    assert.equal(events[0]?.kind === "delta" ? events[0].text : "", "ok");
+    assert.equal(events[1]?.kind === "tool-call" ? events[1].id : "", "tool-1");
+    assert.equal(events[1]?.kind === "tool-call" ? events[1].name : "", "core_file_read");
+    assert.deepEqual(events[1]?.kind === "tool-call" ? events[1].input : {}, { path: "README.md" });
+    assert.equal(events[2]?.kind === "finish" ? events[2].reason : "", "tool-call");
+    assert.equal(events[3]?.kind === "usage" ? events[3].inputTokens : 0, 4);
+    assert.equal(events[3]?.kind === "usage" ? events[3].outputTokens : 0, 2);
+    assert.equal(events.every((event) => event.kind !== "tool-call" || event.provider?.provider === "glm"), true);
+  });
+
+  it("defers GLM placeholder zero usage until the real message delta usage arrives", () => {
+    const normalize = createGlmAnthropicChunkNormalizer();
+    const provider = { provider: "glm", protocol: "anthropic-messages" as const, model: "glm-5.1" };
+    const events = [
+      ...normalize({ data: { type: "message_start", message: { id: "msg-1", usage: { input_tokens: 0, output_tokens: 0 } } } }, provider),
+      ...normalize({ data: { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "tool-1", name: "core_file_read", input: {} } } }, provider),
+      ...normalize({ data: { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: "{\"path\":\"README.md\"}" } } }, provider),
+      ...normalize({ data: { type: "content_block_stop", index: 0 } }, provider),
+      ...normalize({ data: { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { input_tokens: 183, output_tokens: 13, cache_read_input_tokens: 0 } } }, provider),
+      ...normalize({ data: { type: "message_stop" } }, provider)
+    ];
+
+    const usageEvents = events.filter((event) => event.kind === "usage");
+    assert.equal(usageEvents.length, 1);
+    assert.equal(usageEvents[0]?.kind === "usage" ? usageEvents[0].inputTokens : 0, 183);
+    assert.equal(usageEvents[0]?.kind === "usage" ? usageEvents[0].outputTokens : 0, 13);
+    assert.deepEqual(usageEvents[0]?.kind === "usage" ? usageEvents[0].metadata?.cache : undefined, { hitTokens: 0 });
   });
 });

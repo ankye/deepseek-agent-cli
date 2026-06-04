@@ -41,6 +41,8 @@ export type { ModelGatewayFamilyCapabilityOptions } from "./family-capabilities.
 
 const deepSeekProviderId = asId<"modelProvider">("provider-deepseek");
 const deepSeekCredentialRef = asId<"credentialRef">("credential-deepseek-api-key");
+const glmAnthropicProviderId = asId<"modelProvider">("provider-glm-anthropic");
+export const glmAnthropicCredentialRef = asId<"credentialRef">("credential-glm-anthropic-api-key");
 
 export const deepSeekOpenAIProviderConfig: ModelProviderConfig = {
   providerId: deepSeekProviderId,
@@ -54,6 +56,21 @@ export const defaultDeepSeekProfile: ModelProfile = {
   id: asId<"modelProfile">("model-deepseek-default"),
   providerId: deepSeekProviderId,
   model: "deepseek-v4-flash",
+  temperature: 0
+};
+
+export const glmAnthropicProviderConfig: ModelProviderConfig = {
+  providerId: glmAnthropicProviderId,
+  provider: "glm",
+  protocol: "anthropic-messages",
+  baseUrl: "https://open.bigmodel.cn/api/anthropic",
+  credentialRef: glmAnthropicCredentialRef
+};
+
+export const defaultGlmAnthropicProfile: ModelProfile = {
+  id: asId<"modelProfile">("model-glm-anthropic-default"),
+  providerId: glmAnthropicProviderId,
+  model: "glm-5.1",
   temperature: 0
 };
 
@@ -76,6 +93,13 @@ export interface ModelMetadataResolverOptions {
 }
 
 export interface DeepSeekOpenAIProviderOptions {
+  readonly config?: ModelProviderConfig;
+  readonly transport?: ModelProviderTransport;
+  readonly credentials?: ModelCredentialProvider;
+  readonly timeoutMs?: number;
+}
+
+export interface GlmAnthropicProviderOptions {
   readonly config?: ModelProviderConfig;
   readonly transport?: ModelProviderTransport;
   readonly credentials?: ModelCredentialProvider;
@@ -331,6 +355,93 @@ export class DeepSeekOpenAIProvider implements ModelGateway {
   }
 }
 
+export class GlmAnthropicProvider implements ModelGateway {
+  private readonly config: ModelProviderConfig;
+
+  constructor(private readonly options: GlmAnthropicProviderOptions = {}) {
+    this.config = options.config ?? glmAnthropicProviderConfig;
+  }
+
+  async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    const provider = this.providerMetadata(request.profile);
+    const pipelineFingerprint = requestPipelineFingerprint(request.metadata);
+    if (!this.options.transport) {
+      yield { kind: "error", error: providerError("PROVIDER_TRANSPORT_NOT_CONFIGURED", "GLM Anthropic-compatible provider transport is not configured.", false), provider };
+      return;
+    }
+
+    const credentialRef = request.credentialRef ?? this.config.credentialRef;
+    const credential = credentialRef ? await this.options.credentials?.resolve(credentialRef, request) : undefined;
+    if (credentialRef && !credential) {
+      yield { kind: "error", error: providerError("PROVIDER_CREDENTIAL_MISSING", "GLM Anthropic-compatible provider credential is missing.", false, { credentialRef }), provider };
+      return;
+    }
+
+    const providerRequest = this.buildProviderRequest(request, credential?.value);
+    const normalize = createGlmAnthropicChunkNormalizer();
+    let emittedDone = false;
+    try {
+      for await (const chunk of this.options.transport.stream(providerRequest, request.signal ? { signal: request.signal } : undefined)) {
+        for (const event of normalize(chunk, provider)) {
+          if (event.kind === "done") emittedDone = true;
+          yield attachPipelineCacheEvidence(event, pipelineFingerprint);
+        }
+      }
+      if (!emittedDone) yield { kind: "done", provider };
+    } catch (error) {
+      yield {
+        kind: "error",
+        error: providerError("PROVIDER_TRANSPORT_FAILED", error instanceof Error ? error.message : "GLM Anthropic-compatible provider transport failed.", true),
+        provider
+      };
+    }
+  }
+
+  async countTokens(text: string, _profile?: ModelProfile): Promise<number> {
+    return countWhitespaceTokens(text);
+  }
+
+  async verify(request: ModelLiveVerificationRequest): Promise<ModelLiveVerificationResult> {
+    return verifyByStreaming(this, request);
+  }
+
+  buildProviderRequest(request: ModelRequest, credentialValue = ""): ModelProviderRequest {
+    const providerOptions = request.profile.providerOptions ?? {};
+    const maxTokens = numberValue(providerOptions.max_tokens) ?? numberValue(providerOptions.maxTokens) ?? 1024;
+    const { max_tokens: _maxTokensSnake, maxTokens: _maxTokensCamel, ...passthroughProviderOptions } = providerOptions;
+    return {
+      url: `${this.config.baseUrl.replace(/\/$/, "")}/v1/messages`,
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "anthropic-version": "2023-06-01",
+        ...(credentialValue ? { "x-api-key": credentialValue } : {}),
+        ...(this.config.defaultHeaders ?? {})
+      },
+      body: {
+        model: request.profile.model,
+        messages: glmAnthropicMessagesFrom(request),
+        stream: true,
+        ...(request.profile.temperature !== undefined ? { temperature: request.profile.temperature } : {}),
+        ...(glmAnthropicSystemFrom(request) ? { system: glmAnthropicSystemFrom(request) } : {}),
+        ...(request.tools && request.tools.length > 0 ? { tools: request.tools.map(glmAnthropicToolFrom).filter((tool): tool is JsonObject => Boolean(tool)) } : {}),
+        ...(request.toolChoice !== undefined ? { tool_choice: formatAnthropicToolChoice(request.toolChoice) } : {}),
+        ...passthroughProviderOptions,
+        max_tokens: maxTokens
+      },
+      ...(request.timeoutMs ?? this.options.timeoutMs ? { timeoutMs: request.timeoutMs ?? this.options.timeoutMs } : {})
+    };
+  }
+
+  private providerMetadata(profile: ModelProfile): ModelProviderEventMetadata {
+    return {
+      provider: this.config.provider,
+      protocol: this.config.protocol,
+      model: profile.model
+    };
+  }
+}
+
 export interface DeepSeekJsonOutputParseResult extends JsonObject {
   readonly ok: boolean;
   readonly value?: JsonValue;
@@ -569,6 +680,69 @@ function anthropicMessagesFrom(messages: readonly ModelChatMessage[]): readonly 
     }));
 }
 
+function glmAnthropicSystemFrom(request: ModelRequest): string | undefined {
+  const messages = request.messages ?? [];
+  const system = messages
+    .filter((message) => message.role === "system")
+    .map((message) => message.content.trim())
+    .filter((content) => content.length > 0)
+    .join("\n\n");
+  return system.length > 0 ? system : undefined;
+}
+
+function glmAnthropicMessagesFrom(request: ModelRequest): readonly JsonObject[] {
+  const sourceMessages = request.messages && request.messages.length > 0
+    ? request.messages
+    : [{ role: "user" as const, content: request.prompt }];
+  const messages: JsonObject[] = [];
+  for (const message of sourceMessages) {
+    if (message.role === "system") continue;
+    if (message.role === "tool") {
+      messages.push({
+        role: "user",
+        content: `Internal tool feedback (${message.toolName ?? "tool"}):\n${message.content}`
+      });
+      continue;
+    }
+    if (message.role === "assistant" && message.toolCalls && message.toolCalls.length > 0) {
+      messages.push({
+        role: "assistant",
+        content: [
+          ...(message.content ? [{ type: "text", text: message.content }] : []),
+          ...message.toolCalls.map((toolCall) => ({
+            type: "tool_use",
+            id: toolCall.id,
+            name: toolCall.name,
+            input: toolCall.input
+          }))
+        ]
+      });
+      continue;
+    }
+    if (message.role === "user" || message.role === "assistant") {
+      messages.push({
+        role: message.role,
+        content: message.content
+      });
+    }
+  }
+  if (messages.length === 0) return [{ role: "user", content: request.prompt }];
+  return messages;
+}
+
+function glmAnthropicToolFrom(tool: JsonObject): JsonObject | undefined {
+  if (tool.type !== "function" || !isJsonObject(tool.function)) return undefined;
+  const fn = tool.function;
+  const name = stringValue(fn.name);
+  if (!name) return undefined;
+  const inputSchema = isJsonObject(fn.parameters) ? fn.parameters : { type: "object" };
+  return {
+    name,
+    ...(typeof fn.description === "string" && fn.description.length > 0 ? { description: fn.description } : {}),
+    input_schema: inputSchema
+  };
+}
+
 export class StaticCredentialProvider implements ModelCredentialProvider {
   constructor(private readonly value: string, private readonly ref: CredentialRef = deepSeekCredentialRef) {}
 
@@ -796,6 +970,139 @@ export function normalizeDeepSeekChunk(
   return events;
 }
 
+export function createGlmAnthropicChunkNormalizer(): (chunk: ModelProviderResponseChunk, provider: ModelProviderEventMetadata) => readonly ModelStreamEvent[] {
+  const toolBlocks = new Map<number, ToolCallFragment>();
+  let inputTokens: number | undefined;
+  let outputTokens: number | undefined;
+  let cacheReadInputTokens: number | undefined;
+  let usageEmitted = false;
+  let requestId: string | undefined;
+
+  function requestProvider(provider: ModelProviderEventMetadata): ModelProviderEventMetadata {
+    return requestId ? { ...provider, requestId } : provider;
+  }
+
+  function reset(): void {
+    toolBlocks.clear();
+    inputTokens = undefined;
+    outputTokens = undefined;
+    cacheReadInputTokens = undefined;
+    usageEmitted = false;
+    requestId = undefined;
+  }
+
+  function updateUsage(value: unknown): void {
+    if (!isJsonObject(value)) return;
+    inputTokens = numberValue(value.input_tokens) ?? inputTokens;
+    outputTokens = numberValue(value.output_tokens) ?? outputTokens;
+    cacheReadInputTokens = numberValue(value.cache_read_input_tokens) ?? cacheReadInputTokens;
+  }
+
+  return (chunk: ModelProviderResponseChunk, provider: ModelProviderEventMetadata): readonly ModelStreamEvent[] => {
+    const data = chunk.data;
+    const error = isJsonObject(data.error) ? data.error : data.type === "error" && isJsonObject(data.error) ? data.error : undefined;
+    if (error) {
+      return [{ kind: "error", error: providerError(String(error.code ?? error.type ?? "PROVIDER_ERROR"), String(error.message ?? "GLM Anthropic-compatible provider error."), Boolean(error.retryable ?? false)), provider: requestProvider(provider) }];
+    }
+
+    const events: ModelStreamEvent[] = [];
+    if (data.type === "message_start" && isJsonObject(data.message)) {
+      const message = data.message;
+      if (typeof message.id === "string" && message.id.length > 0) requestId = message.id;
+      updateUsage(message.usage);
+    }
+
+    if (data.type === "content_block_start") {
+      const index = numberValue(data.index) ?? 0;
+      const block = isJsonObject(data.content_block) ? data.content_block : undefined;
+      if (block?.type === "tool_use") {
+        toolBlocks.set(index, {
+          ...(typeof block.id === "string" ? { id: block.id } : {}),
+          ...(typeof block.name === "string" ? { name: block.name } : {}),
+          argumentsBuffer: "",
+          argumentsIsString: false,
+          ...(isJsonObject(block.input) ? { argumentsObject: block.input } : {})
+        });
+      }
+    }
+
+    if (data.type === "content_block_delta") {
+      const delta = isJsonObject(data.delta) ? data.delta : undefined;
+      if (delta?.type === "text_delta") {
+        const text = stringValue(delta.text);
+        if (text) events.push({ kind: "delta", text, provider: requestProvider(provider) });
+      }
+      if (delta?.type === "input_json_delta") {
+        const index = numberValue(data.index) ?? 0;
+        let block = toolBlocks.get(index);
+        if (!block) {
+          block = { argumentsBuffer: "", argumentsIsString: true };
+          toolBlocks.set(index, block);
+        }
+        const partial = stringValue(delta.partial_json);
+        if (partial) {
+          block.argumentsBuffer += partial;
+          block.argumentsIsString = true;
+        }
+      }
+    }
+
+    if (data.type === "content_block_stop") {
+      const index = numberValue(data.index) ?? 0;
+      const block = toolBlocks.get(index);
+      if (block?.name) {
+        const input = block.argumentsIsString
+          ? parseToolInput(block.argumentsBuffer)
+          : block.argumentsObject ?? {};
+        events.push({
+          kind: "tool-call",
+          ...(block.id ? { id: block.id } : {}),
+          name: block.name,
+          input,
+          provider: requestProvider(provider)
+        });
+      }
+      toolBlocks.delete(index);
+    }
+
+    if (data.type === "message_delta") {
+      const delta = isJsonObject(data.delta) ? data.delta : undefined;
+      const finishReason = normalizeAnthropicStopReason(delta?.stop_reason);
+      if (finishReason) events.push({ kind: "finish", reason: finishReason, provider: requestProvider(provider) });
+      updateUsage(data.usage);
+    }
+
+    if (!usageEmitted && data.type === "message_delta" && inputTokens !== undefined && outputTokens !== undefined) {
+      usageEmitted = true;
+      const metadata: ModelUsageMetadata = {
+        inputTokens,
+        outputTokens,
+        ...(cacheReadInputTokens !== undefined ? { cache: { hitTokens: cacheReadInputTokens } } : {}),
+        provider: requestProvider(provider)
+      };
+      events.push({
+        kind: "usage",
+        inputTokens,
+        outputTokens,
+        metadata
+      });
+    }
+
+    if (data.type === "message_stop") {
+      events.push({ kind: "done", provider: requestProvider(provider) });
+      reset();
+    }
+
+    return events;
+  };
+}
+
+const defaultGlmAnthropicChunkNormalizer = createGlmAnthropicChunkNormalizer();
+
+export function normalizeGlmAnthropicChunk(chunk: ModelProviderResponseChunk, provider: ModelProviderEventMetadata): readonly ModelStreamEvent[] {
+  return defaultGlmAnthropicChunkNormalizer(chunk, provider);
+}
+
 function normalizeToolCall(value: unknown, provider: ModelProviderEventMetadata): ModelStreamEvent | undefined {
   if (!isJsonObject(value)) return undefined;
   const fn = isJsonObject(value.function) ? value.function : undefined;
@@ -891,6 +1198,21 @@ function normalizeFinishReason(value: unknown): ModelFinishReason | undefined {
       return "tool-call";
     case "content_filter":
       return "content-filter";
+    default:
+      return "unknown";
+  }
+}
+
+function normalizeAnthropicStopReason(value: unknown): ModelFinishReason | undefined {
+  if (value === undefined || value === null) return undefined;
+  switch (String(value)) {
+    case "end_turn":
+    case "stop_sequence":
+      return "stop";
+    case "max_tokens":
+      return "length";
+    case "tool_use":
+      return "tool-call";
     default:
       return "unknown";
   }

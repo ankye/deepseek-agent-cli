@@ -185,6 +185,14 @@ describe("cli host adapter", () => {
       live: true,
       reasoning: { enabled: true, providerEffort: "max" }
     });
+    assert.deepEqual(parseCliArgs(["run", "glm task", "--live", "--provider", "glm", "--model", "glm-5.1", "--output", "jsonl"]), {
+      command: "run",
+      prompt: "glm task",
+      output: "jsonl",
+      live: true,
+      modelProvider: "glm",
+      model: "glm-5.1"
+    });
     assert.deepEqual(parseCliArgs(["index-provider", "set", "zvec", "enabled", "--user", "--output", "json"]), {
       command: "index-provider",
       prompt: "",
@@ -678,6 +686,39 @@ describe("cli host adapter", () => {
     assert.deepEqual(capturedRequests[0]?.reasoning, { enabled: true, providerEffort: "max" });
     assert.equal(lines.some((line) => line.includes("agent.loop.completed")), true);
     await kernel.shutdown("cli-test-live-reasoning-explicit");
+  });
+
+  it("passes explicit GLM model profile through live one-shot runs", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    const capturedRequests: ModelRequest[] = [];
+    const runtimeDeps = {
+      ...deps,
+      models: new CaptureModelRequestGateway(capturedRequests)
+    };
+    await registerRuntimeCoreTools(runtimeDeps, process.cwd());
+    const kernel = await createDefaultRuntimeKernel(runtimeDeps);
+    const lines: string[] = [];
+
+    await runCli(
+      ["run", "glm flow", "--output", "jsonl", "--live", "--provider", "glm", "--model", "glm-5.1"],
+      (line: string) => {
+        lines.push(line);
+      },
+      [],
+      { stdinIsTTY: false, stdoutIsTTY: false },
+      {
+        createRuntime: async (runtimeOptions) => {
+          assert.equal(runtimeOptions.modelProvider, "glm");
+          assert.equal(runtimeOptions.model, "glm-5.1");
+          return { deps: runtimeDeps, kernel };
+        }
+      }
+    );
+
+    assert.equal(String(capturedRequests[0]?.profile.providerId), "provider-glm-anthropic");
+    assert.equal(capturedRequests[0]?.profile.model, "glm-5.1");
+    assert.equal(lines.some((line) => line.includes("agent.loop.completed")), true);
+    await kernel.shutdown("cli-test-live-glm-profile");
   });
 
   it("projects one-shot output contracts through prompt assembly and verification", async () => {

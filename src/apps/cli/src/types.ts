@@ -32,6 +32,8 @@ export interface CliOptions {
   readonly output: AgentLoopOutputMode;
   readonly outputContract?: AgentLoopOutputContract;
   readonly live: boolean;
+  readonly modelProvider?: "deepseek" | "glm";
+  readonly model?: string;
   readonly tuiProfile?: CliTuiProfile;
   readonly timeoutMs?: number;
   readonly reasoning?: ModelReasoningOptions;
@@ -86,6 +88,8 @@ export interface CliRuntimeFactoryOptions {
   readonly live: boolean;
   readonly workspaceRoot: string;
   readonly toolProjection?: CliOptions["toolProjection"];
+  readonly modelProvider?: CliOptions["modelProvider"];
+  readonly model?: CliOptions["model"];
 }
 
 export interface CliRunOptions {

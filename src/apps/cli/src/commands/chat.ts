@@ -1,7 +1,7 @@
 import type { AgentLoopTerminalStatus, RuntimeEvent } from "@deepseek/platform-contracts";
-import { defaultDeepSeekProfile } from "@deepseek/model-gateway";
 import type { CliInputStream, CliOptions, CliRunOptions } from "../types.js";
 import { createCliAgentRuntime } from "../host/runtime.js";
+import { resolveCliModelProfile } from "../host/model-selection.js";
 import type { CliTerminalCapabilityProfile } from "../host/terminal-profile.js";
 import { createInitialChatModeControlState, restoreChatModeControlState, updateChatModeControlState } from "./chat-mode-controls.js";
 import { writeChatLocalLines, writeLocalFailure } from "./chat-local-output.js";
@@ -76,7 +76,8 @@ export async function runChatCommand(
   runOptions: CliRunOptions
 ): Promise<void> {
   const workspaceRoot = process.cwd();
-  const runtime = await createCliAgentRuntime({ live: options.live, workspaceRoot }, runOptions);
+  const runtime = await createCliAgentRuntime({ live: options.live, workspaceRoot, ...(options.modelProvider ? { modelProvider: options.modelProvider } : {}), ...(options.model ? { model: options.model } : {}) }, runOptions);
+  const profile = resolveCliModelProfile(options);
   const state: ChatSessionState = {
     sessionId: options.sessionId,
     turns: 0,
@@ -170,7 +171,7 @@ export async function runChatCommand(
         outputMode: options.output,
         workspaceRoot,
         caller: "cli.chat",
-        profile: defaultDeepSeekProfile,
+        profile,
         live: options.live,
         ...(reasoning ? { reasoning } : {}),
         ...(referenceContext ? { referenceContext } : {}),

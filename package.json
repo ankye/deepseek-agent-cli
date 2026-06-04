@@ -23,6 +23,7 @@
     "test:e2e": "tsx --test \"tests/e2e/**/*.test.ts\"",
     "smoke:headless": "tsx src/apps/cli/src/index.ts run \"smoke\" --output jsonl",
     "smoke:live:deepseek": "tsx --test \"tests/live/deepseek-provider-live-smoke.test.ts\"",
+    "smoke:live:glm": "tsx --test \"tests/live/glm-anthropic-provider-live-smoke.test.ts\"",
     "smoke:live:agent-loop": "tsx --test \"tests/live/deepseek-agent-loop-live-smoke.test.ts\"",
     "smoke:live:agent-tools": "tsx --test \"tests/live/deepseek-agent-tool-live-smoke.test.ts\"",
     "smoke:live:e2e": "tsx --test \"tests/integration/live-factory-real-fs.test.ts\"",

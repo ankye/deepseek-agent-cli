@@ -1,6 +1,6 @@
-import { defaultDeepSeekProfile } from "@deepseek/model-gateway";
 import type { CliOptions, CliRunOptions } from "../types.js";
 import { createCliAgentRuntime } from "../host/runtime.js";
+import { resolveCliModelProfile } from "../host/model-selection.js";
 import { collectCliProjectRuleEvidence } from "../host/project-rules.js";
 import type { CliTerminalCapabilityProfile } from "../host/terminal-profile.js";
 import { emitAgentLoop, finalAgentLoopEvent, renderFinalJsonIfNeeded, resumeHint } from "../renderers/runtime-events.js";
@@ -14,16 +14,17 @@ export async function runOneShotCommand(
   runOptions: CliRunOptions
 ): Promise<void> {
   const workspaceRoot = process.cwd();
-  const runtime = await createCliAgentRuntime({ live: options.live, workspaceRoot, ...(options.toolProjection ? { toolProjection: options.toolProjection } : {}) }, runOptions);
+  const runtime = await createCliAgentRuntime({ live: options.live, workspaceRoot, ...(options.toolProjection ? { toolProjection: options.toolProjection } : {}), ...(options.modelProvider ? { modelProvider: options.modelProvider } : {}), ...(options.model ? { model: options.model } : {}) }, runOptions);
   const reasoning = options.reasoning ?? (options.live ? { enabled: false } : undefined);
   const projectRules = await collectCliProjectRuleEvidence(runtime.deps.platform, workspaceRoot);
+  const profile = resolveCliModelProfile(options);
   try {
     const events = await emitAgentLoop(runtime.deps, runtime.kernel, {
       prompt: options.prompt,
       outputMode: options.output,
       workspaceRoot,
       caller: "cli.run",
-      profile: defaultDeepSeekProfile,
+      profile,
       live: options.live,
       ...(reasoning ? { reasoning } : {}),
       projectRules,

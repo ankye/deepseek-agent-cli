@@ -2,9 +2,10 @@ import type { RuntimeDependencies, RuntimeKernel } from "@deepseek/platform-cont
 import {
   CredentialAuthModelCredentialProvider,
   createDeepSeekCredentialAuthServiceFromEnv,
-  deepSeekLiveCredentialProcessEnv
+  deepSeekLiveCredentialProcessEnv,
+  glmAnthropicLiveCredentialProcessEnv
 } from "@deepseek/credential-auth-management";
-import { OpenAIModelProviderTransport } from "@deepseek/model-gateway";
+import { FetchModelProviderTransport, GlmAnthropicProvider, OpenAIModelProviderTransport, StaticCredentialProvider, glmAnthropicCredentialRef } from "@deepseek/model-gateway";
 import { DurablePermanentMemoryProvider, FilesystemPermanentMemoryStorageAdapter, PersistentJsonlLosslessContextManager } from "@deepseek/memory-cache-management";
 import { NodePlatformRuntime } from "@deepseek/platform-abstraction";
 import { createDefaultRuntimeKernel, loadUserHooks, registerRuntimeCoreTools } from "@deepseek/runtime";
@@ -15,21 +16,46 @@ import type { CliRunOptions, CliRuntimeFactoryOptions } from "../types.js";
 export async function createCliAgentRuntime(options: CliRuntimeFactoryOptions, runOptions: CliRunOptions): Promise<{ readonly deps: RuntimeDependencies; readonly kernel: RuntimeKernel }> {
   if (runOptions.createRuntime) return runOptions.createRuntime(options);
   const platform = new NodePlatformRuntime();
-  const liveCredentialEnv = options.live ? await deepSeekLiveCredentialProcessEnv(platform, options.workspaceRoot) : undefined;
+  const liveCredentialEnv = options.live && options.modelProvider !== "glm" ? await deepSeekLiveCredentialProcessEnv(platform, options.workspaceRoot) : undefined;
   const deps: RuntimeDependencies = options.live
-    ? withCliPermanentMemory(createLiveCliDependencies({
-        workspaceRoot: options.workspaceRoot,
-        credentials: new CredentialAuthModelCredentialProvider(await createDeepSeekCredentialAuthServiceFromEnv(liveCredentialEnv)),
-        transport: new OpenAIModelProviderTransport(),
-        timeoutMs: 90_000,
-        allowWorkspaceWrites: options.toolProjection === "read-write" || options.toolProjection === "all"
-      }))
+    ? await createLiveRuntimeDependencies(options, platform, liveCredentialEnv)
     : createCliSessionDependenciesBase(platform);
   await loadUserHooks(options.workspaceRoot, deps, platform).catch((error: unknown) => {
     console.warn(`deepseek: user hook loading failed: ${error instanceof Error ? error.message : String(error)}`);
   });
   await registerRuntimeCoreTools(deps, options.workspaceRoot);
   return { deps, kernel: await createDefaultRuntimeKernel(deps) };
+}
+
+async function createLiveRuntimeDependencies(
+  options: CliRuntimeFactoryOptions,
+  platform: NodePlatformRuntime,
+  deepSeekEnv: Awaited<ReturnType<typeof deepSeekLiveCredentialProcessEnv>> | undefined
+): Promise<RuntimeDependencies> {
+  const allowWorkspaceWrites = options.toolProjection === "read-write" || options.toolProjection === "all";
+  if (options.modelProvider === "glm") {
+    const glmEnv = await glmAnthropicLiveCredentialProcessEnv(platform, options.workspaceRoot);
+    const token = firstNonEmpty(glmEnv.GLM_ANTHROPIC_API_KEY, glmEnv.ZHIPU_API_KEY);
+    return withCliPermanentMemory({
+      ...createLiveCliDependencies({
+        workspaceRoot: options.workspaceRoot,
+        timeoutMs: 90_000,
+        allowWorkspaceWrites
+      }),
+      models: new GlmAnthropicProvider({
+        transport: new FetchModelProviderTransport(),
+        timeoutMs: 90_000,
+        ...(token ? { credentials: new StaticCredentialProvider(token, glmAnthropicCredentialRef) } : {})
+      })
+    });
+  }
+  return withCliPermanentMemory(createLiveCliDependencies({
+    workspaceRoot: options.workspaceRoot,
+    credentials: new CredentialAuthModelCredentialProvider(await createDeepSeekCredentialAuthServiceFromEnv(deepSeekEnv)),
+    transport: new OpenAIModelProviderTransport(),
+    timeoutMs: 90_000,
+    allowWorkspaceWrites
+  }));
 }
 
 export async function resolveSessionDependencies(runOptions: CliRunOptions, workspaceRoot = process.cwd()): Promise<RuntimeDependencies> {
@@ -72,4 +98,8 @@ function createPersistentPermanentMemoryProvider(): DurablePermanentMemoryProvid
     adapter: new FilesystemPermanentMemoryStorageAdapter(platform, path),
     providerId: "permanent-memory.cli-json"
   });
+}
+
+function firstNonEmpty(...values: readonly (string | undefined)[]): string | undefined {
+  return values.find((value) => typeof value === "string" && value.trim().length > 0)?.trim();
 }

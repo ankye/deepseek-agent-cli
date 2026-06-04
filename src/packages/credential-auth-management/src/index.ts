@@ -20,6 +20,7 @@ import { asId } from "@deepseek/platform-contracts";
 import { join } from "node:path";
 
 export type DeepSeekCredentialEnv = Readonly<Record<"DEEPSEEK_API_KEY" | "DEEPSEEK_TOKEN", string | undefined>>;
+export type GlmAnthropicCredentialEnv = Readonly<Record<"GLM_ANTHROPIC_API_KEY" | "ZHIPU_API_KEY", string | undefined>>;
 
 const defaultDeepSeekCredentialRef = asId<"credentialRef">("credential-deepseek-api-key");
 
@@ -178,6 +179,14 @@ export async function deepSeekLiveCredentialProcessEnv(platform: Pick<PlatformRu
   };
 }
 
+export async function glmAnthropicLiveCredentialProcessEnv(platform: Pick<PlatformRuntime, "readFile">, cwd = process.cwd(), env: Readonly<Record<string, string | undefined>> = process.env): Promise<GlmAnthropicCredentialEnv> {
+  const envFile = await readGlmAnthropicCredentialEnvFile(platform, join(cwd, ".env"));
+  return {
+    GLM_ANTHROPIC_API_KEY: firstNonEmpty(env.GLM_ANTHROPIC_API_KEY, envFile.GLM_ANTHROPIC_API_KEY),
+    ZHIPU_API_KEY: firstNonEmpty(env.ZHIPU_API_KEY, envFile.ZHIPU_API_KEY)
+  };
+}
+
 async function readDeepSeekCredentialEnvFile(platform: Pick<PlatformRuntime, "readFile">, path: string): Promise<DeepSeekCredentialEnv> {
   try {
     const text = await platform.readFile(path);
@@ -197,6 +206,28 @@ async function readDeepSeekCredentialEnvFile(platform: Pick<PlatformRuntime, "re
     };
   } catch {
     return { DEEPSEEK_API_KEY: undefined, DEEPSEEK_TOKEN: undefined };
+  }
+}
+
+async function readGlmAnthropicCredentialEnvFile(platform: Pick<PlatformRuntime, "readFile">, path: string): Promise<GlmAnthropicCredentialEnv> {
+  try {
+    const text = await platform.readFile(path);
+    const values: Record<string, string | undefined> = {};
+    for (const line of text.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const index = trimmed.indexOf("=");
+      if (index <= 0) continue;
+      const key = trimmed.slice(0, index).trim();
+      if (key !== "GLM_ANTHROPIC_API_KEY" && key !== "ZHIPU_API_KEY") continue;
+      values[key] = unquoteEnvValue(trimmed.slice(index + 1).trim());
+    }
+    return {
+      GLM_ANTHROPIC_API_KEY: firstNonEmpty(values.GLM_ANTHROPIC_API_KEY),
+      ZHIPU_API_KEY: firstNonEmpty(values.ZHIPU_API_KEY)
+    };
+  } catch {
+    return { GLM_ANTHROPIC_API_KEY: undefined, ZHIPU_API_KEY: undefined };
   }
 }
 

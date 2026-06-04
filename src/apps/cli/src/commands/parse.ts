@@ -15,12 +15,14 @@ export function parseCliArgs(args: readonly string[], _terminal: CliTerminalFlag
   const reasoning = parseReasoningOptions(args);
   const outputContract = parseOutputContract(args);
   const tuiProfile = parseTuiProfile(args);
+  const modelProvider = parseModelProvider(args);
+  const model = readFlagValue(args, "--model");
   const first = args[0];
   if (!first || first === "help" || first === "--help" || first === "-h") {
     return { command: "help", prompt: "", output, live };
   }
   if (first === "run") {
-    return { command: "run", prompt: promptFromArgs(args.slice(1)), output, live, ...(outputContract ? { outputContract } : {}), ...(timeoutMs ? { timeoutMs } : {}), ...(toolProjection ? { toolProjection } : {}), ...(reasoning ? { reasoning } : {}) };
+    return { command: "run", prompt: promptFromArgs(args.slice(1)), output, live, ...(outputContract ? { outputContract } : {}), ...(timeoutMs ? { timeoutMs } : {}), ...(toolProjection ? { toolProjection } : {}), ...(reasoning ? { reasoning } : {}), ...(modelProvider ? { modelProvider } : {}), ...(model ? { model } : {}) };
   }
   if (first === "chat") {
     const sessionId = readFlagValue(args, "--session");
@@ -32,6 +34,8 @@ export function parseCliArgs(args: readonly string[], _terminal: CliTerminalFlag
       ...(tuiProfile ? { tuiProfile } : {}),
       ...(timeoutMs ? { timeoutMs } : {}),
       ...(reasoning ? { reasoning } : {}),
+      ...(modelProvider ? { modelProvider } : {}),
+      ...(model ? { model } : {}),
       ...(sessionId ? { sessionId: asId<"session">(sessionId) } : {})
     };
   }
@@ -222,8 +226,8 @@ export function cliUsageLines(): readonly string[] {
   return [
     "DeepSeek CLI",
     "Usage:",
-    "  deepseek run \"<task>\" [--output text|json|jsonl] [--live] [--thinking off|low|medium|high|xhigh|max] [--tool-projection none|read-only|read-write|all] [--no-tools] [--timeout-ms <ms>] [--output-contract json-object|json-file|file|command-plan]",
-    "  deepseek chat [--session <session-id>] [--output text|json|jsonl] [--live] [--thinking off|low|medium|high|xhigh|max] [--tui auto|line|full-screen|off] [--timeout-ms <ms>]",
+    "  deepseek run \"<task>\" [--output text|json|jsonl] [--live] [--provider deepseek|glm] [--model <model>] [--thinking off|low|medium|high|xhigh|max] [--tool-projection none|read-only|read-write|all] [--no-tools] [--timeout-ms <ms>] [--output-contract json-object|json-file|file|command-plan]",
+    "  deepseek chat [--session <session-id>] [--output text|json|jsonl] [--live] [--provider deepseek|glm] [--model <model>] [--thinking off|low|medium|high|xhigh|max] [--tui auto|line|full-screen|off] [--timeout-ms <ms>]",
     "  deepseek session resume <session-id> [--output text|json]",
     "  deepseek session fork <session-id> [--output text|json]",
     "  deepseek mcp test <manifest.json> [--enable-real-mcp] [--call <tool> --input <json>] [--output text|json]",
@@ -620,6 +624,12 @@ function parseToolProjection(args: readonly string[]): CliOptions["toolProjectio
   return undefined;
 }
 
+function parseModelProvider(args: readonly string[]): CliOptions["modelProvider"] {
+  const value = readFlagValue(args, "--provider") ?? readFlagValue(args, "--model-provider");
+  if (value === "deepseek" || value === "glm") return value;
+  return undefined;
+}
+
 function parseReasoningOptions(args: readonly string[]): ModelReasoningOptions | undefined {
   const value = readFlagValue(args, "--thinking") ?? readFlagValue(args, "--reasoning-effort");
   if (!value) return undefined;
@@ -677,6 +687,9 @@ function promptFromArgs(args: readonly string[]): string {
       value === "--tui" ||
       value === "--thinking" ||
       value === "--reasoning-effort" ||
+      value === "--provider" ||
+      value === "--model-provider" ||
+      value === "--model" ||
       value === "--output-contract" ||
       value === "--output-contract-path" ||
       value === "--output-schema" ||

@@ -5,7 +5,8 @@ import {
   DeepSeekCredentialAuthService,
   InMemoryCredentialStorageAdapter,
   createDeepSeekCredentialAuthServiceFromEnv,
-  deepSeekLiveCredentialProcessEnv
+  deepSeekLiveCredentialProcessEnv,
+  glmAnthropicLiveCredentialProcessEnv
 } from "@deepseek/credential-auth-management";
 import { asId } from "@deepseek/platform-contracts";
 import type { ConfigDocument, ModelLiveVerificationResult, ReadinessLiveCheckInput } from "@deepseek/platform-contracts";
@@ -48,6 +49,16 @@ describe("persistent config and auth contracts", () => {
     assert.equal(credential?.value, fakeSecret);
     assert.equal(references.length, 1);
     assert.equal(JSON.stringify(references).includes(fakeSecret), false);
+  });
+
+  it("hydrates GLM Anthropic credentials from process env before workspace env files", async () => {
+    const env = await glmAnthropicLiveCredentialProcessEnv({
+      readFile: async () => `GLM_ANTHROPIC_API_KEY=file-secret\nZHIPU_API_KEY=file-zhipu\n`
+    }, "/workspace", { GLM_ANTHROPIC_API_KEY: fakeSecret });
+
+    assert.equal(env.GLM_ANTHROPIC_API_KEY, fakeSecret);
+    assert.equal(env.ZHIPU_API_KEY, "file-zhipu");
+    assert.equal(JSON.stringify({ ...env, GLM_ANTHROPIC_API_KEY: "present" }).includes(fakeSecret), false);
   });
 
   it("defines readiness live-check and live verification result shapes", () => {
