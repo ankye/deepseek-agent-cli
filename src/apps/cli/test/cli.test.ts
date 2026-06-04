@@ -3277,10 +3277,22 @@ describe("cli host adapter", () => {
     const parsed = JSON.parse(lines[0] ?? "{}") as {
       evaluation?: {
         mode?: string;
-        taskRuns?: readonly { task?: { taskId?: string; category?: string; checkCommands?: readonly string[]; mode?: string } }[];
+        taskRuns?: readonly {
+          task?: { taskId?: string; category?: string; checkCommands?: readonly string[]; mode?: string };
+          stagedTask?: {
+            profileId?: string;
+            graphId?: string;
+            profileFingerprint?: string;
+            stageCount?: number;
+            executorKinds?: readonly string[];
+            graph?: { profileId?: string; stages?: readonly { stageId?: string; executorKind?: string }[] };
+            runState?: { taskRunId?: string; events?: readonly unknown[]; stageStates?: readonly { status?: string }[] };
+          };
+        }[];
       };
     };
-    const webpage = parsed.evaluation?.taskRuns?.find((run) => run.task?.taskId === "eval.webpage.generation")?.task;
+    const webpageRun = parsed.evaluation?.taskRuns?.find((run) => run.task?.taskId === "eval.webpage.generation");
+    const webpage = webpageRun?.task;
     const webpageRepair = parsed.evaluation?.taskRuns?.find((run) => run.task?.taskId === "eval.webpage.failing-first-repair")?.task;
     const codingRepair = parsed.evaluation?.taskRuns?.find((run) => run.task?.taskId === "eval.coding.failing-first-typecheck")?.task;
 
@@ -3288,6 +3300,15 @@ describe("cli host adapter", () => {
     assert.equal(webpage?.category, "webpage-generation");
     assert.equal(webpage?.mode, "full");
     assert.equal(webpage?.checkCommands?.includes("node scripts/check-webpage-generation.mjs tests/evaluation/generated-webpage"), true);
+    assert.equal(webpageRun?.stagedTask?.profileId, "evaluation/webpage-generation.v1");
+    assert.equal(webpageRun?.stagedTask?.graph?.profileId, "evaluation/webpage-generation.v1");
+    assert.equal(webpageRun?.stagedTask?.graphId?.startsWith("graph:evaluation/webpage-generation.v1:"), true);
+    assert.equal(webpageRun?.stagedTask?.profileFingerprint?.startsWith("fnv1a:"), true);
+    assert.equal((webpageRun?.stagedTask?.stageCount ?? 0) >= 5, true);
+    assert.equal(webpageRun?.stagedTask?.executorKinds?.includes("agent-loop"), true);
+    assert.equal(webpageRun?.stagedTask?.runState?.taskRunId, "staged:eval:deepseek-cli:eval.webpage.generation");
+    assert.equal(webpageRun?.stagedTask?.runState?.events?.length, 0);
+    assert.equal(webpageRun?.stagedTask?.runState?.stageStates?.some((stage) => stage.status === "ready"), true);
     assert.equal(webpageRepair?.category, "webpage-repair");
     assert.equal(webpageRepair?.checkCommands?.includes("node scripts/check-webpage-generation.mjs tests/evaluation/generated-webpage"), true);
     assert.equal(codingRepair?.category, "coding-repair");

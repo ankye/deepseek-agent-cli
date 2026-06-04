@@ -3,6 +3,7 @@ import type { AgentLoopBudgetKind, AgentPhaseName } from "./agent-mode.js";
 import type { EvidenceManifestStatus } from "./evidence-first.js";
 import type { PackageScorecardAggregate, PackageScorecardSummary } from "./package-scorecard.js";
 import type { ReadinessStatus } from "./readiness.js";
+import type { StagedTaskGraph, StagedTaskRunState } from "./staged-task.js";
 import type { ToolFamilyParityMatrix } from "./tool-family.js";
 
 export const CLI_TASK_EVALUATION_SCHEMA_VERSION = "1.0.0";
@@ -182,6 +183,19 @@ export interface CliEvaluationInstrumentationEvent extends JsonObject {
   readonly redaction: RedactionMetadata;
 }
 
+export interface CliEvaluationStagedTaskSnapshot extends JsonObject {
+  readonly schemaVersion: string;
+  readonly profileId: string;
+  readonly graphId: string;
+  readonly profileFingerprint: string;
+  readonly stageCount: number;
+  readonly refCount: number;
+  readonly executorKinds: readonly string[];
+  readonly graph: StagedTaskGraph;
+  readonly runState: StagedTaskRunState;
+  readonly redaction: RedactionMetadata;
+}
+
 export interface CliEvaluationTaskRunRecord extends JsonObject {
   readonly schemaVersion: string;
   readonly kind: "cli.evaluation.task-run";
@@ -192,6 +206,7 @@ export interface CliEvaluationTaskRunRecord extends JsonObject {
   readonly outcome: CliEvaluationOutcome;
   readonly checks: readonly CliEvaluationCheckResult[];
   readonly metrics: CliEvaluationRunMetrics;
+  readonly stagedTask?: CliEvaluationStagedTaskSnapshot;
   readonly instrumentationEvents: readonly CliEvaluationInstrumentationEvent[];
   readonly diagnostics: readonly CliEvaluationDiagnostic[];
   readonly evidencePaths: readonly string[];

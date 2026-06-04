@@ -10,7 +10,7 @@ import type {
 } from "@deepseek/platform-contracts";
 import { CLI_TASK_EVALUATION_SCHEMA_VERSION } from "@deepseek/platform-contracts";
 import { evaluationLiveCredentialEnv, evaluationModelSelectionArgs } from "./evaluation-provider-selection.js";
-import { buildEvaluationStageGraph } from "./evaluation-stage-graph.js";
+import { buildEvaluationStagedTaskSnapshot } from "./evaluation-stage-graph.js";
 import { generatedArtifactMetrics } from "./generated-artifacts.js";
 import {
   emptyMetrics,
@@ -67,7 +67,7 @@ async function executeWebpageTask(
   options: CliEvaluationOptions
 ): Promise<CliEvaluationTaskRunRecord> {
   const runId = `eval:${baseline.baselineId}:${task.taskId}`;
-  buildEvaluationStageGraph(task);
+  const stagedTask = buildEvaluationStagedTaskSnapshot(task, runId);
   const events = createEventRecorder(runId, baseline.baselineId, task.taskId);
   events.record("run_started", { dryRun: false });
   const workspaceRoot = await isolatedWorkspaceRoot(platform, runId);
@@ -83,7 +83,7 @@ async function executeWebpageTask(
 
   const started = Date.now();
   const command = await baselineCommandForExecution(platform, baseline.baselineId, options, workspaceRoot, webpageTaskPrompt(task));
-  if (!command) return invalidRun(platform, task, baseline, events, workspaceRoot, started);
+  if (!command) return invalidRun(platform, task, baseline, events, workspaceRoot, started, stagedTask);
 
   events.record("prompt_sent", { adapter: baseline.baselineId });
   events.record("command_started", { command: command.command, argCount: command.args.length });
@@ -212,6 +212,7 @@ async function executeWebpageTask(
       recoveryUsed: correctionCount > 0,
       redaction: { class: "internal", fields: ["estimatedCostUsd"] }
     },
+    stagedTask,
     instrumentationEvents: events.events(),
     diagnostics: [
       ...(commandFailed ? [diagnostic("CLI_EVALUATION_BASELINE_COMMAND_FAILED", "warn", `${baseline.baselineId} exited with code ${runResult.exitCode}.`)] : []),
@@ -241,7 +242,6 @@ async function executeStructuredTask(
   const taskPath = platform.resolvePath(workspaceRoot, "TASK.md");
   await platform.writeFile(taskPath, prompt);
   events.record("prompt_written", { path: taskPath });
-
   const started = Date.now();
   const command = await baselineCommandForExecution(platform, baseline.baselineId, options, workspaceRoot, prompt);
   if (!command) return invalidRun(platform, task, baseline, events, workspaceRoot, started);
@@ -709,7 +709,8 @@ async function invalidRun(
   baseline: CliEvaluationBaselineDefinition,
   events: EvaluationEventRecorder,
   workspaceRoot: string,
-  started: number
+  started: number,
+  stagedTask?: CliEvaluationTaskRunRecord["stagedTask"]
 ): Promise<CliEvaluationTaskRunRecord> {
   return {
     schemaVersion: CLI_TASK_EVALUATION_SCHEMA_VERSION,
@@ -721,6 +722,7 @@ async function invalidRun(
     outcome: "invalid",
     checks: [],
     metrics: { ...emptyMetrics(), elapsedMs: Date.now() - started },
+    ...(stagedTask ? { stagedTask } : {}),
     instrumentationEvents: withRecordedEvent(events, "run_finished", { outcome: "invalid" }),
     diagnostics: [diagnostic("CLI_EVALUATION_EXECUTION_ADAPTER_UNAVAILABLE", "error", `${baseline.baselineId} has no execution adapter for ${task.taskId}.`)],
     evidencePaths: [workspaceRoot],

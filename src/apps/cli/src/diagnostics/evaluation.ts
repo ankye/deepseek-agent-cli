@@ -20,6 +20,7 @@ import {
   emptyMetrics
 } from "./evaluation-metrics.js";
 import { executeEvaluationTask, shouldRetryEvaluationTask } from "./evaluation-task-execution.js";
+import { buildOptionalEvaluationStagedTaskSnapshot } from "./evaluation-stage-graph.js";
 import { collectPackageScorecards } from "./package-scorecard.js";
 import { readLiveToolCoverageEvidence, type LiveToolCoverageRecord } from "./tool-live-coverage.js";
 
@@ -262,10 +263,12 @@ async function probeExternalBaseline(
 
 function plannedRun(task: CliEvaluationTaskDefinition, baseline: CliEvaluationBaselineDefinition, dryRun: boolean): CliEvaluationTaskRunRecord {
   const deferred = baseline.status !== "available";
+  const runId = `eval:${baseline.baselineId}:${task.taskId}`;
+  const stagedTask = buildOptionalEvaluationStagedTaskSnapshot(task, runId);
   return {
     schemaVersion: CLI_TASK_EVALUATION_SCHEMA_VERSION,
     kind: "cli.evaluation.task-run",
-    runId: `eval:${baseline.baselineId}:${task.taskId}`,
+    runId,
     task,
     baseline,
     dryRun,
@@ -276,6 +279,7 @@ function plannedRun(task: CliEvaluationTaskDefinition, baseline: CliEvaluationBa
       redaction: { class: "internal", fields: ["command"] }
     })),
     metrics: emptyMetrics(),
+    ...(stagedTask ? { stagedTask } : {}),
     instrumentationEvents: [],
     diagnostics: deferred ? baseline.diagnostics : [],
     evidencePaths: [],

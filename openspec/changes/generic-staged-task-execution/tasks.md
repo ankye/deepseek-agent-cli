@@ -31,3 +31,10 @@
 - [x] 5.1 Validate the OpenSpec change in strict mode. / 使用 strict mode 校验 OpenSpec change。
 - [x] 5.2 Run focused tests for platform contracts, runtime staged task execution, and CLI evaluation. / 运行 platform contracts、runtime staged task execution 与 CLI evaluation 聚焦测试。
 - [x] 5.3 Run repository static gates before commit. / 提交前运行仓库静态门。
+
+## 6. CLI Evaluation Snapshot / CLI 评估快照
+
+- [x] 6.1 Add failing tests that webpage evaluation run records expose staged task snapshots. / 增加失败测试，验证网页 evaluation run records 暴露 staged task snapshots。
+- [x] 6.2 Add a redacted `CliEvaluationStagedTaskSnapshot` DTO with graph and run-state references. / 增加 redacted `CliEvaluationStagedTaskSnapshot` DTO，包含 graph 与 run-state references。
+- [x] 6.3 Emit staged snapshots for planned dry-runs and executed webpage evaluation runs without changing command execution behavior. / 为 planned dry-runs 与 executed webpage evaluation runs 输出 staged snapshots，且不改变 command execution 行为。
+- [x] 6.4 Re-run focused tests and strict OpenSpec validation. / 重新运行聚焦测试与 strict OpenSpec validation。
