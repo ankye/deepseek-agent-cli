@@ -59,6 +59,7 @@ export interface ChatTuiFocusState {
 export interface ChatTuiCommandSuggestion {
   readonly id: string;
   readonly title: string;
+  readonly description?: string;
   readonly kind: ChatTuiCommandSuggestionKind;
   readonly source: CliContributionSourceKind | "builtin";
   readonly commandName?: string;

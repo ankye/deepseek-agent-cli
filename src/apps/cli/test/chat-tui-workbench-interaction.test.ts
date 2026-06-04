@@ -197,9 +197,9 @@ describe("chat TUI workbench interactions", () => {
     const commandLine = lines.find((line) => line.startsWith("Input |"));
 
     assert.ok(lines.every((line) => line.length <= 100));
-    assert.match(lines[0] ?? "", /^Workbench \[command\] \| focus=command-bar/);
+    assert.match(lines[0] ?? "", /^Workbench command \| active=Commands/);
     assert.match(commandLine ?? "", /^Input \| \/h_ \| suggestions=/);
-    assert.ok(lines.some((line) => line.startsWith("Active | command suggestions=")));
+    assert.ok(lines.some((line) => line.startsWith("Active | Commands ")));
     assert.ok(lines.some((line) => line.startsWith("Keys |")));
   });
 
@@ -210,9 +210,13 @@ describe("chat TUI workbench interactions", () => {
 
     assert.equal(lines.length, 5);
     assert.ok(lines.every((line) => line.length <= 100));
-    assert.match(lines[0] ?? "", /^Workbench \[ready\] \| focus=transcript/);
-    assert.match(lines[2] ?? "", /^Panels \| reasoning=idle \| inspect=(empty|ready) \| plugins=ready$/);
+    assert.equal(lines[0], "Workbench ready | active=Chat");
+    assert.equal(lines[1], "Session | New conversation | 0 turns");
+    assert.match(lines[2] ?? "", /^Panels \| Reasoning idle \| Inspector (empty|ready) \| Plugins ready$/);
     assert.equal(lines.at(-1), "Input | deepseek> _");
+    assert.ok(!text.includes("focus="));
+    assert.ok(!text.includes("promptReady="));
+    assert.ok(!text.includes("governed-descriptors"));
     assert.ok(!text.includes("contributions="));
     assert.ok(!text.includes("diagnostics="));
     assert.ok(!text.includes("suggestions="));
@@ -228,6 +232,9 @@ describe("chat TUI workbench interactions", () => {
     assert.equal(lines.at(-1), "Input | deepseek> _");
     assert.ok(!text.includes("keymap="));
     assert.ok(!text.includes("Ready | deepseek> _"));
+    assert.ok(!text.includes("focus=transcript"));
+    assert.ok(!text.includes("promptReady=true"));
+    assert.ok(!text.includes("governed-descriptors"));
   });
 
   it("exits the real chat loop when raw TUI receives Ctrl+C", async () => {
@@ -308,9 +315,9 @@ describe("chat TUI workbench interactions", () => {
     const commandFrame = inline.find((chunk) => chunk.includes("deepseek> /h_")) ?? "";
     assert.ok(renderedInline.includes("deepseek> /_"));
     assert.ok(renderedInline.includes("deepseek> /h_"));
-    assert.ok(renderedInline.includes("Suggestions | >/help"));
+    assert.ok(renderedInline.includes("Suggestions | >/help - Show commands and shortcuts"));
     assert.ok(!renderedInline.includes("deepseek> /h_ |"));
-    assert.ok(commandFrame.indexOf("Suggestions | >/help") < commandFrame.indexOf("deepseek> /h_"));
+    assert.ok(commandFrame.indexOf("Suggestions | >/help - Show commands and shortcuts") < commandFrame.indexOf("deepseek> /h_"));
     assert.ok(!commandFrame.includes("Tab move"));
     assert.ok(!commandFrame.includes("Enter accept"));
     assert.ok(!commandFrame.includes("Esc close"));
@@ -327,8 +334,11 @@ describe("chat TUI workbench interactions", () => {
 
     assert.ok(suggestionsIndex >= 0);
     assert.ok(inputIndex > suggestionsIndex);
-    assert.ok(frame.includes("| >/help"));
+    assert.ok(frame.includes("| >/help - Show commands and shortcuts"));
     assert.ok(frame.includes("| deepseek> /h_"));
+    assert.ok(!frame.includes("promptReady=true"));
+    assert.ok(!frame.includes("governed-descriptors"));
+    assert.ok(!frame.includes("focus=command-bar"));
     assert.ok(!frame.includes("Tab move"));
     assert.ok(!frame.includes("Enter accept"));
     assert.ok(!frame.includes("Esc close"));

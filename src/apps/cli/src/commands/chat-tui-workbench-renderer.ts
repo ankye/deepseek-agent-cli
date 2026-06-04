@@ -3,6 +3,7 @@ import { CLI_PALETTE_SCHEMA_VERSION } from "@deepseek/platform-contracts";
 import type {
   ChatTuiActivityFeed,
   ChatTuiCommandBarState,
+  ChatTuiCommandSuggestion,
   ChatTuiInspectorState,
   ChatTuiPluginShelf,
   ChatTuiReasoningRail,
@@ -33,7 +34,7 @@ export function createChatTuiInputFrame(workbench: ChatTuiWorkbench, input: {
   if (workbench.commandBar.open) {
     const visibleSuggestions = workbench.commandBar.suggestions
       .slice(0, input.maxSuggestions ?? 3)
-      .map((entry) => `${entry.id === workbench.commandBar.activeSuggestionId ? ">" : " "}${entry.title}`);
+      .map((entry) => suggestionLine(entry, entry.id === workbench.commandBar.activeSuggestionId));
     const suggestionLines = visibleSuggestions.length > 0 ? visibleSuggestions : ["no matches"];
     return {
       commandBarOpen: true,
@@ -122,7 +123,7 @@ function renderFullscreenWorkbench(workbench: ChatTuiWorkbench, columns: number,
 
 function headerLines(workbench: ChatTuiWorkbench, columns: number, rows: number): readonly string[] {
   const title = fitColumns(
-    ` DeepSeek Workbench  ${workbench.commandBar.open ? "command" : "ready"}  focus:${workbench.focus.activePanel}`,
+    ` DeepSeek Workbench  ${workbench.commandBar.open ? "Command" : "Ready"}  Active: ${panelLabel(workbench.focus.activePanel)}`,
     "/ commands  Tab panels  Ctrl+C exit",
     columns
   );
@@ -131,7 +132,7 @@ function headerLines(workbench: ChatTuiWorkbench, columns: number, rows: number)
     borderLine(columns, "="),
     title,
     fitColumns(
-      ` Session ${regionSummary(workbench, "transcript")}`,
+      ` Chat ${conversationSummary(workbench)}`,
       workbench.commandBar.open ? `Command /${workbench.commandBar.query}_` : "Input deepseek> _",
       columns
     )
@@ -181,7 +182,7 @@ function renderCommandArea(workbench: ChatTuiWorkbench, columns: number, rows: n
 function transcriptLines(workbench: ChatTuiWorkbench): readonly string[] {
   return [
     "Conversation",
-    regionSummary(workbench, "transcript"),
+    conversationSummary(workbench),
     "",
     "No assistant turn is streaming yet.",
     "Type below. Use / for commands.",
@@ -194,7 +195,7 @@ function reasoningLines(rail: ChatTuiReasoningRail): readonly string[] {
   if (!rail.enabled) {
     return [
       "Idle",
-      rail.statusText,
+      reasoningStatusLabel(rail),
       "Reasoning details appear here during a turn."
     ];
   }
@@ -262,10 +263,10 @@ function distributePanelHeights(totalRows: number, panelCount: number): readonly
 
 function renderExpandedWorkbench(workbench: ChatTuiWorkbench): readonly string[] {
   return [
-    `Workbench [${workbenchModeLabel(workbench)}] | layout=${workbench.layout} | focus=${workbench.focus.activePanel}`,
+    `Workbench ${workbenchModeLabel(workbench)} | layout=${layoutLabel(workbench.layout)} | active=${panelLabel(workbench.focus.activePanel)}`,
     ...statusTelemetryLines(workbench),
-    `Main [transcript] | ${regionSummary(workbench, "transcript")}`,
-    `Focus | active=${workbench.focus.activePanel} | previous=${workbench.focus.previousPanel ?? "none"}`,
+    `Session | ${conversationSummary(workbench)}`,
+    `Focus | active=${panelLabel(workbench.focus.activePanel)} | previous=${workbench.focus.previousPanel ? panelLabel(workbench.focus.previousPanel) : "none"}`,
     `Panels | ${panelSummaryText(workbench)}`,
     ...reasoningSummaryLines(workbench),
     `Activity | ${activityText(workbench.activityFeed, 3)}`,
@@ -275,11 +276,12 @@ function renderExpandedWorkbench(workbench: ChatTuiWorkbench): readonly string[]
 }
 
 function renderCompactWorkbench(workbench: ChatTuiWorkbench): readonly string[] {
+  const statusLines = statusTelemetryLines(workbench);
   return [
-    `Workbench [${workbenchModeLabel(workbench)}] | focus=${workbench.focus.activePanel}`,
-    ...statusTelemetryLines(workbench),
-    `Main | ${regionSummary(workbench, "transcript")}`,
-    activeAreaText(workbench),
+    `Workbench ${workbenchModeLabel(workbench)} | active=${panelLabel(workbench.focus.activePanel)}`,
+    ...statusLines,
+    `Session | ${conversationSummary(workbench)}`,
+    ...(statusLines.length > 1 ? [] : [activeAreaText(workbench)]),
     `Keys | ${keyHintText(workbench)}`,
     `Input | ${suggestionText(workbench.commandBar, 3)}`
   ];
@@ -289,7 +291,8 @@ function statusTelemetryLines(workbench: ChatTuiWorkbench): readonly string[] {
   const telemetry = workbench.statusTelemetry;
   if (!telemetry) return [];
   return [
-    `Status | model=${telemetry.modelId} think=${telemetry.thinkingMode} cache=${cacheText(telemetry)} ctx=${telemetry.context.selectedTokens}/${telemetry.context.hardLimitTokens}`
+    `Status | Model ${telemetry.modelId} | Thinking ${telemetry.thinkingMode}`,
+    `Status | Cache ${cacheText(telemetry)} | Context ${telemetry.context.selectedTokens}/${telemetry.context.hardLimitTokens}`
   ];
 }
 
@@ -315,7 +318,7 @@ function suggestionText(commandBar: ChatTuiCommandBarState, maxSuggestions: numb
   const active = commandBar.suggestions.find((entry) => entry.id === commandBar.activeSuggestionId);
   const names = commandBar.suggestions
     .slice(0, maxSuggestions)
-    .map((entry) => `${entry.id === commandBar.activeSuggestionId ? ">" : ""}${boundSegment(entry.title, 22)}`)
+    .map((entry) => suggestionLine(entry, entry.id === commandBar.activeSuggestionId))
     .join(", ");
   const overflow = Math.max(0, commandBar.overflowCount + Math.max(0, commandBar.suggestions.length - maxSuggestions));
   return [
@@ -328,7 +331,7 @@ function suggestionText(commandBar: ChatTuiCommandBarState, maxSuggestions: numb
 
 function activeAreaText(workbench: ChatTuiWorkbench): string {
   if (workbench.focus.activePanel === "command-bar") {
-    return `Active | command suggestions=${workbench.commandBar.suggestions.length}/${workbench.commandBar.totalSuggestionCount}`;
+    return `Active | Commands ${workbench.commandBar.suggestions.length}/${workbench.commandBar.totalSuggestionCount}`;
   }
   if (workbench.focus.activePanel === "reasoning") return `Active | reasoning ${reasoningText(workbench.reasoningRail, 2)}`;
   if (workbench.focus.activePanel === "inspector") return `Active | inspect ${inspectorText(workbench.inspector, 2)}`;
@@ -338,9 +341,9 @@ function activeAreaText(workbench: ChatTuiWorkbench): string {
 
 function panelSummaryText(workbench: ChatTuiWorkbench): string {
   return [
-    `reasoning=${workbench.reasoningRail.enabled ? "ready" : "idle"}`,
-    `inspect=${workbench.inspector.items.length > 0 ? "ready" : "empty"}`,
-    `plugins=${workbench.pluginShelf.readiness === "disabled" ? "off" : "ready"}`
+    `Reasoning ${workbench.reasoningRail.enabled ? "ready" : "idle"}`,
+    `Inspector ${workbench.inspector.items.length > 0 ? "ready" : "empty"}`,
+    `Plugins ${workbench.pluginShelf.readiness === "disabled" ? "off" : "ready"}`
   ].join(" | ");
 }
 
@@ -350,7 +353,7 @@ function keyHintText(workbench: ChatTuiWorkbench): string {
 }
 
 function reasoningText(rail: ChatTuiReasoningRail, maxSteps: number): string {
-  if (!rail.enabled) return `${rail.statusText} records=${rail.recordCount} evidence=${rail.evidenceLinkCount}`;
+  if (!rail.enabled) return `${reasoningStatusLabel(rail)} records=${rail.recordCount} evidence=${rail.evidenceLinkCount}`;
   const steps = rail.steps
     .slice(0, maxSteps)
     .map((step) => `${step.active ? "*" : ""}${step.order}:${step.stepKind}/${step.status}/${step.certainty}/e${step.evidenceCount}`)
@@ -378,14 +381,14 @@ function pluginShelfText(shelf: ChatTuiPluginShelf, maxItems: number): string {
     .map((item) => `${boundSegment(item.pluginId, 18)}=${item.activeContributionCount}/${item.contributionCount} results=${item.resultListCount}${item.lastExecutionStatus ? ` last=${item.lastExecutionStatus}` : ""}`)
     .join(", ");
   const overflow = Math.max(0, shelf.overflowCount + Math.max(0, shelf.items.length - maxItems));
-  return `${shelf.readiness} plugins=${shelf.totalPlugins} contributions=${shelf.totalContributions} conflicts=${shelf.conflicts} diagnostics=${shelf.diagnostics}${top ? ` top=${top}` : ""}${overflow > 0 ? ` (+${overflow})` : ""}`;
+  return `${pluginReadinessLabel(shelf)} plugins=${shelf.totalPlugins} contributions=${shelf.totalContributions} conflicts=${shelf.conflicts} diagnostics=${shelf.diagnostics}${top ? ` top=${top}` : ""}${overflow > 0 ? ` (+${overflow})` : ""}`;
 }
 
 function statusLine(workbench: ChatTuiWorkbench): string {
   const telemetry = workbench.statusTelemetry
-    ? ` | model=${workbench.statusTelemetry.modelId} cache=${cacheText(workbench.statusTelemetry)} ctx=${workbench.statusTelemetry.context.selectedTokens}/${workbench.statusTelemetry.context.hardLimitTokens}`
+    ? ` | Model ${workbench.statusTelemetry.modelId} | Cache ${cacheText(workbench.statusTelemetry)} | Context ${workbench.statusTelemetry.context.selectedTokens}/${workbench.statusTelemetry.context.hardLimitTokens}`
     : "";
-  return `DeepSeek | ${workbench.layout} | focus=${workbench.focus.activePanel} | ${workbench.commandBar.open ? "command" : "ready"} | plugins=${workbench.pluginShelf.readiness}${telemetry}`;
+  return `DeepSeek | ${layoutLabel(workbench.layout)} | ${panelLabel(workbench.focus.activePanel)} | ${workbench.commandBar.open ? "Command" : "Ready"} | Plugins ${pluginReadinessLabel(workbench.pluginShelf)}${telemetry}`;
 }
 
 function cacheText(telemetry: NonNullable<ChatTuiWorkbench["statusTelemetry"]>): string {
@@ -399,6 +402,48 @@ function keyLine(workbench: ChatTuiWorkbench, columns: number): string {
   const left = ` Keys ${workbench.keyboardHints.map((hint) => `${hint.key}:${hint.label}`).join("  ")}`;
   const right = `mode ${workbench.commandBar.mode}`;
   return fitColumns(left, right, columns);
+}
+
+function suggestionLine(entry: ChatTuiCommandSuggestion, active: boolean): string {
+  const marker = active ? ">" : " ";
+  const description = entry.description ? ` - ${entry.description}` : "";
+  return `${marker}${entry.title}${description}`;
+}
+
+function conversationSummary(workbench: ChatTuiWorkbench): string {
+  const summary = regionSummary(workbench, "transcript");
+  const turns = Number(summary.match(/turns=(\d+)/)?.[1] ?? 0);
+  if (turns === 0) return "New conversation | 0 turns";
+  return `${turns} ${turns === 1 ? "turn" : "turns"}`;
+}
+
+function panelLabel(panel: ChatTuiWorkbenchPanelId): string {
+  if (panel === "transcript") return "Chat";
+  if (panel === "command-bar") return "Commands";
+  if (panel === "result-list") return "Results";
+  if (panel === "reasoning") return "Reasoning";
+  if (panel === "inspector") return "Inspector";
+  if (panel === "activity") return "Activity";
+  if (panel === "plugins") return "Plugins";
+  return "Status";
+}
+
+function layoutLabel(layout: ChatTuiWorkbench["layout"]): string {
+  if (layout === "disabled") return "Disabled";
+  if (layout === "compact") return "Compact";
+  if (layout === "wide") return "Wide";
+  return "Balanced";
+}
+
+function reasoningStatusLabel(rail: ChatTuiReasoningRail): string {
+  if (rail.enabled) return "Running";
+  return rail.recordCount > 0 ? "Ready" : "Not running";
+}
+
+function pluginReadinessLabel(shelf: ChatTuiPluginShelf): string {
+  if (shelf.readiness === "disabled") return "off";
+  if (shelf.conflicts > 0 || shelf.diagnostics > 0) return "needs review";
+  return "ready";
 }
 
 function fitColumns(left: string, right: string, columns: number): string {

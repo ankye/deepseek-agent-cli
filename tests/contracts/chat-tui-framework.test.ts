@@ -57,10 +57,10 @@ describe("chat TUI framework", () => {
     assert.equal(state.frameworkId, CHAT_TUI_FRAMEWORK_ID);
     assert.equal(state.workbench.layout, "balanced");
     assert.equal(state.workbench.regions.some((region) => region.id === "command-bar" && region.visible), true);
-    assert.equal(startup.some((line) => line.startsWith("Workbench [ready]") && line.includes("focus=transcript")), true);
+    assert.equal(startup.some((line) => line.startsWith("Workbench ready") && line.includes("active=Chat")), true);
     assert.equal(startup.some((line) => line.startsWith("Input |") && line.includes("deepseek> _")), true);
     assert.equal(startup.every((line) => line.length <= 100), true);
-    assert.equal(status.some((line) => line.startsWith("Panels |") && line.includes("plugins=ready")), true);
+    assert.equal(status.some((line) => line.startsWith("Panels |") && line.includes("Plugins ready")), true);
   });
 
   it("renders bounded cache-aware statusline telemetry", () => {
@@ -97,10 +97,10 @@ describe("chat TUI framework", () => {
     });
     const status = renderChatTuiStatus(state);
 
-    assert.equal(status.some((line) => line.includes("model=deepseek-v4-flash")), true);
-    assert.equal(status.some((line) => line.includes("think=xhigh")), true);
-    assert.equal(status.some((line) => line.includes("cache=70%")), true);
-    assert.equal(status.some((line) => line.includes("ctx=1000/2000")), true);
+    assert.equal(status.some((line) => line.includes("Model deepseek-v4-flash")), true);
+    assert.equal(status.some((line) => line.includes("Thinking xhigh")), true);
+    assert.equal(status.some((line) => line.includes("Cache 70%")), true);
+    assert.equal(status.some((line) => line.includes("Context 1000/2000")), true);
     assert.equal(status.every((line) => line.length <= 100), true);
   });
 
@@ -404,7 +404,7 @@ describe("chat TUI framework", () => {
     const lines = renderChatTuiStartup(state);
 
     assert.equal(state.workbench.layout, "compact");
-    assert.equal(lines.filter((line) => line.startsWith("Workbench [ready]")).length, 1);
+    assert.equal(lines.filter((line) => line.startsWith("Workbench ready")).length, 1);
     assert.equal(lines.length <= 7, true);
     assert.equal(lines.every((line) => line.length <= 100), true);
   });

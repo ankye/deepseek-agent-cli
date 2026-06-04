@@ -18,7 +18,7 @@ const requiredFrameText = [
   "+ Reasoning",
   "+ Inspector",
   "+ Plugins",
-  "+ Command",
+  "+ Input",
   "No assistant turn is streaming yet.",
   "Keys Tab:next"
 ];
