@@ -21,6 +21,16 @@ import { join } from "node:path";
 
 export type DeepSeekCredentialEnv = Readonly<Record<"DEEPSEEK_API_KEY" | "DEEPSEEK_TOKEN", string | undefined>>;
 export type GlmAnthropicCredentialEnv = Readonly<Record<"GLM_ANTHROPIC_API_KEY" | "ZHIPU_API_KEY", string | undefined>>;
+export type DiagnosticsEnvironmentPresenceEnv = Readonly<Record<
+  "DOCKER_HOST" |
+  "HOME" |
+  "PATH" |
+  "GLM_ANTHROPIC_API_KEY" |
+  "ZHIPU_API_KEY" |
+  "HF_TOKEN" |
+  "HUGGINGFACE_HUB_TOKEN",
+  string | undefined
+>>;
 
 const defaultDeepSeekCredentialRef = asId<"credentialRef">("credential-deepseek-api-key");
 export const liveCredentialLaunchCwdEnvKey = "DEEPSEEK_CLI_LAUNCH_CWD";
@@ -31,6 +41,18 @@ export function createDeepSeekCredentialPresenceEnv(env: Readonly<Record<string,
   return {
     DEEPSEEK_API_KEY: hasValue(env.DEEPSEEK_API_KEY) ? "present" : undefined,
     DEEPSEEK_TOKEN: hasValue(env.DEEPSEEK_TOKEN) ? "present" : undefined
+  };
+}
+
+export function createDiagnosticsEnvironmentPresenceEnv(env: Readonly<Record<string, string | undefined>> = process.env): DiagnosticsEnvironmentPresenceEnv {
+  return {
+    DOCKER_HOST: env.DOCKER_HOST,
+    HOME: env.HOME,
+    PATH: env.PATH,
+    GLM_ANTHROPIC_API_KEY: hasValue(env.GLM_ANTHROPIC_API_KEY) ? "present" : undefined,
+    ZHIPU_API_KEY: hasValue(env.ZHIPU_API_KEY) ? "present" : undefined,
+    HF_TOKEN: hasValue(env.HF_TOKEN) ? "present" : undefined,
+    HUGGINGFACE_HUB_TOKEN: hasValue(env.HUGGINGFACE_HUB_TOKEN) ? "present" : undefined
   };
 }
 

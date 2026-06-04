@@ -4,7 +4,7 @@ import type { CliOptions, CliTerminalFlags } from "../types.js";
 import { defaultTerminalFlags } from "../host/terminal.js";
 
 const readinessCommands = new Set<ReadinessCommandName>(["init", "config", "auth", "doctor", "privacy", "verify-install"]);
-const diagnosticsCommands = new Set<DiagnosticsCommandName>(["bundle", "release", "doctor", "verify", "refresh", "evaluate"]);
+const diagnosticsCommands = new Set<DiagnosticsCommandName>(["bundle", "release", "doctor", "verify", "refresh", "evaluate", "env"]);
 const defaultOutputMode: AgentLoopOutputMode = "text";
 
 export function parseCliArgs(args: readonly string[], _terminal: CliTerminalFlags = defaultTerminalFlags): CliOptions {
@@ -254,7 +254,7 @@ export function cliUsageLines(): readonly string[] {
     "  deepseek palette action <action> <target-id> [--output text|json|jsonl]",
     "  deepseek revert preview --request <id>|--turn <id>|--session <id> [--path <path>] [--output text|json|jsonl]",
     "  deepseek revert apply --request <id>|--turn <id>|--session <id> [--path <path>] [--output text|json|jsonl]",
-    "  deepseek diagnostics bundle|release|doctor|verify|refresh|evaluate [--baseline <id>] [--severity info|warning|release-blocking] [--package <name>] [--capability <id>] [--product-ready <capability>] [--full] [--dry-run] [--live] [--output text|json|jsonl]",
+    "  deepseek diagnostics bundle|release|doctor|verify|refresh|evaluate|env [prepare] [--profile <id>] [--execute] [--baseline <id>] [--severity info|warning|release-blocking] [--package <name>] [--capability <id>] [--product-ready <capability>] [--full] [--dry-run] [--live] [--output text|json|jsonl]",
     "  deepseek tools-smoke [--output text|jsonl]",
     "  deepseek <init|config|auth|doctor|privacy|verify-install> [--output text|json]",
     "Notes:",
@@ -520,6 +520,15 @@ function parseDiagnosticsInput(command: DiagnosticsCommandName, args: readonly s
     input.dryRun = args.includes("--dry-run");
     input.extraArgs = extraDiagnosticsArgs(args, new Set(["--full", "--dry-run"]));
   }
+  if (command === "env") {
+    const rawAction = args[2];
+    const execute = args.includes("--execute") && !args.includes("--dry-run");
+    input.action = rawAction && !rawAction.startsWith("--") ? rawAction : "prepare";
+    input.profile = readFlagValue(args, "--profile") ?? "swe-bench-lite";
+    input.dryRun = !execute;
+    input.execute = execute;
+    input.extraArgs = extraDiagnosticsArgs(args, new Set(["--execute", "--dry-run"]), new Set(["prepare"]));
+  }
   if (command === "evaluate") {
     input.full = args.includes("--full");
     input.smoke = args.includes("--smoke");
@@ -542,11 +551,12 @@ function parseDiagnosticsInput(command: DiagnosticsCommandName, args: readonly s
   return input as JsonObject;
 }
 
-function extraDiagnosticsArgs(args: readonly string[], knownBooleanFlags: ReadonlySet<string>): readonly string[] {
+function extraDiagnosticsArgs(args: readonly string[], knownBooleanFlags: ReadonlySet<string>, knownPositionals: ReadonlySet<string> = new Set()): readonly string[] {
   const extras: string[] = [];
   for (let index = 2; index < args.length; index += 1) {
     const value = args[index];
     if (!value) continue;
+    if (knownPositionals.has(value)) continue;
     if (
       value === "--output" ||
       value === "--max-records" ||
@@ -554,6 +564,7 @@ function extraDiagnosticsArgs(args: readonly string[], knownBooleanFlags: Readon
       value === "--provider" ||
       value === "--model-provider" ||
       value === "--model" ||
+      value === "--profile" ||
       value === "--baseline" ||
       value === "--compare-baseline" ||
       value === "--baseline-command" ||

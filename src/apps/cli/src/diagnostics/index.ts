@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { createDiagnosticsEnvironmentPresenceEnv } from "@deepseek/credential-auth-management";
 import type {
   AgentLoopOutputMode,
   CliEvaluationComparisonSummary,
@@ -22,6 +23,8 @@ import { createCliReadinessEnvironment, renderReadinessText } from "../commands/
 import { activationEvidenceText, missingActivationEvidence } from "../commands/index-provider.js";
 import { collectReleaseReadinessEvidence, diagnosticPitIds, diagnosticsSchemaVersion } from "./release-evidence.js";
 import { refreshAcceptanceEvidence, refreshStepRecord } from "./refresh-evidence.js";
+import { environmentPrepareJsonLines, prepareDiagnosticsEnvironment } from "./environment-prepare.js";
+import type { DiagnosticsEnvironmentPrepareSummary } from "./environment-prepare.js";
 import { collectCliEvaluation, evaluationJsonLines } from "./evaluation.js";
 import type { CliEvaluationOptions } from "./evaluation.js";
 import { buildEvaluationDeliveryCapabilityEvidence } from "./evaluation-delivery-evidence.js";
@@ -44,7 +47,7 @@ export interface CliDiagnosticNotice {
 
 export interface CliDiagnosticsResult extends JsonObject {
   readonly schemaVersion: string;
-  readonly kind: "diagnostics.bundle" | "diagnostics.release" | "diagnostics.doctor" | "diagnostics.verify" | "diagnostics.refresh" | "diagnostics.evaluate";
+  readonly kind: "diagnostics.bundle" | "diagnostics.release" | "diagnostics.doctor" | "diagnostics.verify" | "diagnostics.refresh" | "diagnostics.evaluate" | "diagnostics.env.prepare";
   readonly status: "pass" | "warn" | "fail";
   readonly command: DiagnosticsCommandName;
   readonly bundle?: DiagnosticBundle;
@@ -53,6 +56,7 @@ export interface CliDiagnosticsResult extends JsonObject {
   readonly release?: DiagnosticsReleaseReadinessEvidence;
   readonly verificationSummary?: ReleaseVerificationSummary;
   readonly refresh?: AcceptanceEvidenceRefreshSummary;
+  readonly environment?: DiagnosticsEnvironmentPrepareSummary;
   readonly evaluation?: CliEvaluationComparisonSummary;
   readonly indexProviders?: IndexProviderDiagnosticsSummary;
   readonly modeMatrix?: CliModeMatrixSummary;
@@ -71,6 +75,7 @@ export async function collectCliDiagnostics(command: DiagnosticsCommandName, opt
   if (command === "release") return releaseDiagnostics(options);
   if (command === "verify") return verifyDiagnostics(options);
   if (command === "refresh") return refreshDiagnostics(options);
+  if (command === "env") return environmentDiagnostics(options);
   if (command === "evaluate") return evaluateDiagnostics(options);
   if (command === "doctor") return doctorDiagnostics(options);
   return bundleDiagnostics(options);
@@ -168,6 +173,20 @@ export function renderDiagnosticsResult(result: CliDiagnosticsResult, output: Ag
       lines.push(`- ${step.id}: ${step.status}${typeof step.exitCode === "number" ? ` exit=${step.exitCode}` : ""} -> ${step.outputPath}`);
     }
     for (const diagnostic of result.refresh.diagnostics) {
+      lines.push(`- ${diagnostic.id}: ${diagnostic.status} - ${diagnostic.message}`);
+    }
+  }
+  if (result.environment) {
+    lines.push(`- env profile: ${result.environment.profileId}`);
+    lines.push(`- env action: ${result.environment.action}`);
+    lines.push(`- dry-run: ${String(result.environment.dryRun)}`);
+    lines.push(`- execute: ${String(result.environment.execute)}`);
+    lines.push(`- next action: ${result.environment.nextAction}`);
+    for (const dependency of result.environment.dependencies) {
+      lines.push(`- env dependency ${dependency.id}: ${dependency.status} - ${dependency.message}`);
+      if (dependency.commandPlan.length > 0) lines.push(`  plan=${dependency.commandPlan.map((step) => step.id).join(", ")}`);
+    }
+    for (const diagnostic of result.environment.diagnostics) {
       lines.push(`- ${diagnostic.id}: ${diagnostic.status} - ${diagnostic.message}`);
     }
   }
@@ -312,6 +331,28 @@ async function refreshDiagnostics(options: CliOptions): Promise<CliDiagnosticsRe
     refresh,
     referencePitFixtureIds: [...diagnosticPitIds],
     redaction: { class: "internal", fields: ["refresh.steps.args", "refresh.steps.outputPath", "refresh.refreshedPaths"] }
+  };
+}
+
+async function environmentDiagnostics(options: CliOptions): Promise<CliDiagnosticsResult> {
+  const environment = await prepareDiagnosticsEnvironment({
+    profileId: typeof options.diagnosticsInput?.profile === "string" ? options.diagnosticsInput.profile : "swe-bench-lite",
+    action: typeof options.diagnosticsInput?.action === "string" ? options.diagnosticsInput.action : "prepare",
+    dryRun: options.diagnosticsInput?.dryRun !== false,
+    execute: options.diagnosticsInput?.execute === true,
+    extraArgs: Array.isArray(options.diagnosticsInput?.extraArgs)
+      ? options.diagnosticsInput.extraArgs.filter((item): item is string => typeof item === "string")
+      : [],
+    env: createDiagnosticsEnvironmentPresenceEnv()
+  });
+  return {
+    schemaVersion: diagnosticsSchemaVersion,
+    kind: "diagnostics.env.prepare",
+    status: environment.status,
+    command: "env",
+    environment,
+    referencePitFixtureIds: [...diagnosticPitIds],
+    redaction: { class: "internal", fields: ["environment.dependencies.commandPlan.args", "environment.dependencies.secretRef", "environment.dependencies.metadata", "environment.executedSteps.args", "environment.executedSteps.stdoutPreview", "environment.executedSteps.stderrPreview", "environment.diagnostics.metadata"] }
   };
 }
 
@@ -640,6 +681,9 @@ function diagnosticsJsonLines(result: CliDiagnosticsResult): readonly JsonObject
         redaction: diagnostic.redaction
       });
     }
+  }
+  if (result.environment) {
+    entries.push(...environmentPrepareJsonLines(result.environment));
   }
   if (result.evaluation) {
     entries.push(...evaluationJsonLines(result.evaluation));

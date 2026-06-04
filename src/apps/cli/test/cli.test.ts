@@ -323,6 +323,36 @@ describe("cli host adapter", () => {
       live: false,
       diagnosticsInput: { command: "verify" }
     });
+    assert.deepEqual(parseCliArgs(["diagnostics", "env", "prepare", "--profile", "swe-bench-lite", "--output", "json"]), {
+      command: "diagnostics",
+      diagnosticsCommand: "env",
+      prompt: "",
+      output: "json",
+      live: false,
+      diagnosticsInput: {
+        command: "env",
+        action: "prepare",
+        profile: "swe-bench-lite",
+        dryRun: true,
+        execute: false,
+        extraArgs: []
+      }
+    });
+    assert.deepEqual(parseCliArgs(["diagnostics", "env", "prepare", "--profile", "swe-bench-lite", "--execute", "--output", "jsonl"]), {
+      command: "diagnostics",
+      diagnosticsCommand: "env",
+      prompt: "",
+      output: "jsonl",
+      live: false,
+      diagnosticsInput: {
+        command: "env",
+        action: "prepare",
+        profile: "swe-bench-lite",
+        dryRun: false,
+        execute: true,
+        extraArgs: []
+      }
+    });
     assert.deepEqual(parseCliArgs(["diagnostics", "refresh", "--full", "--dry-run", "--output", "jsonl"]), {
       command: "diagnostics",
       diagnosticsCommand: "refresh",
@@ -424,7 +454,7 @@ describe("cli host adapter", () => {
     assert.equal(lines.some((line) => line.includes("deepseek repo files|grep|recall|project-index")), true);
     assert.equal(lines.some((line) => line.includes("deepseek git status|diff|review")), true);
     assert.equal(lines.some((line) => line.includes("deepseek jump file|text|symbol")), true);
-    assert.equal(lines.some((line) => line.includes("deepseek diagnostics bundle|release|doctor|verify|refresh|evaluate")), true);
+    assert.equal(lines.some((line) => line.includes("deepseek diagnostics bundle|release|doctor|verify|refresh|evaluate|env")), true);
     assert.equal(lines.some((line) => line.includes("deepseek chat [--session <session-id>]")), true);
     assert.equal(lines.join("\n").includes("stream-json"), false);
     assert.equal(lines.join("\n").includes(" -p "), false);
@@ -3226,6 +3256,109 @@ describe("cli host adapter", () => {
     assert.equal(stored.includes("Command: npm run acceptance:index"), true);
     assert.equal(stored.includes('"command":"npm"'), true);
     assert.equal(stored.includes("\u001b["), false);
+  });
+
+  it("renders diagnostics env prepare SWE-bench Lite dry-run as redacted JSON", async () => {
+    const previousGlm = process.env.GLM_ANTHROPIC_API_KEY;
+    const secret = "2e3e884dec94408480485979fa73ffb5.lcg5M29IrVRSzqLH";
+    process.env.GLM_ANTHROPIC_API_KEY = secret;
+    try {
+      const lines: string[] = [];
+      await runCli(["diagnostics", "env", "prepare", "--profile", "swe-bench-lite", "--output", "json"], (line: string) => {
+        lines.push(line);
+      });
+      const parsed = JSON.parse(lines[0] ?? "{}") as {
+        kind?: string;
+        status?: string;
+        environment?: {
+          profileId?: string;
+          action?: string;
+          dryRun?: boolean;
+          execute?: boolean;
+          dependencies?: readonly { id?: string; status?: string; optional?: boolean; commandPlan?: readonly { id?: string; command?: string; autoExecute?: boolean }[]; secretRef?: { present?: boolean; sourceClass?: string } }[];
+          diagnostics?: readonly { id?: string; status?: string; message?: string }[];
+          nextAction?: string;
+        };
+      };
+      const serialized = lines.join("\n");
+      const dependencyIds = parsed.environment?.dependencies?.map((dependency) => dependency.id) ?? [];
+      const glmCredential = parsed.environment?.dependencies?.find((dependency) => dependency.id === "credential.glm");
+      const dockerInstallPlan = parsed.environment?.dependencies?.find((dependency) => dependency.id === "docker.cli")?.commandPlan?.find((step) => step.id === "docker.install");
+
+      assert.equal(parsed.kind, "diagnostics.env.prepare");
+      assert.equal(parsed.status === "pass" || parsed.status === "warn", true);
+      assert.equal(parsed.environment?.profileId, "swe-bench-lite");
+      assert.equal(parsed.environment?.action, "prepare");
+      assert.equal(parsed.environment?.dryRun, true);
+      assert.equal(parsed.environment?.execute, false);
+      assert.equal(dependencyIds.includes("docker.cli"), true);
+      assert.equal(dependencyIds.includes("docker.daemon"), true);
+      assert.equal(dependencyIds.includes("docker.host"), true);
+      assert.equal(dependencyIds.includes("python.venv"), true);
+      assert.equal(dependencyIds.includes("swebench.package"), true);
+      assert.equal(dependencyIds.includes("rust.toolchain"), true);
+      assert.equal(dependencyIds.includes("credential.glm"), true);
+      assert.equal(dependencyIds.includes("credential.huggingface"), true);
+      assert.equal(glmCredential?.secretRef?.present, true);
+      assert.equal(glmCredential?.secretRef?.sourceClass, "process-env");
+      assert.equal(dockerInstallPlan?.command, "brew");
+      assert.equal(dockerInstallPlan?.autoExecute, true);
+      assert.equal(parsed.environment?.dependencies?.some((dependency) => dependency.commandPlan?.some((step) => step.id === "swebench.install")), true);
+      assert.equal(parsed.environment?.nextAction?.includes("--execute"), true);
+      assert.equal(serialized.includes(secret), false);
+      assert.equal(serialized.includes("\u001b["), false);
+    } finally {
+      if (previousGlm === undefined) delete process.env.GLM_ANTHROPIC_API_KEY;
+      else process.env.GLM_ANTHROPIC_API_KEY = previousGlm;
+    }
+  });
+
+  it("renders diagnostics env prepare dependencies as JSONL records", async () => {
+    const lines: string[] = [];
+    await runCli(["diagnostics", "env", "prepare", "--profile", "swe-bench-lite", "--output", "jsonl"], (line: string) => {
+      lines.push(line);
+    });
+    const records = lines.map((line) => JSON.parse(line) as {
+      kind?: string;
+      status?: string;
+      summary?: { profileId?: string; dryRun?: boolean };
+      dependency?: { id?: string; status?: string };
+    });
+
+    assert.equal(records[0]?.kind, "diagnostics.env.prepare");
+    assert.equal(records[0]?.status === "pass" || records[0]?.status === "warn", true);
+    assert.equal(records.some((record) => record.kind === "diagnostics.env.prepare.summary" && record.summary?.profileId === "swe-bench-lite" && record.summary.dryRun === true), true);
+    assert.equal(records.some((record) => record.kind === "diagnostics.env.prepare.dependency" && record.dependency?.id === "docker.cli"), true);
+    assert.equal(records.some((record) => record.kind === "diagnostics.env.prepare.dependency" && record.dependency?.id === "swebench.package"), true);
+    assert.equal(lines.join("\n").includes("\u001b["), false);
+  });
+
+  it("rejects diagnostics env prepare arbitrary positional input", async () => {
+    const lines: string[] = [];
+    await runCli(["diagnostics", "env", "prepare", "npm", "test", "--profile", "swe-bench-lite", "--execute", "--output", "json"], (line: string) => {
+      lines.push(line);
+    });
+    const parsed = JSON.parse(lines[0] ?? "{}") as {
+      kind?: string;
+      status?: string;
+      environment?: {
+        status?: string;
+        execute?: boolean;
+        executedSteps?: readonly unknown[];
+        diagnostics?: readonly { id?: string; message?: string }[];
+      };
+    };
+    const serialized = lines.join("\n");
+
+    assert.equal(parsed.kind, "diagnostics.env.prepare");
+    assert.equal(parsed.status, "fail");
+    assert.equal(parsed.environment?.status, "fail");
+    assert.equal(parsed.environment?.execute, false);
+    assert.deepEqual(parsed.environment?.executedSteps, []);
+    assert.equal(parsed.environment?.diagnostics?.[0]?.id, "diagnostics.env.invalid-args");
+    assert.equal(parsed.environment?.diagnostics?.[0]?.message, "diagnostics env prepare received 2 unsupported argument(s).");
+    assert.equal(serialized.includes("npm test"), false);
+    assert.equal(serialized.includes("\u001b["), false);
   });
 
   it("renders diagnostics evaluate smoke dry-run as DeepSeek-owned plan", async () => {
