@@ -20,7 +20,8 @@ const requiredFrameText = [
   "+ Plugins",
   "+ Input",
   "No assistant turn is streaming yet.",
-  "Keys Tab:next"
+  "Keys | / commands",
+  "Mode Ready"
 ];
 
 mkdirSync(OUT_DIR, { recursive: true });

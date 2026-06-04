@@ -405,9 +405,14 @@ function cacheText(telemetry: NonNullable<ChatTuiWorkbench["statusTelemetry"]>):
 }
 
 function keyLine(workbench: ChatTuiWorkbench, columns: number): string {
-  const left = ` Keys ${workbench.keyboardHints.map((hint) => `${hint.key}:${hint.label}`).join("  ")}`;
-  const right = `mode ${workbench.commandBar.mode}`;
+  const left = ` Keys | ${keyHintText(workbench)}`;
+  const right = `Mode ${commandModeLabel(workbench.commandBar)}`;
   return fitColumns(left, right, columns);
+}
+
+function commandModeLabel(commandBar: ChatTuiCommandBarState): string {
+  if (commandBar.open) return "Command";
+  return "Ready";
 }
 
 function suggestionLine(entry: ChatTuiCommandSuggestion, active: boolean): string {

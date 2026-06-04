@@ -368,13 +368,29 @@ describe("chat TUI workbench interactions", () => {
     assert.ok(!frame.includes("governed-descriptors"));
     assert.ok(!frame.includes("focus=command-bar"));
     assert.ok(!frame.includes("Tab move"));
-    assert.ok(!frame.includes("Enter accept"));
-    assert.ok(!frame.includes("Esc close"));
+    assert.ok(!frame.includes("mode slash"));
     assert.ok(!frame.includes("raw/full-screen"));
     assert.ok(!frame.includes("contributions="));
     assert.ok(!frame.includes("diagnostics="));
     assert.ok(frame.indexOf("Keys ") < inputIndex);
     assert.ok(frame.indexOf("DeepSeek |") < inputIndex);
+  });
+
+  it("renders full-screen footer shortcuts as readable product copy", async () => {
+    const tui = createTuiWithProfile(createFullScreenTerminalProfile());
+    const readyFrame = renderChatTuiFullscreenFrame({ workbench: tui.snapshot().workbench, rows: 24, phase: "repaint" }).chunks.join("\n");
+
+    assert.ok(readyFrame.includes("Keys | / commands | Tab next panel | Shift+Tab previous | Ctrl+C exit"));
+    assert.ok(readyFrame.includes("Mode Ready"));
+    assert.ok(!readyFrame.includes("Keys Tab:next"));
+    assert.ok(!readyFrame.includes("mode closed"));
+
+    await readPrompts(tui, ["/", "h"]);
+    const commandFrame = renderChatTuiFullscreenFrame({ workbench: tui.snapshot().workbench, rows: 24, phase: "repaint" }).chunks.join("\n");
+
+    assert.ok(commandFrame.includes("Keys | Tab suggestions | Enter accept | Esc close | Ctrl+C exit"));
+    assert.ok(commandFrame.includes("Mode Command"));
+    assert.ok(!commandFrame.includes("mode slash"));
   });
 
   it("repaints full-screen frames instead of line-mode prompt fragments", async () => {
