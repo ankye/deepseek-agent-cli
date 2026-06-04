@@ -1,5 +1,6 @@
 import type { JsonObject, RedactionMetadata } from "./common.js";
 import type { CommandId, CredentialRef } from "./ids.js";
+import type { ModelProviderProtocol } from "./model.js";
 import type { IndexProviderDiagnosticsSummary } from "./index-provider.js";
 import type { ModelLiveVerificationResult } from "./model.js";
 import type { PackageScorecardReleaseAdvisory } from "./package-scorecard.js";
@@ -74,6 +75,7 @@ export interface ReleaseEvidenceFileStatus extends JsonObject {
 export interface ReleaseLiveEvidenceFileStatus extends JsonObject {
   readonly path: string;
   readonly exists: boolean;
+  readonly required: boolean;
   readonly status: ReadinessStatus;
   readonly message: string;
   readonly redaction: RedactionMetadata;
@@ -84,6 +86,7 @@ export interface ReleaseLiveEvidenceSummary extends JsonObject {
   readonly status: ReadinessStatus;
   readonly requiredEvidencePaths: readonly string[];
   readonly files: readonly ReleaseLiveEvidenceFileStatus[];
+  readonly providerParityEvidence?: readonly ReleaseLiveEvidenceFileStatus[];
   readonly missingEvidencePaths: readonly string[];
   readonly invalidEvidencePaths: readonly string[];
   readonly overallDeliveryCapabilityScore?: number;
@@ -313,9 +316,18 @@ export interface ReadinessCheck extends JsonObject {
   readonly redaction: RedactionMetadata;
 }
 
+export type ReadinessModelProviderName = "deepseek" | "glm";
+
+export interface ReadinessModelProviderMetadata extends JsonObject {
+  readonly provider: ReadinessModelProviderName;
+  readonly protocol: ModelProviderProtocol;
+  readonly model: string;
+  readonly label: string;
+}
+
 export interface ReadinessCredentialReference extends JsonObject {
   readonly ref: CredentialRef;
-  readonly provider: "deepseek";
+  readonly provider: ReadinessModelProviderName;
   readonly source: "process-env" | "env-file" | "secure-storage" | "fake-storage" | "missing";
   readonly available: boolean;
   readonly redaction: RedactionMetadata;

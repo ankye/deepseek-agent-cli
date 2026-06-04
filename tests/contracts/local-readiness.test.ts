@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -229,6 +229,57 @@ describe("local readiness contracts", () => {
     });
   });
 
+  it("reports GLM live evidence as provider parity without adding default release blockers", async () => {
+    await withTempRepo(async () => {
+      await writeFile("src/apps/cli/dist/index.js", "#!/usr/bin/env node\n", "utf8");
+
+      const release = await collectReleaseReadinessEvidence();
+      const parityEvidence = Array.isArray(release.verification.liveEvidence?.providerParityEvidence)
+        ? release.verification.liveEvidence.providerParityEvidence.filter(isRecord)
+        : [];
+      const parityPaths = parityEvidence.map((file) => String(file.path));
+
+      assert.equal(release.status, "pass");
+      assert.equal(release.verification.liveEvidence?.requiredEvidencePaths.some((path) => path.includes("glm-live")), false);
+      assert.equal(release.verification.acceptanceEvidencePaths.some((path) => path.includes("glm-live")), false);
+      assert.equal(parityPaths.includes("tests/acceptance/latest/glm-live-provider-smoke.txt"), true);
+      assert.equal(parityPaths.includes("tests/acceptance/latest/glm-live-agent-tool-smoke.txt"), true);
+      assert.equal(parityPaths.includes("tests/acceptance/latest/glm-live-doctor-smoke.txt"), true);
+      assert.equal(parityEvidence.every((file) => file.required === false), true);
+    });
+  });
+
+  it("accepts GLM diagnostics doctor JSON as provider parity evidence", async () => {
+    await withTempRepo(async () => {
+      await writeFile("src/apps/cli/dist/index.js", "#!/usr/bin/env node\n", "utf8");
+      await writeFile("tests/acceptance/latest/glm-live-provider-smoke.txt", "# pass 2\n# skipped 0\n", "utf8");
+      await writeFile("tests/acceptance/latest/glm-live-agent-tool-smoke.txt", "# pass 1\n# skipped 0\n", "utf8");
+      await writeFile("tests/acceptance/latest/glm-live-doctor-smoke.txt", glmLiveDoctorSmokeEvidenceForTest(), "utf8");
+
+      const release = await collectReleaseReadinessEvidence();
+      const parityEvidence = Array.isArray(release.verification.liveEvidence?.providerParityEvidence)
+        ? release.verification.liveEvidence.providerParityEvidence.filter(isRecord)
+        : [];
+      const doctorEvidence = parityEvidence.find((file) => file.path === "tests/acceptance/latest/glm-live-doctor-smoke.txt");
+
+      assert.equal(doctorEvidence?.status, "pass");
+      assert.equal(doctorEvidence?.required, false);
+    });
+  });
+
+  it("lists GLM live provider parity in the acceptance index", async () => {
+    const index = await readFile("tests/acceptance/acceptance-index.md", "utf8");
+
+    assert.equal(index.includes("GLM live provider smoke"), true);
+    assert.equal(index.includes("GLM_ANTHROPIC_LIVE_TESTS=1 npm run smoke:live:glm"), true);
+    assert.equal(index.includes("latest/glm-live-provider-smoke.txt"), true);
+    assert.equal(index.includes("GLM live agent tool smoke"), true);
+    assert.equal(index.includes("GLM_ANTHROPIC_LIVE_AGENT_TOOL_TESTS=1 npm run smoke:live:glm-agent-tools"), true);
+    assert.equal(index.includes("latest/glm-live-agent-tool-smoke.txt"), true);
+    assert.equal(index.includes("GLM live doctor smoke"), true);
+    assert.equal(index.includes("latest/glm-live-doctor-smoke.txt"), true);
+  });
+
   it("surfaces index provider diagnostics in doctor without raw provider material", async () => {
     const result = await runLocalReadinessCommand("doctor", { live: false }, fakeEnv());
 
@@ -236,6 +287,67 @@ describe("local readiness contracts", () => {
     assert.equal(result.indexProviders?.deferredProviderIds.includes("zvec"), true);
     assert.equal(result.checks.some((check) => check.id === "index-provider.pageindex" && check.status === "pass"), true);
     assert.equal(result.checks.some((check) => check.id === "index-provider.zvec" && check.status === "warn"), true);
+    assert.equal(JSON.stringify(result).includes(fakeSecret), false);
+  });
+
+  it("reports selected GLM credential and provider metadata in doctor", async () => {
+    const environment = {
+      ...fakeEnv(),
+      env: { GLM_ANTHROPIC_API_KEY: fakeSecret },
+      modelProvider: {
+        provider: "glm",
+        protocol: "anthropic-messages",
+        model: "glm-5.1",
+        label: "GLM"
+      }
+    } as LocalReadinessEnvironment;
+    const result = await runLocalReadinessCommand("doctor", { live: false }, environment);
+    const credentialCheck = result.checks.find((check) => check.id === "auth.glm");
+
+    assert.equal(result.credential?.provider, "glm");
+    assert.equal(result.credential?.available, true);
+    assert.equal(result.metadata.provider && typeof result.metadata.provider === "object", true);
+    assert.equal((result.metadata.provider as { provider?: string }).provider, "glm");
+    assert.equal((result.metadata.provider as { model?: string }).model, "glm-5.1");
+    assert.equal(credentialCheck?.status, "pass");
+    assert.equal(credentialCheck?.metadata?.provider, "glm");
+    assert.equal(JSON.stringify(result).includes(fakeSecret), false);
+  });
+
+  it("renders live doctor messages from the verified provider instead of hardcoded DeepSeek", async () => {
+    const environment = {
+      ...fakeEnv(),
+      env: { GLM_ANTHROPIC_API_KEY: fakeSecret },
+      modelProvider: {
+        provider: "glm",
+        protocol: "anthropic-messages",
+        model: "glm-5.1",
+        label: "GLM"
+      },
+      liveVerifier: async () => ({
+        ok: true,
+        provider: {
+          provider: "glm",
+          protocol: "anthropic-messages",
+          model: "glm-5.1",
+          requestId: "req-glm-contract"
+        },
+        reachable: true,
+        terminalStatus: "completed",
+        latencyMs: 12,
+        eventKinds: ["delta", "finish", "done"],
+        diagnostics: [],
+        redaction: { class: "internal" }
+      })
+    } as LocalReadinessEnvironment;
+    const result = await runLocalReadinessCommand("doctor", { live: true }, environment);
+    const liveCheck = result.checks.find((check) => check.id === "doctor.live");
+
+    assert.equal(result.live?.provider.provider, "glm");
+    assert.equal(liveCheck?.status, "pass");
+    assert.equal(liveCheck?.message.includes("GLM live verification completed for glm-5.1"), true);
+    assert.equal(liveCheck?.metadata?.provider, "glm");
+    assert.equal(liveCheck?.metadata?.protocol, "anthropic-messages");
     assert.equal(JSON.stringify(result).includes(fakeSecret), false);
   });
 
@@ -407,6 +519,33 @@ function liveDoctorSmokeEvidenceForTest(): string {
         provider: { provider: "deepseek", protocol: "openai-chat-completions", model: "deepseek-v4-flash", requestId: "req-live-doctor-test" },
         cache: { hitTokens: 0, missTokens: 8 }
       }
+    }
+  })}\n`;
+}
+
+function glmLiveDoctorSmokeEvidenceForTest(): string {
+  return `${JSON.stringify({
+    schemaVersion: "1.0.0",
+    kind: "diagnostics.doctor",
+    command: "doctor",
+    status: "warn",
+    readiness: {
+      command: "doctor",
+      status: "warn",
+      checks: [{
+        id: "doctor.live",
+        status: "pass",
+        message: "GLM live verification completed for glm-5.1.",
+        metadata: {
+          requested: true,
+          provider: "glm",
+          protocol: "anthropic-messages",
+          model: "glm-5.1",
+          terminalStatus: "completed",
+          eventKinds: ["delta", "finish", "usage", "done"],
+          reachable: true
+        }
+      }]
     }
   })}\n`;
 }

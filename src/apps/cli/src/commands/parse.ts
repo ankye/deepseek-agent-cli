@@ -176,6 +176,8 @@ export function parseCliArgs(args: readonly string[], _terminal: CliTerminalFlag
       prompt: "",
       output,
       live,
+      ...(modelProvider ? { modelProvider } : {}),
+      ...(model ? { model } : {}),
       ...(toolProjection ? { toolProjection } : {}),
       diagnosticsInput: parseDiagnosticsInput(diagnosticsCommand, args)
     };
@@ -500,6 +502,11 @@ function parseDiagnosticsInput(command: DiagnosticsCommandName, args: readonly s
   if (maxRecords) input.maxRecords = maxRecords;
   if (args.includes("--external")) input.external = true;
   if (args.includes("--fake-secret")) input.fakeSecret = true;
+  if (args.includes("--live")) input.live = true;
+  const provider = parseModelProvider(args);
+  if (provider) input.provider = provider;
+  const model = readFlagValue(args, "--model");
+  if (model) input.model = model;
   const severities = readRepeatedFlagValues(args, "--severity");
   if (severities.length > 0) input.severities = severities;
   const packages = readRepeatedFlagValues(args, "--package");
@@ -544,6 +551,9 @@ function extraDiagnosticsArgs(args: readonly string[], knownBooleanFlags: Readon
       value === "--output" ||
       value === "--max-records" ||
       value === "--tool-projection" ||
+      value === "--provider" ||
+      value === "--model-provider" ||
+      value === "--model" ||
       value === "--baseline" ||
       value === "--compare-baseline" ||
       value === "--baseline-command" ||

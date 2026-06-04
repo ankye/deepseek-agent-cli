@@ -193,6 +193,21 @@ describe("cli host adapter", () => {
       modelProvider: "glm",
       model: "glm-5.1"
     });
+    assert.deepEqual(parseCliArgs(["diagnostics", "doctor", "--live", "--provider", "glm", "--model", "glm-5.1", "--output", "json"]), {
+      command: "diagnostics",
+      diagnosticsCommand: "doctor",
+      prompt: "",
+      output: "json",
+      live: true,
+      modelProvider: "glm",
+      model: "glm-5.1",
+      diagnosticsInput: {
+        command: "doctor",
+        live: true,
+        provider: "glm",
+        model: "glm-5.1"
+      }
+    });
     assert.deepEqual(parseCliArgs(["index-provider", "set", "zvec", "enabled", "--user", "--output", "json"]), {
       command: "index-provider",
       prompt: "",
@@ -3771,6 +3786,39 @@ describe("cli host adapter", () => {
     assert.equal(parsed.indexProviders?.source?.scope, "default");
     assert.equal(parsed.indexProviders?.providers?.some((provider) => provider.providerId === "zvec" && provider.implementationStatus === "missing"), true);
     assert.equal(parsed.release?.checks?.some((check) => check.id === "release.package"), true);
+  });
+
+  it("passes GLM provider selection into diagnostics doctor readiness", async () => {
+    const lines = await withTempCwd("deepseek-cli-doctor-glm-", async () => {
+      const previous = process.env.GLM_ANTHROPIC_API_KEY;
+      process.env.GLM_ANTHROPIC_API_KEY = "sk-glm-diagnostics-secret";
+      try {
+        const output: string[] = [];
+        await runCli(["diagnostics", "doctor", "--provider", "glm", "--model", "glm-5.1", "--output", "json"], (line: string) => {
+          output.push(line);
+        });
+        return output;
+      } finally {
+        if (previous === undefined) delete process.env.GLM_ANTHROPIC_API_KEY;
+        else process.env.GLM_ANTHROPIC_API_KEY = previous;
+      }
+    });
+    const parsed = JSON.parse(lines[0] ?? "{}") as {
+      readiness?: {
+        credential?: { provider?: string; available?: boolean };
+        metadata?: { provider?: { provider?: string; model?: string; protocol?: string } };
+        checks?: readonly { id?: string; status?: string; metadata?: { provider?: string } }[];
+      };
+    };
+    const credentialCheck = parsed.readiness?.checks?.find((check) => check.id === "auth.glm");
+
+    assert.equal(parsed.readiness?.credential?.provider, "glm");
+    assert.equal(parsed.readiness?.credential?.available, true);
+    assert.equal(parsed.readiness?.metadata?.provider?.provider, "glm");
+    assert.equal(parsed.readiness?.metadata?.provider?.protocol, "anthropic-messages");
+    assert.equal(parsed.readiness?.metadata?.provider?.model, "glm-5.1");
+    assert.equal(credentialCheck?.status, "pass");
+    assert.equal(JSON.stringify(parsed).includes("sk-glm-diagnostics-secret"), false);
   });
 
   it("renders index provider status without provider execution", async () => {

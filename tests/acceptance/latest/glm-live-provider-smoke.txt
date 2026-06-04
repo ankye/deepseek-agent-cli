@@ -1,0 +1,33 @@
+
+> deepseek-cli-platform@0.1.8 smoke:live:glm
+> tsx --test "tests/live/glm-anthropic-provider-live-smoke.test.ts"
+
+TAP version 13
+# Subtest: GLM Anthropic-compatible live provider smoke
+    # Subtest: streams a real response only when explicitly enabled
+    ok 1 - streams a real response only when explicitly enabled
+      ---
+      duration_ms: 2317.613728
+      type: 'test'
+      ...
+    # Subtest: streams a real tool-use response only when explicitly enabled
+    ok 2 - streams a real tool-use response only when explicitly enabled
+      ---
+      duration_ms: 7858.9045
+      type: 'test'
+      ...
+    1..2
+ok 1 - GLM Anthropic-compatible live provider smoke
+  ---
+  duration_ms: 10177.726463
+  type: 'suite'
+  ...
+1..1
+# tests 2
+# suites 1
+# pass 2
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 10749.094113

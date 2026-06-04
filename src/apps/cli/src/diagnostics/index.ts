@@ -464,8 +464,9 @@ async function writeEvaluationDeliveryCapabilityEvidence(
 }
 
 async function doctorDiagnostics(options: CliOptions): Promise<CliDiagnosticsResult> {
-  const environment = await createCliReadinessEnvironment({ ...options, readinessCommand: "doctor", readinessInput: { live: false } });
-  const readiness = await invokeLocalReadinessCommand("doctor", { live: false }, environment);
+  const live = options.live === true;
+  const environment = await createCliReadinessEnvironment({ ...options, readinessCommand: "doctor", readinessInput: { live } });
+  const readiness = await invokeLocalReadinessCommand("doctor", { live }, environment);
   const releaseRaw = await collectReleaseReadinessEvidence({
     productReadyClaims: productReadyClaimsFromInput(options.diagnosticsInput)
   });

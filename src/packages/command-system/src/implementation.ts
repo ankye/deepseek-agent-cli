@@ -12,6 +12,7 @@ import type {
   ReadinessCommandName,
   ReadinessCommandResult,
   ReadinessCredentialReference,
+  ReadinessModelProviderMetadata,
   ReleasePackageSurface,
   ReleaseVerificationEvidence,
   ResolvedConfig,
@@ -75,6 +76,7 @@ export interface LocalReadinessEnvironment {
   readonly resolvedConfig?: ResolvedConfig;
   readonly credentialReferences?: readonly StoredCredentialReference[];
   readonly workspaceMetadataPath?: string;
+  readonly modelProvider?: ReadinessModelProviderMetadata;
   readonly liveVerifier?: () => Promise<ModelLiveVerificationResult>;
   readonly initialized?: boolean;
   readonly initializedThisRun?: boolean;
@@ -115,14 +117,17 @@ export async function runLocalReadinessCommand(command: ReadinessCommandName, in
     case "config":
       return readinessResult(command, environment, configChecks(environment), { configKeys: Object.keys(environment.config ?? {}).sort(), resolvedConfig: redactedResolvedConfig(environment.resolvedConfig) });
     case "auth": {
-      const credential = credentialReference(environment);
-      return readinessResult(command, environment, authChecks(credential), { provider: "deepseek", credentialCount: environment.credentialReferences?.length ?? 0 }, credential);
+      const provider = selectedModelProvider(environment);
+      const credential = credentialReference(environment, provider);
+      return readinessResult(command, environment, authChecks(credential, provider), { provider, credentialCount: environment.credentialReferences?.length ?? 0 }, credential);
     }
     case "doctor": {
-      const credential = credentialReference(environment);
+      const provider = selectedModelProvider(environment);
+      const credential = credentialReference(environment, provider);
       const live = input.live === true && environment.liveVerifier ? await environment.liveVerifier() : undefined;
-      return readinessResult(command, environment, [...platformChecks(environment), ...configChecks(environment), ...authChecks(credential), ignoredPathCheck(environment), ...indexProviderChecks(environment), ...releaseReadinessChecks(environment), ...liveChecks(live, input.live === true)], {
+      return readinessResult(command, environment, [...platformChecks(environment), ...configChecks(environment), ...authChecks(credential, provider), ignoredPathCheck(environment), ...indexProviderChecks(environment), ...releaseReadinessChecks(environment), ...liveChecks(live, input.live === true, provider)], {
         checkGroup: "doctor",
+        provider,
         liveRequested: input.live === true,
         indexProviders: indexProviderMetadata(environment.indexProviderDiagnostics),
         release: releaseMetadata(environment),
@@ -441,15 +446,18 @@ function configChecks(environment: LocalReadinessEnvironment): readonly Readines
   ];
 }
 
-function authChecks(credential: ReadinessCredentialReference): readonly ReadinessCheck[] {
+function authChecks(credential: ReadinessCredentialReference, provider: ReadinessModelProviderMetadata): readonly ReadinessCheck[] {
+  const envAction = provider.provider === "glm"
+    ? "Set GLM_ANTHROPIC_API_KEY or ZHIPU_API_KEY in an untracked local environment source."
+    : "Set DEEPSEEK_API_KEY or DEEPSEEK_TOKEN in an untracked local environment source.";
   return [
     check(
-      "auth.deepseek",
-      "DeepSeek credential",
+      `auth.${provider.provider}`,
+      `${provider.label} credential`,
       credential.available ? "pass" : "warn",
-      credential.available ? `DeepSeek credential reference ${credential.ref} is available from ${credential.source}.` : "DeepSeek credential was not found.",
-      credential.available ? [] : ["Set DEEPSEEK_API_KEY or DEEPSEEK_TOKEN in an untracked local environment source."],
-      { provider: credential.provider, source: credential.source, available: credential.available }
+      credential.available ? `${provider.label} credential reference ${credential.ref} is available from ${credential.source}.` : `${provider.label} credential was not found.`,
+      credential.available ? [] : [envAction],
+      { provider: credential.provider, protocol: provider.protocol, model: provider.model, source: credential.source, available: credential.available }
     )
   ];
 }
@@ -634,10 +642,28 @@ function indexProviderMetadata(summary: IndexProviderDiagnosticsSummary | undefi
   };
 }
 
-function credentialReference(environment: LocalReadinessEnvironment): ReadinessCredentialReference {
-  const stored = environment.credentialReferences?.find((reference) => reference.available);
+function selectedModelProvider(environment: LocalReadinessEnvironment): ReadinessModelProviderMetadata {
+  return environment.modelProvider ?? {
+    provider: "deepseek",
+    protocol: "openai-chat-completions",
+    model: typeof resolvedValue(environment, "model") === "string" ? String(resolvedValue(environment, "model")) : "deepseek-v4-flash",
+    label: "DeepSeek"
+  };
+}
+
+function credentialReference(environment: LocalReadinessEnvironment, provider: ReadinessModelProviderMetadata): ReadinessCredentialReference {
+  const stored = environment.credentialReferences?.find((reference) => reference.available && reference.scope.provider === provider.provider);
   if (stored) {
-    return { ref: stored.ref, provider: "deepseek", source: stored.source, available: true, redaction: { class: "secret" } };
+    return { ref: stored.ref, provider: provider.provider, source: stored.source, available: true, redaction: { class: "secret" } };
+  }
+  if (provider.provider === "glm") {
+    if (hasValue(environment.env.GLM_ANTHROPIC_API_KEY) || hasValue(environment.env.ZHIPU_API_KEY)) {
+      return { ref: asId<"credentialRef">("credential-glm-anthropic-api-key"), provider: "glm", source: "process-env", available: true, redaction: { class: "secret" } };
+    }
+    if (hasValue(environment.envFile?.GLM_ANTHROPIC_API_KEY) || hasValue(environment.envFile?.ZHIPU_API_KEY)) {
+      return { ref: asId<"credentialRef">("credential-glm-anthropic-api-key"), provider: "glm", source: "env-file", available: true, redaction: { class: "secret" } };
+    }
+    return { ref: asId<"credentialRef">("credential-glm-anthropic-api-key"), provider: "glm", source: "missing", available: false, redaction: { class: "secret" } };
   }
   if (hasValue(environment.env.DEEPSEEK_API_KEY) || hasValue(environment.env.DEEPSEEK_TOKEN)) {
     return { ref: asId<"credentialRef">("credential-deepseek-api-key"), provider: "deepseek", source: "process-env", available: true, redaction: { class: "secret" } };
@@ -648,21 +674,22 @@ function credentialReference(environment: LocalReadinessEnvironment): ReadinessC
   return { ref: asId<"credentialRef">("credential-deepseek-api-key"), provider: "deepseek", source: "missing", available: false, redaction: { class: "secret" } };
 }
 
-function liveChecks(live: ModelLiveVerificationResult | undefined, requested: boolean): readonly ReadinessCheck[] {
+function liveChecks(live: ModelLiveVerificationResult | undefined, requested: boolean, provider: ReadinessModelProviderMetadata): readonly ReadinessCheck[] {
   if (!requested) {
-    return [check("doctor.live", "Live provider verification", "pass", "Live provider verification was not requested; doctor stayed offline.", [], { requested: false })];
+    return [check("doctor.live", "Live provider verification", "pass", "Live provider verification was not requested; doctor stayed offline.", [], { requested: false, provider: provider.provider, protocol: provider.protocol, model: provider.model })];
   }
   if (!live) {
-    return [check("doctor.live", "Live provider verification", "warn", "Live provider verification was requested but no live verifier was configured.", ["Configure a model gateway live verifier."], { requested: true })];
+    return [check("doctor.live", "Live provider verification", "warn", "Live provider verification was requested but no live verifier was configured.", ["Configure a model gateway live verifier."], { requested: true, provider: provider.provider, protocol: provider.protocol, model: provider.model })];
   }
+  const liveLabel = live.provider.provider === "glm" ? "GLM" : live.provider.provider === "deepseek" ? "DeepSeek" : live.provider.provider;
   return [
     check(
       "doctor.live",
       "Live provider verification",
       live.ok ? "pass" : "warn",
-      live.ok ? `DeepSeek live verification completed for ${live.provider.model}.` : `DeepSeek live verification did not complete: ${live.terminalStatus}.`,
+      live.ok ? `${liveLabel} live verification completed for ${live.provider.model}.` : `${liveLabel} live verification did not complete: ${live.terminalStatus}.`,
       live.ok ? [] : live.diagnostics.flatMap((diagnostic) => (Array.isArray(diagnostic.details?.suggestedActions) ? diagnostic.details.suggestedActions.map(String) : [])),
-      { requested: true, terminalStatus: live.terminalStatus, eventKinds: live.eventKinds, reachable: live.reachable }
+      { requested: true, provider: live.provider.provider, protocol: live.provider.protocol, model: live.provider.model, terminalStatus: live.terminalStatus, eventKinds: live.eventKinds, reachable: live.reachable }
     )
   ];
 }

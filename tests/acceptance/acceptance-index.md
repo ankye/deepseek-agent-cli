@@ -21,6 +21,9 @@ This index maps each first-framework acceptance gate to a command, test suite, t
 | DeepSeek live agent tool smoke | `DEEPSEEK_LIVE_AGENT_TOOL_TESTS=1 npm run smoke:live:agent-tools` -> `latest/live-agent-tool-smoke.txt` | required for live release rehearsal |
 | DeepSeek live CLI run smoke | `deepseek run --live --output jsonl` against README tool-read task -> `latest/live-cli-run-smoke.txt` | required for live release rehearsal |
 | DeepSeek live doctor smoke | `deepseek doctor --live --output json` -> `latest/live-doctor-smoke.txt` | required for live release rehearsal |
+| GLM live provider smoke | `GLM_ANTHROPIC_LIVE_TESTS=1 npm run smoke:live:glm` -> `latest/glm-live-provider-smoke.txt` | provider parity, optional for release rehearsal |
+| GLM live agent tool smoke | `GLM_ANTHROPIC_LIVE_AGENT_TOOL_TESTS=1 npm run smoke:live:glm-agent-tools` -> `latest/glm-live-agent-tool-smoke.txt` | provider parity, optional for release rehearsal |
+| GLM live doctor smoke | `deepseek diagnostics doctor --live --provider glm --model glm-5.1 --output json` -> `latest/glm-live-doctor-smoke.txt` | provider parity, optional for release rehearsal |
 | Overall delivery capability | `deepseek diagnostics evaluate --full --execute-task all --live --output json` -> `latest/overall-delivery-capability-score.json` | required |
 | CLI mode and agent completion matrix | `deepseek diagnostics evaluate --dry-run --output json`, `src/apps/cli/test/cli.test.ts` -> mode matrix diagnostics | required |
 | Visible reasoning turn audit | `npx tsx --test tests/contracts/visible-reasoning-surface.test.ts tests/contracts/chat-slash-commands.test.ts tests/contracts/chat-tui-framework.test.ts tests/contracts/observability-privacy-contracts.test.ts` -> `latest/contracts.txt` | required |

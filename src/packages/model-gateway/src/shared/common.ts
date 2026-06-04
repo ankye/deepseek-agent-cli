@@ -59,6 +59,7 @@ export async function verifyByStreaming(gateway: ModelGateway, request: ModelLiv
   const eventKinds: string[] = [];
   const diagnostics: RedactedError[] = [];
   let usage: ModelLiveVerificationResult["usage"];
+  let providerMetadata: ModelProviderEventMetadata | undefined;
   let terminalStatus: ModelLiveVerificationResult["terminalStatus"] = "failed";
   let reachable = false;
 
@@ -70,6 +71,8 @@ export async function verifyByStreaming(gateway: ModelGateway, request: ModelLiv
     metadata: { liveVerification: true, ...(request.timeoutMs ? { timeoutMs: request.timeoutMs } : {}) }
   } as ModelRequest)) {
     eventKinds.push(event.kind);
+    const eventProvider = event.kind === "usage" ? event.metadata?.provider : event.provider;
+    providerMetadata = providerMetadata ?? eventProvider;
     if (event.kind === "delta" || event.kind === "reasoning" || event.kind === "finish" || event.kind === "usage" || event.kind === "done") reachable = true;
     if (event.kind === "usage") usage = event.metadata;
     if (event.kind === "error") {
@@ -81,7 +84,7 @@ export async function verifyByStreaming(gateway: ModelGateway, request: ModelLiv
 
   return {
     ok: terminalStatus === "completed",
-    provider: { provider: "deepseek", protocol: "openai-chat-completions", model: request.profile.model },
+    provider: providerMetadata ?? { provider: "deepseek", protocol: "openai-chat-completions", model: request.profile.model },
     reachable,
     terminalStatus,
     latencyMs: Date.now() - started,

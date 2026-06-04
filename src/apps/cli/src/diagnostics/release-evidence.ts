@@ -287,7 +287,8 @@ function firstPartyPluginPackReadinessEvidence(): FirstPartyPluginPackReadinessE
 }
 
 async function collectLiveReleaseEvidence(): Promise<ReleaseLiveEvidenceSummary> {
-  const files = await Promise.all(liveAcceptanceEvidencePaths().map(liveEvidenceFileStatus));
+  const files = await Promise.all(liveAcceptanceEvidencePaths().map((path) => liveEvidenceFileStatus(path)));
+  const providerParityEvidence = await Promise.all(providerParityLiveEvidencePaths().map((path) => liveEvidenceFileStatus(path, false)));
   const missingEvidencePaths = files.filter((file) => !file.exists).map((file) => file.path);
   const invalidEvidencePaths = files.filter((file) => file.exists && file.status !== "pass").map((file) => file.path);
   const overall = await readJsonFile("tests/acceptance/latest/overall-delivery-capability-score.json");
@@ -301,23 +302,32 @@ async function collectLiveReleaseEvidence(): Promise<ReleaseLiveEvidenceSummary>
     status,
     requiredEvidencePaths: liveAcceptanceEvidencePaths(),
     files,
+    providerParityEvidence,
     missingEvidencePaths,
     invalidEvidencePaths,
     ...(overallDeliveryCapabilityScore !== undefined ? { overallDeliveryCapabilityScore } : {}),
     ...(overallDeliveryCapabilityStatus ? { overallDeliveryCapabilityStatus } : {}),
     ...(liveToolCoveredFamilyCount !== undefined ? { liveToolCoveredFamilyCount } : {}),
-    redaction: { class: "internal", fields: ["files.path", "missingEvidencePaths", "invalidEvidencePaths"] }
+    redaction: { class: "internal", fields: ["files.path", "providerParityEvidence.path", "missingEvidencePaths", "invalidEvidencePaths"] }
   };
 }
 
-async function liveEvidenceFileStatus(path: string): Promise<ReleaseLiveEvidenceFileStatus> {
+function providerParityLiveEvidencePaths(): readonly string[] {
+  return [
+    "tests/acceptance/latest/glm-live-provider-smoke.txt",
+    "tests/acceptance/latest/glm-live-agent-tool-smoke.txt",
+    "tests/acceptance/latest/glm-live-doctor-smoke.txt"
+  ];
+}
+
+async function liveEvidenceFileStatus(path: string, required = true): Promise<ReleaseLiveEvidenceFileStatus> {
   const platform = new NodePlatformRuntime();
   const raw = await platform.readFile(join(process.cwd(), path)).catch(() => "");
   const exists = raw.length > 0;
-  if (!exists) return liveFile(path, false, "fail", `${path} is missing.`);
+  if (!exists) return liveFile(path, false, required, required ? "fail" : "warn", `${path} is missing.`);
   if (path.endsWith(".txt")) {
     const passed = liveTextEvidencePasses(path, raw);
-    return liveFile(path, true, passed ? "pass" : "fail", passed ? `${path} contains passing live evidence.` : `${path} does not prove a non-skipped live pass.`);
+    return liveFile(path, true, required, passed ? "pass" : "fail", passed ? `${path} contains passing live evidence.` : `${path} does not prove a non-skipped live pass.`);
   }
   if (path.endsWith("live-tool-coverage.json")) {
     const parsed = safeJson(raw);
@@ -326,7 +336,7 @@ async function liveEvidenceFileStatus(path: string): Promise<ReleaseLiveEvidence
       && parsed.replayOnly === false
       && getNested(parsed, ["summary", "passedToolCount"]) === 64
       && getNested(parsed, ["summary", "providerRequestMode"]) === "live";
-    return liveFile(path, true, passed ? "pass" : "fail", passed ? `${path} proves live tool coverage.` : `${path} is missing live tool coverage proof.`);
+    return liveFile(path, true, required, passed ? "pass" : "fail", passed ? `${path} proves live tool coverage.` : `${path} is missing live tool coverage proof.`);
   }
   if (path.endsWith("tool-family-delivery-capability-score.json")) {
     const parsed = safeJson(raw);
@@ -335,7 +345,7 @@ async function liveEvidenceFileStatus(path: string): Promise<ReleaseLiveEvidence
       && parsed.fakeCoveredFamilyCount === 0
       && parsed.replayedCoveredFamilyCount === 0
       && parsed.liveCoveredFamilyCount === 64;
-    return liveFile(path, true, passed ? "pass" : "fail", passed ? `${path} proves live tool-family delivery capability.` : `${path} is missing strict live tool-family delivery proof.`);
+    return liveFile(path, true, required, passed ? "pass" : "fail", passed ? `${path} proves live tool-family delivery capability.` : `${path} is missing strict live tool-family delivery proof.`);
   }
   if (path.endsWith("deepseek-provider-response-cache.json")) {
     const parsed = safeJson(raw);
@@ -343,7 +353,7 @@ async function liveEvidenceFileStatus(path: string): Promise<ReleaseLiveEvidence
     const passed = parsed?.kind === "deepseek.provider-response-cache"
       && entryCount > 0
       && parsed.sourceEvidencePath === "tests/acceptance/latest/live-tool-coverage.json";
-    return liveFile(path, true, passed ? "pass" : "fail", passed ? `${path} contains cached live provider responses for regression.` : `${path} does not contain live provider response cache records.`);
+    return liveFile(path, true, required, passed ? "pass" : "fail", passed ? `${path} contains cached live provider responses for regression.` : `${path} does not contain live provider response cache records.`);
   }
   if (path.endsWith("overall-delivery-capability-score.json")) {
     const parsed = safeJson(raw);
@@ -355,9 +365,9 @@ async function liveEvidenceFileStatus(path: string): Promise<ReleaseLiveEvidence
       && dimensionIds.includes("deepseek-api")
       && dimensionIds.includes("memory")
       && dimensionIds.includes("cache-observability");
-    return liveFile(path, true, passed ? "pass" : "fail", passed ? `${path} proves current-schema overall delivery capability.` : `${path} is stale or does not prove all current delivery dimensions.`);
+    return liveFile(path, true, required, passed ? "pass" : "fail", passed ? `${path} proves current-schema overall delivery capability.` : `${path} is stale or does not prove all current delivery dimensions.`);
   }
-  return liveFile(path, true, "pass", `${path} exists.`);
+  return liveFile(path, true, required, "pass", `${path} exists.`);
 }
 
 function liveTextEvidencePasses(path: string, raw: string): boolean {
@@ -365,8 +375,9 @@ function liveTextEvidencePasses(path: string, raw: string): boolean {
   if (/# (fail|cancelled|todo) [1-9]/.test(normalized)) return false;
   if (/# skipped [1-9]/.test(normalized) || normalized.includes("testcontext.skip")) return false;
   if (path.endsWith("live-cli-run-smoke.txt")) return liveCliRunSmokePasses(raw);
+  if (path.endsWith("glm-live-doctor-smoke.txt")) return glmLiveDoctorSmokePasses(raw);
   if (path.endsWith("live-doctor-smoke.txt")) return liveDoctorSmokePasses(raw);
-  return normalized.includes("# pass 1") && normalized.includes("# skipped 0");
+  return /# pass [1-9]\d*/.test(normalized) && normalized.includes("# skipped 0");
 }
 
 function liveCliRunSmokePasses(raw: string): boolean {
@@ -386,11 +397,31 @@ function liveDoctorSmokePasses(raw: string): boolean {
     && deepSeekProviderRequestEvidence(raw);
 }
 
+function glmLiveDoctorSmokePasses(raw: string): boolean {
+  return !/DeepSeek mock response/i.test(raw)
+    && (jsonBooleanField(raw, "liveRequested", true) || jsonBooleanField(raw, "requested", true))
+    && jsonBooleanField(raw, "reachable", true)
+    && jsonStringField(raw, "id", "doctor.live")
+    && glmProviderRequestEvidence(raw);
+}
+
 function deepSeekProviderRequestEvidence(raw: string): boolean {
   return jsonStringField(raw, "provider", "deepseek")
     && jsonStringField(raw, "protocol", "openai-chat-completions")
     && /"requestId"\s*:\s*"[^"]+"/.test(raw)
     && /"cache"\s*:\s*\{[^}]*"(hitTokens|missTokens)"\s*:\s*\d+/.test(raw);
+}
+
+function glmProviderRequestEvidence(raw: string): boolean {
+  return jsonStringField(raw, "provider", "glm")
+    && jsonStringField(raw, "protocol", "anthropic-messages")
+    && (/"requestId"\s*:\s*"[^"]+"/.test(raw) || glmStreamCompletionEvidence(raw));
+}
+
+function glmStreamCompletionEvidence(raw: string): boolean {
+  return jsonStringField(raw, "terminalStatus", "completed")
+    && jsonArrayContains(raw, "eventKinds", "usage")
+    && jsonArrayContains(raw, "eventKinds", "done");
 }
 
 function jsonStringField(raw: string, key: string, value: string): boolean {
@@ -401,14 +432,19 @@ function jsonBooleanField(raw: string, key: string, value: boolean): boolean {
   return new RegExp(`"${escapeRegExp(key)}"\\s*:\\s*${value ? "true" : "false"}`).test(raw);
 }
 
+function jsonArrayContains(raw: string, key: string, value: string): boolean {
+  return new RegExp(`"${escapeRegExp(key)}"\\s*:\\s*\\[[^\\]]*"${escapeRegExp(value)}"`).test(raw);
+}
+
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function liveFile(path: string, exists: boolean, status: ReadinessCheck["status"], message: string): ReleaseLiveEvidenceFileStatus {
+function liveFile(path: string, exists: boolean, required: boolean, status: ReadinessCheck["status"], message: string): ReleaseLiveEvidenceFileStatus {
   return {
     path,
     exists,
+    required,
     status,
     message,
     redaction: { class: "internal", fields: ["path"] }

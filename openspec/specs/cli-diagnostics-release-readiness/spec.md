@@ -4,7 +4,6 @@
 Define CLI diagnostics and release readiness requirements for local health, package evidence, governance findings, and publish gates.
 
 定义 CLI diagnostics 与 release readiness 对本地健康、package evidence、governance findings 与发布门禁的要求。
-
 ## Requirements
 ### Requirement: CLI Diagnostics Command Surface / CLI 诊断命令表面
 
@@ -44,21 +43,17 @@ CLI diagnostics 必须支持 text、JSON 和 JSONL 输出，并且 structured mo
 
 ### Requirement: CLI Release Readiness Evidence / CLI 发布就绪证据
 
-The CLI SHALL provide release-readiness evidence before publishing or host promotion, including both individual latest verification artifacts and the generated acceptance evidence index in text and structured output modes.
+CLI diagnostics release readiness SHALL require DeepSeek live acceptance evidence for publish readiness and SHALL also surface provider-specific GLM live evidence when GLM verification is requested or present.
 
-CLI 必须在发布或 host promotion 前提供 release-readiness evidence，且必须在 text 与 structured output modes 中同时包含单独的 latest verification artifacts 与生成的 acceptance evidence index。
+CLI diagnostics release readiness 必须要求 DeepSeek live acceptance evidence 才能发布就绪，并且在请求或存在 GLM verification 时展示 provider-specific GLM live evidence。
 
-#### Scenario: Package surface is checked / Package Surface 被检查
+#### Scenario: Live release evidence gates publish readiness / Live 发布证据门禁 Publish Ready
 
-- **WHEN** release readiness runs for the CLI npm package
-- **THEN** evidence includes package name, version, bin entry, build output path, expected tarball files, publish access, and a status for generated bundles being excluded from source commits
-- **中文** 当 release readiness 针对 CLI npm package 运行时，evidence 必须包含 package name、version、bin entry、build output path、expected tarball files、publish access，以及 generated bundles 不进入源码提交面的状态。
-
-#### Scenario: Acceptance evidence is linked / 验收证据被链接
-
-- **WHEN** release readiness is rendered
-- **THEN** output links or lists the generated acceptance index, OpenSpec validation, typecheck, lint, unit/contract/integration/golden/matrix/e2e tests, CLI build, headless smoke, boundary checks, and reference hygiene evidence in text and structured output modes
-- **中文** 当 release readiness 被渲染时，output 必须在 text 与 structured output modes 链接或列出 generated acceptance index、OpenSpec validation、typecheck、lint、unit/contract/integration/golden/matrix/e2e tests、CLI build、headless smoke、boundary checks 和 reference hygiene evidence。
+- **WHEN** `diagnostics verify` evaluates release readiness before publishing
+- **THEN** it requires DeepSeek live provider smoke, live agent-loop smoke, live agent-tool smoke, live CLI run smoke, live doctor smoke, live tool coverage, provider response cache, and current-schema overall delivery capability evidence
+- **AND** `publishDryRunReady` remains `false` when any required DeepSeek live evidence is missing, replay-only, skipped, stale, or does not include current delivery dimensions
+- **AND** GLM live provider smoke, GLM live agent-tool smoke, and GLM live doctor evidence are reported as provider-parity evidence without weakening the DeepSeek gate
+- **中文** 当 `diagnostics verify` 在发布前评估 release readiness 时，必须要求 DeepSeek live provider smoke、live agent-loop smoke、live agent-tool smoke、live CLI run smoke、live doctor smoke、live tool coverage、provider response cache 与当前 schema 的 overall delivery capability evidence；任一 required DeepSeek live evidence 缺失、仅 replay、被 skip、过期或不包含当前 delivery dimensions 时，`publishDryRunReady` 必须保持 `false`；GLM live provider smoke、GLM live agent-tool smoke 与 GLM live doctor evidence 必须作为 provider-parity evidence 报告，且不得削弱 DeepSeek gate。
 
 ### Requirement: Diagnostics Remain Host Adapter Work / 诊断保持 Host Adapter 职责
 
@@ -418,4 +413,16 @@ Readiness SHALL report release-blocking diagnostics when product-ready claims co
 - **WHEN** release metadata marks a placeholder, deferred, rollout-gated, or evidence-missing capability as product-ready
 - **THEN** readiness fails with a stable release-blocking diagnostic
 - **中文** 当 release metadata 将 placeholder、deferred、rollout-gated 或缺少证据的能力标记为 product-ready 时，readiness 必须以稳定 release-blocking diagnostic 失败。
+
+### Requirement: Diagnostics Doctor Is Provider-Aware / Diagnostics Doctor 支持 Provider 感知
+
+CLI diagnostics doctor SHALL pass explicit provider/model options into local readiness so live verification, credential checks, and metadata describe the selected provider.
+
+CLI diagnostics doctor 必须把显式 provider/model options 传入 local readiness，使 live verification、credential checks 与 metadata 描述 selected provider。
+
+#### Scenario: Diagnostics doctor verifies selected GLM provider / Diagnostics Doctor 校验选中的 GLM Provider
+
+- **WHEN** a user runs `deepseek diagnostics doctor --live --provider glm --model glm-5.1 --output json`
+- **THEN** diagnostics output includes `liveRequested = true`, selected provider metadata for GLM Anthropic-compatible verification, a `doctor.live` check for GLM, and redaction metadata without raw credential values
+- **中文** 当用户运行 `deepseek diagnostics doctor --live --provider glm --model glm-5.1 --output json` 时，diagnostics output 必须包含 `liveRequested = true`、GLM Anthropic-compatible verification 的 selected provider metadata、面向 GLM 的 `doctor.live` check，以及不包含 raw credential values 的 redaction metadata。
 

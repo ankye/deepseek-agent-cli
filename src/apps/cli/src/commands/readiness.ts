@@ -18,13 +18,15 @@ import {
   createDeepSeekCredentialAuthServiceFromEnv,
   createDeepSeekCredentialPresenceEnv,
   CredentialAuthModelCredentialProvider,
-  deepSeekLiveCredentialProcessEnv
+  deepSeekLiveCredentialProcessEnv,
+  glmAnthropicLiveCredentialProcessEnv
 } from "@deepseek/credential-auth-management";
 import { resolveIndexProviderDiagnostics } from "@deepseek/index-provider";
-import { DeepSeekOpenAIProvider, DeterministicMockModelGateway, OpenAIModelProviderTransport, defaultDeepSeekProfile } from "@deepseek/model-gateway";
+import { DeepSeekOpenAIProvider, DeterministicMockModelGateway, FetchModelProviderTransport, GlmAnthropicProvider, OpenAIModelProviderTransport, StaticCredentialProvider, defaultDeepSeekProfile, defaultGlmAnthropicProfile, glmAnthropicCredentialRef } from "@deepseek/model-gateway";
 import { NodePlatformRuntime } from "@deepseek/platform-abstraction";
 import type { CliOptions } from "../types.js";
 import { collectReleaseReadinessEvidence } from "../diagnostics/release-evidence.js";
+import { resolveCliModelProfile } from "../host/model-selection.js";
 
 export function renderReadinessText(result: ReadinessCommandResult): readonly string[] {
   const lines = [`${result.command}: ${result.status}`];
@@ -67,8 +69,17 @@ export async function createCliReadinessEnvironment(options: CliOptions): Promis
       sandbox: "ask"
     }
   });
-  const credentialEnv = await deepSeekLiveCredentialProcessEnv(platform, workspaceRoot);
-  const credentialAuth = await createDeepSeekCredentialAuthServiceFromEnv(credentialEnv);
+  const deepSeekCredentialEnv = await deepSeekLiveCredentialProcessEnv(platform, workspaceRoot);
+  const glmCredentialEnv = await glmAnthropicLiveCredentialProcessEnv(platform, workspaceRoot);
+  const credentialAuth = await createDeepSeekCredentialAuthServiceFromEnv(deepSeekCredentialEnv);
+  const selectedProfile = resolveCliModelProfile(options);
+  const selectedProvider = selectedProviderName(options, selectedProfile.providerId);
+  const selectedProviderMetadata = {
+    provider: selectedProvider,
+    protocol: selectedProvider === "glm" ? "anthropic-messages" as const : "openai-chat-completions" as const,
+    model: selectedProfile.model,
+    label: selectedProvider === "glm" ? "GLM" : "DeepSeek"
+  };
   const existingWorkspaceDocument = await config.document("workspace");
   let initializedThisRun = false;
   if (options.readinessCommand === "init" && (!existingWorkspaceDocument || options.readinessInput?.force === true)) {
@@ -99,16 +110,25 @@ export async function createCliReadinessEnvironment(options: CliOptions): Promis
   const platformDescriptor = await platform.descriptor();
   const liveVerifier = options.readinessInput?.live === true
     ? async () => {
-        const providerOptions = {
-          credentials: new CredentialAuthModelCredentialProvider(credentialAuth),
-          ...(options.readinessInput?.fakeLive === true ? {} : { transport: new OpenAIModelProviderTransport() }),
-          timeoutMs: 90000
-        };
-        const provider = new DeepSeekOpenAIProvider(providerOptions);
-        const gateway = options.readinessInput?.fakeLive === true ? new DeterministicMockModelGateway() : provider;
+        const glmToken = firstNonEmpty(glmCredentialEnv.GLM_ANTHROPIC_API_KEY, glmCredentialEnv.ZHIPU_API_KEY);
+        const gateway = selectedProvider === "glm"
+          ? new GlmAnthropicProvider({
+              ...(options.readinessInput?.fakeLive === true ? {} : { transport: new FetchModelProviderTransport() }),
+              timeoutMs: 90000,
+              ...(glmToken
+                ? { credentials: new StaticCredentialProvider(glmToken, glmAnthropicCredentialRef) }
+                : {})
+            })
+          : options.readinessInput?.fakeLive === true
+            ? new DeterministicMockModelGateway()
+            : new DeepSeekOpenAIProvider({
+                credentials: new CredentialAuthModelCredentialProvider(credentialAuth),
+                transport: new OpenAIModelProviderTransport(),
+                timeoutMs: 90000
+              });
         return gateway.verify
-          ? gateway.verify({ profile: defaultDeepSeekProfile, prompt: "Reply with exactly this text: ok", timeoutMs: 90000 })
-          : missingLiveVerifierResult(defaultDeepSeekProfile);
+          ? gateway.verify({ profile: selectedProfile, prompt: "Reply with exactly this text: ok", timeoutMs: 90000 })
+          : missingLiveVerifierResult(selectedProfile);
       }
     : undefined;
 
@@ -118,7 +138,10 @@ export async function createCliReadinessEnvironment(options: CliOptions): Promis
     platform: `${platformDescriptor.os}:${platformDescriptor.environmentKind}`,
     packageName: "deepseek-agent-cli",
     packageVersion: "0.1.3",
-    env: createDeepSeekCredentialPresenceEnv(credentialEnv),
+    env: {
+      ...createDeepSeekCredentialPresenceEnv(deepSeekCredentialEnv),
+      ...createGlmCredentialPresenceEnv(glmCredentialEnv)
+    },
     ignoredPaths: [".env", ".env.*", "参考/"],
     availableCommands: ["node", "npm"],
     platformDescriptor,
@@ -129,6 +152,7 @@ export async function createCliReadinessEnvironment(options: CliOptions): Promis
     supportBundlePolicy: release.supportBundle,
     indexProviderDiagnostics: resolveIndexProviderDiagnostics(indexProviderManifestFromConfig(resolvedConfig.values.find((value) => value.key === "indexProviders")?.redactedValue)),
     credentialReferences: credentials,
+    modelProvider: selectedProviderMetadata,
     ...(liveVerifier ? { liveVerifier } : {}),
     ...(workspaceMetadata.ok && workspaceMetadata.value ? { workspaceMetadataPath: workspaceMetadata.value } : {}),
     initialized: Boolean(existingWorkspaceDocument),
@@ -208,11 +232,33 @@ function isJsonObject(value: unknown): value is JsonObject {
 function missingLiveVerifierResult(profile: ModelProfile): ModelLiveVerificationResult {
   return {
     ok: false,
-    provider: { provider: "deepseek", protocol: "openai-chat-completions", model: profile.model },
+    provider: profile.providerId === defaultGlmAnthropicProfile.providerId
+      ? { provider: "glm", protocol: "anthropic-messages", model: profile.model }
+      : { provider: "deepseek", protocol: "openai-chat-completions", model: profile.model },
     reachable: false,
     terminalStatus: "failed",
     eventKinds: [],
     diagnostics: [],
     redaction: { class: "internal" }
   };
+}
+
+function selectedProviderName(options: CliOptions, providerId: ModelProfile["providerId"]): "deepseek" | "glm" {
+  if (options.modelProvider === "glm" || providerId === defaultGlmAnthropicProfile.providerId) return "glm";
+  return "deepseek";
+}
+
+function createGlmCredentialPresenceEnv(env: Readonly<Record<"GLM_ANTHROPIC_API_KEY" | "ZHIPU_API_KEY", string | undefined>>): Readonly<Record<"GLM_ANTHROPIC_API_KEY" | "ZHIPU_API_KEY", string | undefined>> {
+  return {
+    GLM_ANTHROPIC_API_KEY: hasValue(env.GLM_ANTHROPIC_API_KEY) ? "present" : undefined,
+    ZHIPU_API_KEY: hasValue(env.ZHIPU_API_KEY) ? "present" : undefined
+  };
+}
+
+function firstNonEmpty(...values: readonly (string | undefined)[]): string | undefined {
+  return values.find((value) => hasValue(value))?.trim();
+}
+
+function hasValue(value: string | undefined): value is string {
+  return typeof value === "string" && value.trim().length > 0;
 }

@@ -1,0 +1,27 @@
+
+> deepseek-cli-platform@0.1.8 smoke:live:glm-agent-tools
+> tsx --test "tests/live/glm-agent-tool-live-smoke.test.ts"
+
+TAP version 13
+# Subtest: GLM Anthropic-compatible live agent tool-loop smoke
+    # Subtest: runs a live GLM tool turn only when explicitly enabled
+    ok 1 - runs a live GLM tool turn only when explicitly enabled
+      ---
+      duration_ms: 16514.809446
+      type: 'test'
+      ...
+    1..1
+ok 1 - GLM Anthropic-compatible live agent tool-loop smoke
+  ---
+  duration_ms: 16516.309531
+  type: 'suite'
+  ...
+1..1
+# tests 1
+# suites 1
+# pass 1
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 17350.051579

@@ -701,6 +701,26 @@ describe("GLM Anthropic-compatible provider", () => {
     assert.deepEqual(request?.body.tool_choice, { type: "tool", name: "core_file_read" });
   });
 
+  it("preserves GLM provider metadata in live verification results", async () => {
+    const transport = new FixtureModelProviderTransport([
+      { data: { type: "message_start", message: { usage: { input_tokens: 2, output_tokens: 0 } } } },
+      { data: { type: "content_block_delta", delta: { type: "text_delta", text: "ok" } } },
+      { data: { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } } },
+      { data: { type: "message_stop" } }
+    ]);
+    const provider = new GlmAnthropicProvider({
+      transport,
+      credentials: new StaticCredentialProvider("glm-test", glmAnthropicProviderConfig.credentialRef)
+    });
+
+    const result = await provider.verify?.({ profile: defaultGlmAnthropicProfile, prompt: "ok", timeoutMs: 1234 });
+
+    assert.equal(result?.ok, true);
+    assert.equal(result?.provider.provider, "glm");
+    assert.equal(result?.provider.protocol, "anthropic-messages");
+    assert.equal(result?.provider.model, "glm-5.1");
+  });
+
   it("normalizes Anthropic text, tool-use, usage, finish, and done events", () => {
     const provider = { provider: "glm", protocol: "anthropic-messages" as const, model: "glm-5.1" };
     const events = [
