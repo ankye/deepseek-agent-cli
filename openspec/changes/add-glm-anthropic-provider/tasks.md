@@ -15,6 +15,7 @@
 - [x] 3.1 Add skip-by-default GLM provider smoke and npm script. / 增加默认跳过的 GLM provider smoke 与 npm script。
 - [x] 3.2 Run the GLM live provider smoke with explicit environment credentials and confirm redacted normalized output. / 使用显式环境凭据运行 GLM live provider smoke，并确认输出为脱敏 normalized output。
 - [x] 3.3 Run a CLI live flow against GLM with explicit provider/model selection. / 使用显式 provider/model selection 针对 GLM 运行 CLI live flow。
+- [x] 3.4 Add and run a skip-by-default GLM live agent tool-loop smoke through runtime-governed tools. / 增加并运行默认跳过的 GLM live agent tool-loop smoke，覆盖 runtime-governed tools。
 
 ## 4. Verification / 校验
 
