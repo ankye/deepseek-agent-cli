@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { createEvaluationProgressObserver, progressLineFromChildJsonl } from "./evaluation-progress.js";
+import { createEvaluationProgressObserver, progressLineFromChildJsonl, progressLineFromInstrumentationEvent } from "./evaluation-progress.js";
 
 describe("diagnostics evaluation progress", () => {
   it("flushes a final child JSONL progress line when the child exits without a trailing newline", () => {
@@ -35,5 +35,18 @@ describe("diagnostics evaluation progress", () => {
     }));
 
     assert.equal(line, "progress eval.test: loop failed");
+  });
+
+  it("sanitizes public progress identifiers and outcome labels", () => {
+    const childLine = progressLineFromChildJsonl("eval.test\nsk-secret", JSON.stringify({
+      kind: "model.tool.intent",
+      data: { name: "core.file.read" }
+    }));
+    const phaseLine = progressLineFromInstrumentationEvent("eval.test\nsk-secret", "deepseek-cli\nsecret", "run_started", {});
+    const outcomeLine = progressLineFromInstrumentationEvent("eval.test", "deepseek-cli", "run_finished", { outcome: "solved\nsecret" });
+
+    assert.equal(childLine, "progress unknown: tool core.file.read started");
+    assert.equal(phaseLine, "progress unknown: task started baseline=unknown");
+    assert.equal(outcomeLine, "progress eval.test: task finished");
   });
 });

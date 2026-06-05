@@ -32,25 +32,26 @@ export function progressLineFromChildJsonl(taskId: string, line: string): string
   if (!trimmed) return undefined;
   const parsed = parseJsonObject(trimmed);
   if (!parsed) return undefined;
+  const safeTaskId = safePublicToken(taskId, "unknown");
   const kind = stringField(parsed, "kind");
   const data = jsonObjectField(parsed, "data") ?? {};
   if (kind === "model.tool.intent") {
-    return `progress ${taskId}: tool ${toolName(data)} started`;
+    return `progress ${safeTaskId}: tool ${toolName(data)} started`;
   }
   if (kind === "model.tool.result") {
-    return `progress ${taskId}: tool ${toolName(data)} ${toolStatus(data)}`;
+    return `progress ${safeTaskId}: tool ${toolName(data)} ${toolStatus(data)}`;
   }
   if (kind === "agent.repair.started") {
-    return `progress ${taskId}: repair started`;
+    return `progress ${safeTaskId}: repair started`;
   }
   if (kind === "agent.repair.stopped") {
-    return `progress ${taskId}: repair stopped${reasonSuffix(repairStopReason(data))}`;
+    return `progress ${safeTaskId}: repair stopped${reasonSuffix(repairStopReason(data))}`;
   }
   if (kind === "agent.loop.completed") {
-    return `progress ${taskId}: loop completed${reasonSuffix(repairStopReason(data))}`;
+    return `progress ${safeTaskId}: loop completed${reasonSuffix(repairStopReason(data))}`;
   }
   if (kind === "agent.loop.failed") {
-    return `progress ${taskId}: loop failed${reasonSuffix(stringField(data, "reason") ?? repairStopReason(data))}`;
+    return `progress ${safeTaskId}: loop failed${reasonSuffix(stringField(data, "reason") ?? repairStopReason(data))}`;
   }
   return undefined;
 }
@@ -72,15 +73,17 @@ export function progressLineFromInstrumentationEvent(
   kind: CliEvaluationInstrumentationEvent["kind"],
   metadata: JsonObject
 ): string | undefined {
-  if (kind === "run_started") return `progress ${taskId}: task started baseline=${baselineId}`;
-  if (kind === "workspace_created") return `progress ${taskId}: workspace ready`;
-  if (kind === "command_started") return `progress ${taskId}: agent command started`;
-  if (kind === "command_finished") return `progress ${taskId}: agent command exit=${numericField(metadata, "exitCode") ?? "unknown"}`;
-  if (kind === "checker_started") return `progress ${taskId}: checker started`;
-  if (kind === "checker_finished") return `progress ${taskId}: checker ${numericField(metadata, "exitCode") === 0 ? "pass" : "fail"} exit=${numericField(metadata, "exitCode") ?? "unknown"}`;
-  if (kind === "artifact_scan_started") return `progress ${taskId}: artifact scan started`;
-  if (kind === "artifact_scan_finished") return `progress ${taskId}: artifact scan finished files=${numericField(metadata, "fileCount") ?? "unknown"}`;
-  if (kind === "run_finished") return `progress ${taskId}: task ${stringField(metadata, "outcome") ?? "finished"}`;
+  const safeTaskId = safePublicToken(taskId, "unknown");
+  const safeBaselineId = safePublicToken(baselineId, "unknown");
+  if (kind === "run_started") return `progress ${safeTaskId}: task started baseline=${safeBaselineId}`;
+  if (kind === "workspace_created") return `progress ${safeTaskId}: workspace ready`;
+  if (kind === "command_started") return `progress ${safeTaskId}: agent command started`;
+  if (kind === "command_finished") return `progress ${safeTaskId}: agent command exit=${numericField(metadata, "exitCode") ?? "unknown"}`;
+  if (kind === "checker_started") return `progress ${safeTaskId}: checker started`;
+  if (kind === "checker_finished") return `progress ${safeTaskId}: checker ${numericField(metadata, "exitCode") === 0 ? "pass" : "fail"} exit=${numericField(metadata, "exitCode") ?? "unknown"}`;
+  if (kind === "artifact_scan_started") return `progress ${safeTaskId}: artifact scan started`;
+  if (kind === "artifact_scan_finished") return `progress ${safeTaskId}: artifact scan finished files=${numericField(metadata, "fileCount") ?? "unknown"}`;
+  if (kind === "run_finished") return `progress ${safeTaskId}: task ${safePublicToken(stringField(metadata, "outcome"), "finished")}`;
   return undefined;
 }
 

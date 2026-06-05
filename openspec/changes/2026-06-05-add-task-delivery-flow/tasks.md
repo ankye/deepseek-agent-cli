@@ -21,6 +21,7 @@
 - [x] 19. Stream safe diagnostics evaluation phase progress for workspace, agent command, checker, artifact scan, and outcome transitions without exposing paths, commands, prompts, or raw output.
 - [x] 20. Flush the final buffered diagnostics evaluation child progress event when the child process exits without a trailing JSONL newline.
 - [x] 21. Restrict child-derived diagnostics progress fields to short safe identifiers and fall back to neutral public labels for unsafe values.
+- [x] 22. Restrict diagnostics progress task ids, baseline ids, and outcome labels to short safe identifiers with neutral fallbacks.
 
 # 任务
 
@@ -45,3 +46,4 @@
 - [x] 19. 为 workspace、agent command、checker、artifact scan 与 outcome transitions 流式输出安全的 diagnostics evaluation phase progress，且不暴露 paths、commands、prompts 或 raw output。
 - [x] 20. 当子进程退出且最后一个 JSONL event 没有 trailing newline 时，flush 最终 buffered diagnostics evaluation child progress event。
 - [x] 21. 将 child-derived diagnostics progress 字段限制为短安全标识符，并对 unsafe values 回退为中性公开标签。
+- [x] 22. 将 diagnostics progress task ids、baseline ids 与 outcome labels 限制为短安全标识符，并提供中性 fallback。
