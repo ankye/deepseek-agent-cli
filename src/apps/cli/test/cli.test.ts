@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { AGENT_MODE_COMPATIBILITY, AGENT_MODE_SCHEMA_VERSION, APPROVAL_SCHEMA_VERSION, INTERACTION_MODE_COMPATIBILITY, INTERACTION_MODE_SCHEMA_VERSION, asId } from "@deepseek/platform-contracts";
-import type { ApprovalId, ApprovalRequest, JsonObject, ModelGateway, ModelRequest, ModelStreamEvent, PlatformRuntime, PolicyDecision, PolicyEngine, PolicyRequest, ProcessResult, RuntimeEvent, SessionEvent, SessionId, WorkspaceEditTransaction } from "@deepseek/platform-contracts";
+import type { ApprovalId, ApprovalRequest, JsonObject, ModelGateway, ModelRequest, ModelStreamEvent, PlatformRuntime, PolicyDecision, PolicyEngine, PolicyRequest, ProcessResult, ProcessRunObserver, ProcessRunOptions, RuntimeEvent, SessionEvent, SessionId, WorkspaceEditTransaction } from "@deepseek/platform-contracts";
 import { FakePlatformRuntime, NodePlatformRuntime } from "@deepseek/platform-abstraction";
 import { createDefaultRuntimeKernel, registerRuntimeCoreTools } from "@deepseek/runtime";
 import { createDeterministicRuntimeDependencies } from "@deepseek/testing-regression";
@@ -3844,6 +3844,32 @@ describe("cli host adapter", () => {
     assert.equal(webpageRun?.diagnostics.some((item) => item.code === "CLI_EVALUATION_PROMPT_ASSEMBLY_MISSING"), false);
   });
 
+  it("streams safe diagnostics evaluate progress without exposing raw model deltas", async () => {
+    const progressLines: string[] = [];
+    const platform = new FakeWebpageAgentPlatform({ streamProgressEvents: true });
+    const evaluationOptions = {
+      mode: "full" as const,
+      dryRun: false,
+      live: false,
+      baselineId: "deepseek-cli",
+      compareBaselineIds: ["deepseek-cli"],
+      allowExternalBaseline: false,
+      baselineArgs: [],
+      executeTaskId: "eval.webpage.generation",
+      extraArgs: [],
+      platform,
+      progressSink: { emit: (line: string) => progressLines.push(line) }
+    };
+
+    const summary = await collectCliEvaluation(evaluationOptions as Parameters<typeof collectCliEvaluation>[0]);
+    const text = progressLines.join("\n");
+
+    assert.equal(summary.taskRuns.find((run) => run.task.taskId === "eval.webpage.generation")?.outcome, "solved");
+    assert.equal(text.includes("progress eval.webpage.generation: tool core.file.read started"), true);
+    assert.equal(text.includes("progress eval.webpage.generation: tool core.file.read success"), true);
+    assert.equal(text.includes("secret raw delta"), false);
+  });
+
   it("does not solve structurally valid webpages without evidence grounding", async () => {
     const platform = new FakeWebpageAgentPlatform({ omitEvidenceManifest: true });
     const summary = await collectCliEvaluation({
@@ -4751,11 +4777,11 @@ class FakeWebpageAgentPlatform extends NodePlatformRuntime {
   readonly executedWorkspaces: string[] = [];
   readonly executedCommands: { readonly command: string; readonly args: readonly string[]; readonly cwd: string; readonly env?: JsonObject }[] = [];
 
-  constructor(private readonly behavior: { readonly omitEvidenceManifest?: boolean; readonly includeRuntimeSignals?: boolean; readonly runtimeReasoningOnly?: boolean } = {}) {
+  constructor(private readonly behavior: { readonly omitEvidenceManifest?: boolean; readonly includeRuntimeSignals?: boolean; readonly runtimeReasoningOnly?: boolean; readonly streamProgressEvents?: boolean } = {}) {
     super();
   }
 
-  override async runProcess(command: string, args: readonly string[], options: JsonObject = {}): Promise<ProcessResult> {
+  override async runProcess(command: string, args: readonly string[], options: ProcessRunOptions = {}, observer?: ProcessRunObserver): Promise<ProcessResult> {
     const cwd = typeof options.cwd === "string" ? options.cwd : process.cwd();
     this.executedCommands.push({ command, args: [...args], cwd, ...(isJsonObject(options.env) ? { env: options.env } : {}) });
     if (command === "fake-web-agent" && args[0] === "--version") {
@@ -4777,44 +4803,56 @@ class FakeWebpageAgentPlatform extends NodePlatformRuntime {
     if (command === process.execPath && args.some((arg) => String(arg).replace(/\\/g, "/").endsWith("src/apps/cli/src/index.ts"))) {
       this.executedWorkspaces.push(cwd);
       await this.writeGeneratedWebpage(cwd);
+      const stdout = [
+        ...this.progressEventLines(),
+        JSON.stringify({
+        kind: "prompt.assembled",
+        data: {
+          fingerprint: "assembly-test",
+          sectionCount: 3,
+          excludedSectionCount: 0,
+          budget: { status: "within-budget" },
+          toolPlan: { visibleToolCount: 4 },
+          trace: {
+            sections: [
+              { kind: "task.intent", included: true },
+              { kind: "task.output-contract", included: true },
+              { kind: "tools.policy", included: true }
+            ]
+          }
+        }
+        }),
+        JSON.stringify({
+          kind: "agent.repair.started",
+          data: { schemaVersion: "1.0.0", enabled: true, attemptBudget: 1 }
+        }),
+        JSON.stringify({
+          kind: "agent.repair.stopped",
+          data: { schemaVersion: "1.0.0", stopReason: "completed" }
+        }),
+        JSON.stringify({
+          kind: "agent.loop.completed",
+          data: { selfRepair: { stopReason: "completed" } }
+        }),
+        ...this.runtimeSignalLines()
+      ].join("\n") + "\n";
+      observer?.onStdoutChunk?.(stdout);
       return {
         exitCode: 0,
-        stdout: [
-          JSON.stringify({
-          kind: "prompt.assembled",
-          data: {
-            fingerprint: "assembly-test",
-            sectionCount: 3,
-            excludedSectionCount: 0,
-            budget: { status: "within-budget" },
-            toolPlan: { visibleToolCount: 4 },
-            trace: {
-              sections: [
-                { kind: "task.intent", included: true },
-                { kind: "task.output-contract", included: true },
-                { kind: "tools.policy", included: true }
-              ]
-            }
-          }
-          }),
-          JSON.stringify({
-            kind: "agent.repair.started",
-            data: { schemaVersion: "1.0.0", enabled: true, attemptBudget: 1 }
-          }),
-          JSON.stringify({
-            kind: "agent.repair.stopped",
-            data: { schemaVersion: "1.0.0", stopReason: "completed" }
-          }),
-          JSON.stringify({
-            kind: "agent.loop.completed",
-            data: { selfRepair: { stopReason: "completed" } }
-          }),
-          ...this.runtimeSignalLines()
-        ].join("\n") + "\n",
+        stdout,
         stderr: ""
       };
     }
-    return super.runProcess(command, args, options);
+    return super.runProcess(command, args, options, observer);
+  }
+
+  private progressEventLines(): readonly string[] {
+    if (!this.behavior.streamProgressEvents) return [];
+    return [
+      JSON.stringify({ kind: "model.tool.intent", data: { name: "core.file.read" } }),
+      JSON.stringify({ kind: "model.delta", data: { text: "secret raw delta" } }),
+      JSON.stringify({ kind: "model.tool.result", data: { name: "core.file.read", status: "success" } })
+    ];
   }
 
   private async writeGeneratedWebpage(cwd: string): Promise<void> {

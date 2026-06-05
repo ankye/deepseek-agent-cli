@@ -28,6 +28,7 @@ import { environmentPrepareJsonLines, prepareDiagnosticsEnvironment } from "./en
 import type { DiagnosticsEnvironmentPrepareSummary } from "./environment-prepare.js";
 import { collectCliEvaluation, evaluationJsonLines } from "./evaluation.js";
 import type { CliEvaluationOptions } from "./evaluation.js";
+import type { EvaluationProgressSink } from "./evaluation-progress.js";
 import { buildEvaluationDeliveryCapabilityEvidence } from "./evaluation-delivery-evidence.js";
 import { evaluationRunMetricText, evaluationRunTraceText } from "./evaluation-text-render.js";
 import { collectModeMatrix } from "./mode-matrix.js";
@@ -71,17 +72,26 @@ export interface CliDiagnosticsResult extends JsonObject {
 
 export async function runDiagnosticsCommand(options: CliOptions, write: (line: string) => Promise<void>): Promise<void> {
   const command = options.diagnosticsCommand ?? "bundle";
-  const result = await collectCliDiagnostics(command, options);
+  let progressWrites = Promise.resolve();
+  const progressSink: EvaluationProgressSink | undefined = command === "evaluate" && options.output === "text"
+    ? {
+        emit(line) {
+          progressWrites = progressWrites.then(() => write(line));
+        }
+      }
+    : undefined;
+  const result = await collectCliDiagnostics(command, options, progressSink);
+  await progressWrites;
   for (const line of renderDiagnosticsResult(result, options.output)) await write(line);
 }
 
-export async function collectCliDiagnostics(command: DiagnosticsCommandName, options: CliOptions): Promise<CliDiagnosticsResult> {
+export async function collectCliDiagnostics(command: DiagnosticsCommandName, options: CliOptions, progressSink?: EvaluationProgressSink): Promise<CliDiagnosticsResult> {
   if (command === "release") return releaseDiagnostics(options);
   if (command === "verify") return verifyDiagnostics(options);
   if (command === "refresh") return refreshDiagnostics(options);
   if (command === "env") return environmentDiagnostics(options);
   if (command === "flow") return flowDiagnostics(options);
-  if (command === "evaluate") return evaluateDiagnostics(options);
+  if (command === "evaluate") return evaluateDiagnostics(options, progressSink);
   if (command === "doctor") return doctorDiagnostics(options);
   return bundleDiagnostics(options);
 }
@@ -375,7 +385,7 @@ async function flowDiagnostics(options: CliOptions): Promise<CliDiagnosticsResul
   };
 }
 
-async function evaluateDiagnostics(options: CliOptions): Promise<CliDiagnosticsResult> {
+async function evaluateDiagnostics(options: CliOptions, progressSink?: EvaluationProgressSink): Promise<CliDiagnosticsResult> {
   const evaluationOptions: CliEvaluationOptions = {
     mode: options.diagnosticsInput?.full === true ? "full" : "smoke",
     dryRun: options.diagnosticsInput?.dryRun === true,
@@ -396,7 +406,8 @@ async function evaluateDiagnostics(options: CliOptions): Promise<CliDiagnosticsR
       : [],
     extraArgs: Array.isArray(options.diagnosticsInput?.extraArgs)
       ? options.diagnosticsInput.extraArgs.filter((item): item is string => typeof item === "string")
-      : []
+      : [],
+    ...(progressSink ? { progressSink } : {})
   };
   const evaluation = await collectCliEvaluation(evaluationOptions);
   const modeMatrix = await collectModeMatrix();

@@ -21,6 +21,7 @@ import {
 } from "./evaluation-metrics.js";
 import { executeEvaluationTask, shouldRetryEvaluationTask } from "./evaluation-task-execution.js";
 import { buildOptionalEvaluationStagedTaskSnapshot } from "./evaluation-stage-graph.js";
+import type { EvaluationProgressSink } from "./evaluation-progress.js";
 import { collectPackageScorecards } from "./package-scorecard.js";
 import { readLiveToolCoverageEvidence, type LiveToolCoverageRecord } from "./tool-live-coverage.js";
 
@@ -45,6 +46,7 @@ export interface CliEvaluationOptions {
   readonly baselineArgs: readonly string[];
   readonly extraArgs: readonly string[];
   readonly platform?: PlatformRuntime;
+  readonly progressSink?: EvaluationProgressSink;
 }
 
 export const defaultEvaluationCatalogPath = "tests/evaluation/task-catalog.json";

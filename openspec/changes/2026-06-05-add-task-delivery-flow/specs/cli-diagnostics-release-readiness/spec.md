@@ -32,3 +32,10 @@ CLI diagnostics 必须暴露确定性的 `diagnostics flow inspect` 命令，用
 - **THEN** the text output includes a bounded public execution trace with instrumentation event order, final event, staged run status, active/failed stage ids, executor kinds, checker status, checker exit code, and repair stop reason when available
 - **AND** it does not render provider raw chain-of-thought, raw model request or response bodies, complete stdout/stderr, raw secrets, environment credentials, or unbounded command output
 - **中文** 当 `deepseek diagnostics evaluate --execute-task <id> --output text` 渲染已执行任务 run 时，文本输出必须包含有界的公开执行轨迹，包括 instrumentation event order、final event、staged run status、active/failed stage ids、executor kinds、checker status、checker exit code 与可用的 repair stop reason；不得渲染 provider raw chain-of-thought、raw model request/response bodies、完整 stdout/stderr、raw secrets、environment credentials 或无界 command output。
+
+#### Scenario: Diagnostics evaluation streams safe child progress / Diagnostics Evaluate 流式输出安全子进程进度
+
+- **WHEN** `deepseek diagnostics evaluate --execute-task <id> --output text` runs a DeepSeek CLI child process that emits JSONL task events before the child exits
+- **THEN** diagnostics may stream bounded public progress lines for allowlisted child events such as tool intent, tool result, repair started, repair stopped, loop completed, and loop failed
+- **AND** progress streaming ignores raw model deltas, provider raw chain-of-thought, raw stdout/stderr lines, raw model request or response bodies, raw secrets, environment credentials, and unrecognized child payloads
+- **中文** 当 `deepseek diagnostics evaluate --execute-task <id> --output text` 运行 DeepSeek CLI 子进程，且子进程在退出前输出 JSONL task events 时，diagnostics 可以为 tool intent、tool result、repair started、repair stopped、loop completed 与 loop failed 等 allowlist child events 流式输出有界公开进度行；progress streaming 必须忽略 raw model deltas、provider raw chain-of-thought、raw stdout/stderr lines、raw model request/response bodies、raw secrets、environment credentials 与未识别的 child payloads。

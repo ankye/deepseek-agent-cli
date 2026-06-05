@@ -18,6 +18,7 @@ import type {
   PlatformRuntime,
   PlatformResolvedPath,
   ProcessProviderDescriptor,
+  ProcessRunObserver,
   ProcessResult,
   ProcessRunOptions,
   RedactedError,
@@ -432,7 +433,7 @@ export class NodePlatformRuntime implements PlatformRuntime {
     return results;
   }
 
-  async runProcess(command: string, args: readonly string[], options: ProcessRunOptions = {}): Promise<ProcessResult> {
+  async runProcess(command: string, args: readonly string[], options: ProcessRunOptions = {}, observer?: ProcessRunObserver): Promise<ProcessResult> {
     const processProvider = await this.resolveProcessProvider();
     if (!processProvider.available) {
       return {
@@ -485,12 +486,16 @@ export class NodePlatformRuntime implements PlatformRuntime {
         }, timeoutMs)
         : undefined;
       child.stdout?.on("data", (chunk) => {
-        const next = appendBoundedOutput(stdout, String(chunk), outputLimitBytes);
+        const text = String(chunk);
+        observer?.onStdoutChunk?.(text);
+        const next = appendBoundedOutput(stdout, text, outputLimitBytes);
         stdout = next.text;
         stdoutTruncated ||= next.truncated;
       });
       child.stderr?.on("data", (chunk) => {
-        const next = appendBoundedOutput(stderr, String(chunk), outputLimitBytes);
+        const text = String(chunk);
+        observer?.onStderrChunk?.(text);
+        const next = appendBoundedOutput(stderr, text, outputLimitBytes);
         stderr = next.text;
         stderrTruncated ||= next.truncated;
       });
@@ -842,7 +847,7 @@ export class FakePlatformRuntime extends NodePlatformRuntime {
     return results;
   }
 
-  override async runProcess(command: string, args: readonly string[], options: ProcessRunOptions = {}): Promise<ProcessResult> {
+  override async runProcess(command: string, args: readonly string[], options: ProcessRunOptions = {}, observer?: ProcessRunObserver): Promise<ProcessResult> {
     const processProvider = await this.resolveProcessProvider();
     if (!processProvider.available) {
       return {
@@ -852,14 +857,16 @@ export class FakePlatformRuntime extends NodePlatformRuntime {
         metadata: providerMetadata("none", "unavailable", [], processProvider.diagnostics[0]?.code, processProvider.diagnostics)
       };
     }
+    const stdout = JSON.stringify({
+      command,
+      args,
+      executionProfile: options.executionProfile ?? "default",
+      stdin: options.stdin ?? (options.executionProfile === "noninteractive" ? "ignore" : "pipe")
+    });
+    observer?.onStdoutChunk?.(stdout);
     return {
       exitCode: 0,
-      stdout: JSON.stringify({
-        command,
-        args,
-        executionProfile: options.executionProfile ?? "default",
-        stdin: options.stdin ?? (options.executionProfile === "noninteractive" ? "ignore" : "pipe")
-      }),
+      stdout,
       stderr: "",
       metadata: providerMetadata("argv", "available", [], undefined, options.executionProfile === "noninteractive" ? [diagnostic("PROCESS_NONINTERACTIVE_PROFILE", "info", "Fake process observed noninteractive profile.")] : [])
     };

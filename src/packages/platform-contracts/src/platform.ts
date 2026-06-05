@@ -137,6 +137,11 @@ export interface ProcessResult {
 export type ProcessExecutionProfile = "default" | "noninteractive";
 export type ProcessStdinMode = "pipe" | "ignore";
 
+export interface ProcessRunObserver {
+  readonly onStdoutChunk?: (chunk: string) => void;
+  readonly onStderrChunk?: (chunk: string) => void;
+}
+
 export interface ProcessRunOptions extends JsonObject {
   readonly cwd?: string;
   readonly timeoutMs?: number;
@@ -177,7 +182,7 @@ export interface PlatformRuntime {
   writeFile(path: string, content: string): Promise<void>;
   findFiles(pattern: string, root: string): Promise<readonly string[]>;
   searchText(pattern: string, root: string): Promise<readonly SearchResult[]>;
-  runProcess(command: string, args: readonly string[], options?: ProcessRunOptions): Promise<ProcessResult>;
+  runProcess(command: string, args: readonly string[], options?: ProcessRunOptions, observer?: ProcessRunObserver): Promise<ProcessResult>;
   availability(): Promise<JsonObject>;
 }
 

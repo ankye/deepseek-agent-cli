@@ -17,6 +17,7 @@
 - [x] 15. Project model-selected goal and plan fields into decision evidence and final task-delivery flow lineage.
 - [x] 16. Prevent raw model `TaskDecisionEnvelope` JSON from becoming completion evidence or final assistant delivery text.
 - [x] 17. Render public diagnostics evaluation execution traces in text output without exposing provider raw chain-of-thought or unbounded stdout/stderr.
+- [x] 18. Stream safe diagnostics evaluation progress from allowlisted child JSONL events while filtering raw model deltas and unbounded stdout/stderr.
 
 # 任务
 
@@ -37,3 +38,4 @@
 - [x] 15. 将模型选择的 goal 与 plan 字段投影到 decision evidence 和最终 task-delivery flow lineage。
 - [x] 16. 防止原始模型 `TaskDecisionEnvelope` JSON 被当作完成证据或最终 assistant 交付文本。
 - [x] 17. 在 diagnostics evaluate 文本输出中渲染公开执行轨迹，且不暴露 provider raw chain-of-thought 或无界 stdout/stderr。
+- [x] 18. 从 allowlist child JSONL events 流式输出安全的 diagnostics evaluation progress，同时过滤 raw model deltas 与无界 stdout/stderr。

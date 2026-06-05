@@ -11,6 +11,7 @@ import type {
 import { CLI_TASK_EVALUATION_SCHEMA_VERSION } from "@deepseek/platform-contracts";
 import { evaluationLiveCredentialEnv, evaluationModelSelectionArgs } from "./evaluation-provider-selection.js";
 import { buildEvaluationStagedTaskSnapshot } from "./evaluation-stage-graph.js";
+import { createEvaluationProgressObserver } from "./evaluation-progress.js";
 import { generatedArtifactMetrics } from "./generated-artifacts.js";
 import {
   emptyMetrics,
@@ -87,11 +88,12 @@ async function executeWebpageTask(
 
   events.record("prompt_sent", { adapter: baseline.baselineId });
   events.record("command_started", { command: command.command, argCount: command.args.length });
+  const progressObserver = baseline.baselineId === "deepseek-cli" ? createEvaluationProgressObserver(task.taskId, options.progressSink) : undefined;
   const runResult = await platform.runProcess(command.command, command.args, {
     cwd: workspaceRoot,
     timeoutMs: task.timeBudgetMs,
     ...(command.env ? { env: command.env } : {})
-  });
+  }, progressObserver);
   events.record("command_finished", { exitCode: runResult.exitCode, stdoutBytes: byteLength(runResult.stdout), stderrBytes: byteLength(runResult.stderr) });
   const promptAssembly = baseline.baselineId === "deepseek-cli" ? promptAssemblyMetricsFromJsonl(runResult.stdout) : { available: false, gapReason: "not-applicable" as const };
   const runtimeSignals = extractRuntimeSignals(runResult.stdout);
@@ -248,11 +250,12 @@ async function executeStructuredTask(
 
   events.record("prompt_sent", { adapter: baseline.baselineId });
   events.record("command_started", { command: command.command, argCount: command.args.length });
+  const progressObserver = baseline.baselineId === "deepseek-cli" ? createEvaluationProgressObserver(task.taskId, options.progressSink) : undefined;
   const runResult = await platform.runProcess(command.command, command.args, {
     cwd: workspaceRoot,
     timeoutMs: task.timeBudgetMs,
     ...(command.env ? { env: command.env } : {})
-  });
+  }, progressObserver);
   events.record("command_finished", { exitCode: runResult.exitCode, stdoutBytes: byteLength(runResult.stdout), stderrBytes: byteLength(runResult.stderr) });
   const checkerCommand = `node scripts/check-evaluation-task.mjs ${task.taskId} ${workspaceRoot}`;
   events.record("checker_started", { command: checkerCommand });
@@ -770,11 +773,7 @@ function createEventRecorder(runId: string, baselineId: string, taskId: string):
   };
 }
 
-function withRecordedEvent(
-  recorder: EvaluationEventRecorder,
-  kind: CliEvaluationInstrumentationEvent["kind"],
-  metadata?: JsonObject
-): readonly CliEvaluationInstrumentationEvent[] {
+function withRecordedEvent(recorder: EvaluationEventRecorder, kind: CliEvaluationInstrumentationEvent["kind"], metadata?: JsonObject): readonly CliEvaluationInstrumentationEvent[] {
   recorder.record(kind, metadata);
   return recorder.events();
 }
