@@ -94,21 +94,22 @@ function parseJsonObject(value: string): JsonObject | undefined {
 }
 
 function toolName(data: JsonObject): string {
-  return stringField(data, "name") ?? stringField(data, "toolName") ?? stringField(data, "capabilityId") ?? "unknown";
+  return safePublicToken(stringField(data, "name") ?? stringField(data, "toolName") ?? stringField(data, "capabilityId"), "unknown");
 }
 
 function toolStatus(data: JsonObject): string {
   const feedback = jsonObjectField(data, "feedback");
-  return stringField(data, "status") ?? stringField(feedback, "status") ?? stringField(data, "terminalKind") ?? "completed";
+  return safePublicToken(stringField(data, "status") ?? stringField(feedback, "status") ?? stringField(data, "terminalKind"), "completed");
 }
 
 function repairStopReason(data: JsonObject): string | undefined {
   const selfRepair = jsonObjectField(data, "selfRepair");
-  return stringField(data, "stopReason") ?? stringField(selfRepair, "stopReason");
+  return safePublicToken(stringField(data, "stopReason") ?? stringField(selfRepair, "stopReason"), undefined);
 }
 
 function reasonSuffix(reason: string | undefined): string {
-  return reason ? ` reason=${reason}` : "";
+  const safeReason = safePublicToken(reason, undefined);
+  return safeReason ? ` reason=${safeReason}` : "";
 }
 
 function jsonObjectField(value: JsonObject | undefined, key: string): JsonObject | undefined {
@@ -127,6 +128,13 @@ function numericField(value: JsonObject | undefined, key: string): number | unde
   if (!value) return undefined;
   const field = value[key];
   return typeof field === "number" && Number.isFinite(field) ? field : undefined;
+}
+
+function safePublicToken(value: string | undefined, fallback: string): string;
+function safePublicToken(value: string | undefined, fallback: undefined): string | undefined;
+function safePublicToken(value: string | undefined, fallback: string | undefined): string | undefined {
+  if (!value) return fallback;
+  return /^[A-Za-z0-9_.:-]{1,80}$/.test(value) ? value : fallback;
 }
 
 function isJsonObject(value: unknown): value is JsonObject {
