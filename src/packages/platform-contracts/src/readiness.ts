@@ -44,7 +44,7 @@ export type GovernanceEvidenceStatus = "present" | "missing" | "not-required";
 export type GovernanceEvidenceProductReadinessStatus = "ready" | "gated" | "not-product-scope";
 
 export type ReadinessCommandName = "init" | "config" | "auth" | "doctor" | "privacy" | "verify-install";
-export type DiagnosticsCommandName = "bundle" | "release" | "doctor" | "verify" | "refresh" | "evaluate" | "env" | "flow";
+export type DiagnosticsCommandName = "bundle" | "release" | "doctor" | "verify" | "refresh" | "evaluate" | "env" | "flow" | "swe-bench";
 
 export interface ReleasePackageSurface extends JsonObject {
   readonly schemaVersion: string;

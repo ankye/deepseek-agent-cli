@@ -96,6 +96,29 @@ describe("live CLI dependency factory resolves against real filesystem", () => {
       await rm(workspaceRoot, { recursive: true, force: true });
     }
   });
+
+  it("allows workspace process execution only when explicitly requested", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "deepseek-live-process-"));
+    try {
+      const writeOnlyDeps = createLiveCliDependencies({ workspaceRoot, allowWorkspaceWrites: true });
+      const writeOnlyRun = await runShellTurn(writeOnlyDeps, workspaceRoot);
+      assert.equal(writeOnlyRun.events.some((event) => event.kind === "execution.rejected"), true);
+      assert.equal(writeOnlyRun.events.some((event) => event.kind === "capability.completed"), false);
+
+      const processDeps = createLiveCliDependencies({
+        workspaceRoot,
+        allowWorkspaceWrites: true,
+        allowWorkspaceProcesses: true
+      });
+      const processRun = await runShellTurn(processDeps, workspaceRoot);
+      const resultEvent = processRun.events.find((event) => event.kind === "model.tool.result");
+      const feedback = resultEvent?.data as { feedback?: ToolResultFeedback };
+      assert.equal(processRun.events.some((event) => event.kind === "capability.completed"), true);
+      assert.equal(feedback.feedback?.preview.text.includes("live process ok"), true);
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
 });
 
 async function runWriteTurn(deps: ReturnType<typeof createLiveCliDependencies>, workspaceRoot: string) {
@@ -111,6 +134,34 @@ async function runWriteTurn(deps: ReturnType<typeof createLiveCliDependencies>, 
         outputMode: "jsonl",
         profile: defaultDeepSeekProfile,
         toolProjection: "read-write"
+      }))
+    };
+  } finally {
+    await kernel.shutdown();
+  }
+}
+
+async function runShellTurn(deps: ReturnType<typeof createLiveCliDependencies>, workspaceRoot: string) {
+  const runtimeDeps = {
+    ...deps,
+    models: new SingleToolCallModelGateway("core.shell.run", {
+      command: process.execPath,
+      args: ["-e", "console.log('live process ok')"],
+      cwd: ".",
+      timeoutMs: 30_000
+    })
+  };
+  await registerRuntimeCoreTools(runtimeDeps, workspaceRoot);
+  const kernel = await createDefaultRuntimeKernel(runtimeDeps);
+  try {
+    return {
+      events: await collectRuntimeEvents(runAgentLoop(runtimeDeps, kernel, {
+        prompt: "run a scoped process through live factory",
+        caller: "integration.live-factory.test",
+        workspaceRoot,
+        outputMode: "jsonl",
+        profile: defaultDeepSeekProfile,
+        toolProjection: "all"
       }))
     };
   } finally {

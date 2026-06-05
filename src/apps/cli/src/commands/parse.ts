@@ -4,7 +4,7 @@ import type { CliOptions, CliTerminalFlags } from "../types.js";
 import { defaultTerminalFlags } from "../host/terminal.js";
 
 const readinessCommands = new Set<ReadinessCommandName>(["init", "config", "auth", "doctor", "privacy", "verify-install"]);
-const diagnosticsCommands = new Set<DiagnosticsCommandName>(["bundle", "release", "doctor", "verify", "refresh", "evaluate", "env", "flow"]);
+const diagnosticsCommands = new Set<DiagnosticsCommandName>(["bundle", "release", "doctor", "verify", "refresh", "evaluate", "env", "flow", "swe-bench"]);
 const defaultOutputMode: AgentLoopOutputMode = "text";
 
 export function parseCliArgs(args: readonly string[], _terminal: CliTerminalFlags = defaultTerminalFlags): CliOptions {
@@ -554,6 +554,17 @@ function parseDiagnosticsInput(command: DiagnosticsCommandName, args: readonly s
     input.baselineArgs = readRepeatedFlagValues(args, "--baseline-arg");
     input.extraArgs = extraDiagnosticsArgs(args, new Set(["--full", "--smoke", "--dry-run"]));
   }
+  if (command === "swe-bench") {
+    const rawAction = args[2];
+    input.action = rawAction && !rawAction.startsWith("--") ? rawAction : "predict";
+    input.dryRun = args.includes("--dry-run");
+    input.instanceFile = readFlagValue(args, "--instance-file");
+    input.repoDir = readFlagValue(args, "--repo-dir");
+    input.outputPath = readFlagValue(args, "--output-path");
+    const timeoutMs = parsePositiveNumberFlag(args, "--timeout-ms");
+    if (timeoutMs) input.timeoutMs = timeoutMs;
+    input.extraArgs = extraDiagnosticsArgs(args, new Set(["--dry-run"]), new Set(["predict"]));
+  }
   return input as JsonObject;
 }
 
@@ -579,6 +590,10 @@ function extraDiagnosticsArgs(args: readonly string[], knownBooleanFlags: Readon
       value === "--claude-command" ||
       value === "--baseline-arg" ||
       value === "--execute-task" ||
+      value === "--instance-file" ||
+      value === "--repo-dir" ||
+      value === "--output-path" ||
+      value === "--timeout-ms" ||
       value === "--severity" ||
       value === "--package" ||
       value === "--capability" ||

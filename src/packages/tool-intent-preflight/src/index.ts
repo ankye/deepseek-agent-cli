@@ -13,6 +13,7 @@ import { asId } from "@deepseek/platform-contracts";
 
 const defaultPathFields = ["path", "file", "filePath", "target", "cwd"];
 const deepSeekProviderId = asId<"modelProvider">("provider-deepseek");
+const workspaceExecutionTools = new Set(["core.shell.run", "core.test.run"]);
 
 export const deepSeekToolIntentProfile: ToolIntentProviderProfile = {
   providerId: deepSeekProviderId,
@@ -101,6 +102,18 @@ export class DeterministicToolIntentPreflight implements ToolIntentPreflightServ
       diagnostics.push(...normalized.diagnostics);
       repairs.push(...normalized.repairs);
       if (normalized.value) repairedInput[field] = normalized.value.executorValue;
+    }
+    if (workspaceExecutionTools.has(String(capabilityId))) {
+      const cwd = repairedInput.cwd;
+      if (typeof cwd !== "string" || cwd.trim().length === 0) {
+        repairedInput.cwd = ".";
+        repairs.push(repair("workspace-cwd-defaulted", "cwd", typeof cwd === "string" ? cwd : "", "."));
+      }
+      const workspaceRoot = repairedInput.workspaceRoot;
+      if (workspaceRoot !== request.workspaceRoot) {
+        repairedInput.workspaceRoot = request.workspaceRoot;
+        repairs.push(repair("workspace-root-defaulted", "workspaceRoot", typeof workspaceRoot === "string" ? workspaceRoot : "", request.workspaceRoot));
+      }
     }
 
     if (diagnostics.length > 0) {
@@ -204,6 +217,15 @@ export function normalizeWorkspacePath(
   }
 
   const parts = next.split(/[\\/]+/).filter(Boolean);
+  if (parts.length === 1 && parts[0] === ".") {
+    const normalizedRoot = workspaceRoot.replace(/[\\/]+$/, "");
+    const modelValue = normalizedRoot ? `${normalizedRoot}${separator}.` : ".";
+    return {
+      value: { modelValue, executorValue: "." },
+      diagnostics,
+      repairs: normalizedRoot ? [...repairs, repair("path-normalized", field, value, modelValue, ".")] : repairs
+    };
+  }
   if (parts.some((part) => part === "..")) {
     diagnostics.push(diagnostic("TOOL_INTENT_PARENT_TRAVERSAL_REJECTED", "Parent traversal is not workspace-safe", field));
     return { diagnostics, repairs };

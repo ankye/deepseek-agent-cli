@@ -33,6 +33,7 @@ async function createLiveRuntimeDependencies(
   deepSeekEnv: Awaited<ReturnType<typeof deepSeekLiveCredentialProcessEnv>> | undefined
 ): Promise<RuntimeDependencies> {
   const allowWorkspaceWrites = options.toolProjection === "read-write" || options.toolProjection === "all";
+  const allowWorkspaceProcesses = options.toolProjection === "all";
   if (options.modelProvider === "glm") {
     const glmEnv = await glmAnthropicLiveCredentialProcessEnv(platform, options.workspaceRoot);
     const token = firstNonEmpty(glmEnv.GLM_ANTHROPIC_API_KEY, glmEnv.ZHIPU_API_KEY);
@@ -40,7 +41,8 @@ async function createLiveRuntimeDependencies(
       ...createLiveCliDependencies({
         workspaceRoot: options.workspaceRoot,
         timeoutMs: 90_000,
-        allowWorkspaceWrites
+        allowWorkspaceWrites,
+        allowWorkspaceProcesses
       }),
       models: new GlmAnthropicProvider({
         transport: new FetchModelProviderTransport(),
@@ -54,7 +56,8 @@ async function createLiveRuntimeDependencies(
     credentials: new CredentialAuthModelCredentialProvider(await createDeepSeekCredentialAuthServiceFromEnv(deepSeekEnv)),
     transport: new OpenAIModelProviderTransport(),
     timeoutMs: 90_000,
-    allowWorkspaceWrites
+    allowWorkspaceWrites,
+    allowWorkspaceProcesses
   }));
 }
 

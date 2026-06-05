@@ -1,8 +1,8 @@
 {
   "schemaVersion": "1.0.0",
   "kind": "cli.overall-delivery-capability-score.evidence",
-  "generatedAt": "2026-06-05T07:05:52.194Z",
-  "command": "npx tsx src/apps/cli/src/index.ts diagnostics evaluate --full --execute-task all --live --compare-baseline deepseek-cli --provider glm --model glm-5.1 --output json",
+  "generatedAt": "2026-06-05T12:37:21.821Z",
+  "command": "npx tsx src/apps/cli/src/index.ts diagnostics evaluate --full --execute-task all --live --provider glm --model glm-5.1 --output text",
   "invocation": {
     "schemaVersion": "1.0.0",
     "kind": "cli.evaluation.invocation",
@@ -17,7 +17,7 @@
     "baselines": [
       "deepseek-cli"
     ],
-    "output": "json",
+    "output": "text",
     "redaction": {
       "class": "internal",
       "fields": []
@@ -180,8 +180,8 @@
         "retryCount": 0,
         "evidenceManifestStatus": "passed",
         "repairMetricsAvailability": "available",
-        "repairActivationCount": 0,
-        "repairSuccessCount": 0
+        "repairActivationCount": 1,
+        "repairSuccessCount": 1
       },
       {
         "taskId": "eval.refactor.multifile",
@@ -190,8 +190,8 @@
         "retryCount": 0,
         "evidenceManifestStatus": "passed",
         "repairMetricsAvailability": "available",
-        "repairActivationCount": 0,
-        "repairSuccessCount": 0
+        "repairActivationCount": 1,
+        "repairSuccessCount": 1
       },
       {
         "taskId": "eval.docs.spec-update",
@@ -230,8 +230,8 @@
         "retryCount": 0,
         "evidenceManifestStatus": "passed",
         "repairMetricsAvailability": "available",
-        "repairActivationCount": 2,
-        "repairSuccessCount": 0
+        "repairActivationCount": 1,
+        "repairSuccessCount": 1
       },
       {
         "taskId": "eval.webpage.generation",
@@ -249,7 +249,7 @@
         "taskId": "eval.webpage.failing-first-repair",
         "outcome": "solved",
         "checkPassRate": 1,
-        "retryCount": 1,
+        "retryCount": 0,
         "evidenceManifestStatus": "passed",
         "unsupportedClaimCount": 0,
         "hallucinatedCommandCount": 0,
@@ -264,8 +264,8 @@
         "retryCount": 0,
         "evidenceManifestStatus": "passed",
         "repairMetricsAvailability": "available",
-        "repairActivationCount": 1,
-        "repairSuccessCount": 1
+        "repairActivationCount": 2,
+        "repairSuccessCount": 0
       }
     ]
   },

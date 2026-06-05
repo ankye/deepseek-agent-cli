@@ -9,7 +9,9 @@ export type ToolIntentRepairKind =
   | "path-separator-normalized"
   | "provider-arguments-unwrapped"
   | "provider-tool-alias-normalized"
-  | "semantic-platform-operation";
+  | "semantic-platform-operation"
+  | "workspace-cwd-defaulted"
+  | "workspace-root-defaulted";
 
 export interface ToolIntent extends JsonObject {
   readonly toolCallId?: string;

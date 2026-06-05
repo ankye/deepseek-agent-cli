@@ -43,6 +43,9 @@ import {
 } from "./governance-diagnostics.js";
 import { governanceEvidenceMatrixJsonLines, renderGovernanceEvidenceMatrixText } from "./governance-evidence-render.js";
 import { collectDiagnosticsFlowInspect, diagnosticsFlowInspectJsonLines } from "./flow-inspect.js";
+import { collectSweBenchCliDiagnostics } from "./swe-bench-cli-diagnostics.js";
+import { renderSweBenchPredictionText, sweBenchPredictionJsonLines } from "./swe-bench-prediction.js";
+import type { SweBenchPredictionSummary } from "./swe-bench-prediction.js";
 
 export interface CliDiagnosticNotice {
   readonly code: string;
@@ -51,7 +54,7 @@ export interface CliDiagnosticNotice {
 
 export interface CliDiagnosticsResult extends JsonObject {
   readonly schemaVersion: string;
-  readonly kind: "diagnostics.bundle" | "diagnostics.release" | "diagnostics.doctor" | "diagnostics.verify" | "diagnostics.refresh" | "diagnostics.evaluate" | "diagnostics.env.prepare" | "diagnostics.flow.inspect";
+  readonly kind: "diagnostics.bundle" | "diagnostics.release" | "diagnostics.doctor" | "diagnostics.verify" | "diagnostics.refresh" | "diagnostics.evaluate" | "diagnostics.env.prepare" | "diagnostics.flow.inspect" | "diagnostics.swe-bench";
   readonly status: "pass" | "warn" | "fail";
   readonly command: DiagnosticsCommandName;
   readonly bundle?: DiagnosticBundle;
@@ -62,6 +65,7 @@ export interface CliDiagnosticsResult extends JsonObject {
   readonly refresh?: AcceptanceEvidenceRefreshSummary;
   readonly environment?: DiagnosticsEnvironmentPrepareSummary;
   readonly flow?: TaskDeliveryFlowSummary;
+  readonly sweBench?: SweBenchPredictionSummary;
   readonly evaluation?: CliEvaluationComparisonSummary;
   readonly indexProviders?: IndexProviderDiagnosticsSummary;
   readonly modeMatrix?: CliModeMatrixSummary;
@@ -91,6 +95,7 @@ export async function collectCliDiagnostics(command: DiagnosticsCommandName, opt
   if (command === "refresh") return refreshDiagnostics(options);
   if (command === "env") return environmentDiagnostics(options);
   if (command === "flow") return flowDiagnostics(options);
+  if (command === "swe-bench") return collectSweBenchCliDiagnostics(options);
   if (command === "evaluate") return evaluateDiagnostics(options, progressSink);
   if (command === "doctor") return doctorDiagnostics(options);
   return bundleDiagnostics(options);
@@ -214,6 +219,9 @@ export function renderDiagnosticsResult(result: CliDiagnosticsResult, output: Ag
     for (const diagnostic of result.flow.diagnostics) {
       lines.push(`- ${diagnostic.code}: ${diagnostic.message}`);
     }
+  }
+  if (result.sweBench) {
+    lines.push(...renderSweBenchPredictionText(result.sweBench));
   }
   if (result.evaluation) {
     lines.push(`- mode: ${result.evaluation.mode}`);
@@ -717,6 +725,9 @@ function diagnosticsJsonLines(result: CliDiagnosticsResult): readonly JsonObject
   }
   if (result.flow) {
     entries.push(...diagnosticsFlowInspectJsonLines(result.schemaVersion, result.flow));
+  }
+  if (result.sweBench) {
+    entries.push(...sweBenchPredictionJsonLines(result.sweBench));
   }
   if (result.evaluation) {
     entries.push(...evaluationJsonLines(result.evaluation));

@@ -126,6 +126,26 @@ describe("tool intent preflight", () => {
     assert.equal(result.repairs.some((repair) => repair.kind === "provider-tool-alias-normalized"), true);
   });
 
+  it("defaults shell execution to the active workspace before policy evaluation", async () => {
+    const preflight = new DeterministicToolIntentPreflight();
+    const result = await preflight.check({
+      providerId: deepseek,
+      intent: {
+        name: "core_shell_run",
+        source: "model",
+        input: { command: "npm", args: ["test"] }
+      },
+      workspaceRoot: "/repo",
+      platform: "linux",
+      modelVisibleCapabilities: [asId<"capability">("core.shell.run")]
+    });
+
+    assert.equal(result.status, "repaired");
+    assert.deepEqual(result.repaired?.input, { command: "npm", args: ["test"], cwd: ".", workspaceRoot: "/repo" });
+    assert.equal(result.repairs.some((repair) => repair.kind === "workspace-cwd-defaulted"), true);
+    assert.equal(result.repairs.some((repair) => repair.kind === "workspace-root-defaulted"), true);
+  });
+
   it("normalizes provider-safe names against model-visible capability ids", async () => {
     const preflight = new DeterministicToolIntentPreflight();
     const result = await preflight.check({

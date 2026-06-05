@@ -171,6 +171,7 @@ export interface LiveCliDependencyOptions {
   readonly timeoutMs?: number;
   readonly sessionsDirectory?: string;
   readonly allowWorkspaceWrites?: boolean;
+  readonly allowWorkspaceProcesses?: boolean;
 }
 
 export function createLiveCliDependencies(options: LiveCliDependencyOptions = {}): RuntimeDependencies {
@@ -196,7 +197,7 @@ export function createLiveCliDependencies(options: LiveCliDependencyOptions = {}
     platform,
     losslessContext: new PersistentJsonlLosslessContextManager(platform, losslessContextDir),
     models: new DeepSeekOpenAIProvider(modelOptions),
-    policy: options.allowWorkspaceWrites ? new WorkspaceWritePolicyEngine() : base.policy,
+    policy: options.allowWorkspaceWrites || options.allowWorkspaceProcesses ? new WorkspaceWritePolicyEngine({ allowWorkspaceProcesses: options.allowWorkspaceProcesses === true }) : base.policy,
     sessions,
     backgroundTasks: new NodeBackgroundTaskManager()
   };
@@ -204,6 +205,8 @@ export function createLiveCliDependencies(options: LiveCliDependencyOptions = {}
 
 class WorkspaceWritePolicyEngine implements PolicyEngine {
   private readonly fallback = new DefaultPolicyEngine();
+
+  constructor(private readonly options: { readonly allowWorkspaceProcesses: boolean }) {}
 
   async decide(request: PolicyRequest): Promise<PolicyDecision> {
     if (request.metadata.sideEffect === "write" && request.resourceScope?.kind === "filesystem") {
@@ -215,6 +218,19 @@ class WorkspaceWritePolicyEngine implements PolicyEngine {
         audit: request.auditEvidence ?? { policy: "live-cli-workspace-write" },
         sandboxProfile: sandbox.profile,
         sandbox: { ...sandbox, reasonCodes: [...sandbox.reasonCodes, "policy.live-cli.workspace-write.allow"] },
+        ...(request.secret ? { secret: request.secret } : {}),
+        ...(request.auditEvidence ? { auditEvidence: request.auditEvidence } : {})
+      };
+    }
+    if (this.options.allowWorkspaceProcesses && request.metadata.sideEffect === "process" && request.resourceScope?.kind === "process") {
+      const sandbox = selectSandboxDecision(request);
+      if (sandbox.action !== "allow") return this.fallback.decide(request);
+      return {
+        action: "allow",
+        reason: "Live CLI policy allows workspace-scoped process execution.",
+        audit: request.auditEvidence ?? { policy: "live-cli-workspace-process" },
+        sandboxProfile: sandbox.profile,
+        sandbox: { ...sandbox, reasonCodes: [...sandbox.reasonCodes, "policy.live-cli.workspace-process.allow"] },
         ...(request.secret ? { secret: request.secret } : {}),
         ...(request.auditEvidence ? { auditEvidence: request.auditEvidence } : {})
       };
