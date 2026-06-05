@@ -140,6 +140,7 @@ export type ProcessStdinMode = "pipe" | "ignore";
 export interface ProcessRunObserver {
   readonly onStdoutChunk?: (chunk: string) => void;
   readonly onStderrChunk?: (chunk: string) => void;
+  readonly onProcessExit?: () => void;
 }
 
 export interface ProcessRunOptions extends JsonObject {

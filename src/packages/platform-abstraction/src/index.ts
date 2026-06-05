@@ -476,6 +476,7 @@ export class NodePlatformRuntime implements PlatformRuntime {
         if (settled) return;
         settled = true;
         if (timer) clearTimeout(timer);
+        observer?.onProcessExit?.();
         resolvePromise(result);
       };
       const timer = timeoutMs
@@ -864,6 +865,7 @@ export class FakePlatformRuntime extends NodePlatformRuntime {
       stdin: options.stdin ?? (options.executionProfile === "noninteractive" ? "ignore" : "pipe")
     });
     observer?.onStdoutChunk?.(stdout);
+    observer?.onProcessExit?.();
     return {
       exitCode: 0,
       stdout,

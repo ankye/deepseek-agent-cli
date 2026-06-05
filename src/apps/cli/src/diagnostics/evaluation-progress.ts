@@ -7,16 +7,22 @@ export interface EvaluationProgressSink {
 export function createEvaluationProgressObserver(taskId: string, sink?: EvaluationProgressSink): ProcessRunObserver | undefined {
   if (!sink) return undefined;
   let buffer = "";
+  const emitLine = (line: string) => {
+    const progressLine = progressLineFromChildJsonl(taskId, line);
+    if (progressLine) sink.emit(progressLine);
+  };
   return {
     onStdoutChunk(chunk) {
       buffer += chunk;
       const lines = buffer.split(/\r?\n/);
       buffer = lines.pop() ?? "";
       if (buffer.length > 64 * 1024) buffer = buffer.slice(-64 * 1024);
-      for (const line of lines) {
-        const progressLine = progressLineFromChildJsonl(taskId, line);
-        if (progressLine) sink.emit(progressLine);
-      }
+      for (const line of lines) emitLine(line);
+    },
+    onProcessExit() {
+      const finalLine = buffer;
+      buffer = "";
+      if (finalLine.trim()) emitLine(finalLine);
     }
   };
 }

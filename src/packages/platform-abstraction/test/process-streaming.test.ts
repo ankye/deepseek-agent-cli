@@ -20,4 +20,19 @@ describe("platform process streaming", () => {
     assert.equal(chunks.join("").includes("one"), true);
     assert.equal(chunks.join("").includes("two"), true);
   });
+
+  it("notifies the optional process observer when the process exits", async () => {
+    const platform = new NodePlatformRuntime();
+    let exited = false;
+
+    const result = await platform.runProcess(
+      process.execPath,
+      ["-e", "process.stdout.write('done')"],
+      {},
+      { onProcessExit: () => { exited = true; } }
+    );
+
+    assert.equal(result.exitCode, 0);
+    assert.equal(exited, true);
+  });
 });
