@@ -196,9 +196,19 @@ describe("headless runtime", () => {
     assert.equal(decisionReceived?.data.decisionId, "task-decision:model-evaluation");
     const receivedFlow = decisionReceived?.data.taskDeliveryFlow as JsonObject | undefined;
     const completedFlow = completed?.data.taskDeliveryFlow as JsonObject | undefined;
+    const receivedGoal = decisionReceived?.data.goal as JsonObject | undefined;
+    const receivedPlan = decisionReceived?.data.plan as JsonObject | undefined;
     assert.equal(decisionReceived?.data.requestId, receivedFlow?.decisionRequestId);
+    assert.equal(receivedGoal?.goalId, "task-goal:model-evaluation");
+    assert.deepEqual(receivedGoal?.acceptanceCriterionIds, ["criterion:model-proof"]);
+    assert.equal(receivedPlan?.planningMode, "catalog-profile");
+    assert.deepEqual(receivedPlan?.stepIds, ["task-step:model-evaluate"]);
+    assert.deepEqual(receivedPlan?.phases, ["runtime"]);
     assert.equal(completedFlow?.decisionId, "task-decision:model-evaluation");
     assert.equal(completedFlow?.decisionSource, "model");
+    assert.equal(completedFlow?.goalId, "task-goal:model-evaluation");
+    assert.deepEqual(completedFlow?.planStepIds, ["task-step:model-evaluate"]);
+    assert.deepEqual(completedFlow?.planPhases, ["runtime"]);
     await kernel.shutdown();
   });
 

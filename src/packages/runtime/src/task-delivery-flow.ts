@@ -359,14 +359,21 @@ export function taskDeliveryFlowWithDecisionData(
   envelope: TaskDecisionEnvelope,
   source: "deterministic" | "model" = "model"
 ): JsonObject {
+  const plan = taskDecisionEnvelopePlanData(envelope);
   return {
     ...flow,
     decisionId: envelope.decisionId,
     decisionSource: source,
+    goalId: envelope.goalProposal.goalId,
+    planId: `task-plan:${stableHash(`${envelope.decisionId}:${envelope.planSteps.map((step) => step.stepId).join("|")}`)}`,
+    planningMode: plan.planningMode,
     modelConfidence: envelope.confidence,
     profileSelection: envelope.profileSelection,
     planStepCount: envelope.planSteps.length,
+    planStepIds: plan.stepIds,
+    planPhases: plan.phases,
     acceptanceCriteriaCount: envelope.acceptanceCriteria.length,
+    acceptanceCriterionIds: envelope.acceptanceCriteria.map((criterion) => criterion.criterionId),
     questionCount: envelope.questionsForUser.length,
     redaction: { class: "internal" }
   };
@@ -387,8 +394,44 @@ export function taskDecisionEnvelopeEventData(envelope: TaskDecisionEnvelope, fl
     repairPolicyCount: envelope.repairPolicy.length,
     stopConditionCount: envelope.stopConditions.length,
     questionCount: envelope.questionsForUser.length,
+    goal: taskDecisionEnvelopeGoalData(envelope),
+    plan: taskDecisionEnvelopePlanData(envelope),
     taskDeliveryFlow: flow,
     compatibility: envelope.compatibility,
+    redaction: { class: "internal" }
+  };
+}
+
+function taskDecisionEnvelopeGoalData(envelope: TaskDecisionEnvelope): JsonObject {
+  return {
+    goalId: envelope.goalProposal.goalId,
+    briefId: envelope.goalProposal.briefId,
+    taskKind: envelope.goalProposal.taskKind,
+    riskLevel: envelope.goalProposal.riskLevel,
+    acceptanceCriterionIds: envelope.acceptanceCriteria.map((criterion) => criterion.criterionId),
+    nonGoalCount: envelope.goalProposal.nonGoals.length,
+    redaction: { class: "internal" }
+  };
+}
+
+function taskDecisionEnvelopePlanData(envelope: TaskDecisionEnvelope): JsonObject {
+  return {
+    planningMode: envelope.questionsForUser.length > 0
+      ? "ask-user"
+      : envelope.dynamicProfileProposal
+        ? "dynamic-profile"
+        : envelope.profileSelection
+          ? "catalog-profile"
+          : "deterministic",
+    profileSelection: envelope.profileSelection,
+    stepIds: envelope.planSteps.map((step) => step.stepId),
+    phases: envelope.planSteps.map((step) => step.phase),
+    stepCount: envelope.planSteps.length,
+    requiresUserInput: envelope.questionsForUser.length > 0,
+    toolStrategyCount: envelope.toolStrategy.length,
+    verificationPlanCount: envelope.verificationPlan.length,
+    repairPolicyCount: envelope.repairPolicy.length,
+    stopConditionCount: envelope.stopConditions.length,
     redaction: { class: "internal" }
   };
 }

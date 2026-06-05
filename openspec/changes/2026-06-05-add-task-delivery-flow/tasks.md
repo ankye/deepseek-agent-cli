@@ -14,6 +14,7 @@
 - [x] 12. Wire replay-safe task delivery flow lineage into ordinary agent-loop started, hook, model request, and model metadata paths.
 - [x] 13. Pass task decision requests through ordinary prompt assembly so the main model dispatch can return multi-step decisions without an extra provider request.
 - [x] 14. Parse model-returned `TaskDecisionEnvelope` JSON, emit replay-safe decision evidence, and carry the model decision into the final agent-loop summary.
+- [x] 15. Project model-selected goal and plan fields into decision evidence and final task-delivery flow lineage.
 
 # 任务
 
@@ -31,3 +32,4 @@
 - [x] 12. 将 replay-safe task delivery flow lineage 接入普通 agent-loop started、hook、model request 与 model metadata 路径。
 - [x] 13. 将 task decision requests 交给普通 prompt assembly，让主模型请求可返回多步决策而不增加额外 provider request。
 - [x] 14. 解析模型返回的 `TaskDecisionEnvelope` JSON，输出 replay-safe decision evidence，并将模型决策带入最终 agent-loop summary。
+- [x] 15. 将模型选择的 goal 与 plan 字段投影到 decision evidence 和最终 task-delivery flow lineage。
