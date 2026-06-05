@@ -436,7 +436,21 @@ function redactSecretText(value: string): string {
 }
 
 function isSecretKey(key: string): boolean {
+  if (isUsageTokenCountKey(key)) return false;
   return /api[_-]?key|token|secret|password|credential/i.test(key);
+}
+
+function isUsageTokenCountKey(key: string): boolean {
+  return new Set([
+    "inputtokens",
+    "outputtokens",
+    "totaltokens",
+    "reasoningtokens",
+    "hittokens",
+    "misstokens",
+    "cachedtokens",
+    "cachereadinputtokens"
+  ]).has(key.toLowerCase());
 }
 
 function isProviderReasoningKey(key: string): boolean {

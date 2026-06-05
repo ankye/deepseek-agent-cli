@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import type { AgentLoopBudget, AgentLoopProjectRuleEvidence, AgentPhasePlan, AgentReasoningEffortMapping, AgentWorkOrder, CapabilityManifest, ContextPipelineManifest, EvidenceFirstRuntimeContext, EvidenceItem, EvidenceSourceCoverage, EvidenceTaskClassification, JsonObject, PromptAssemblyInput, PromptSection, SelfRepairAttemptRecord, SelfRepairFailureClassification, SelfRepairOutcomeSummary, SelfRepairVerificationSummary } from "@deepseek/platform-contracts";
-import { AGENT_MODE_COMPATIBILITY, AGENT_MODE_SCHEMA_VERSION, CONTEXT_PIPELINE_SCHEMA_VERSION, EVIDENCE_FIRST_COMPATIBILITY, EVIDENCE_FIRST_SCHEMA_VERSION, SELF_REPAIR_COMPATIBILITY, SELF_REPAIR_SCHEMA_VERSION, asId } from "@deepseek/platform-contracts";
+import type { AgentLoopBudget, AgentLoopProjectRuleEvidence, AgentPhasePlan, AgentReasoningEffortMapping, AgentWorkOrder, CapabilityManifest, ContextPipelineManifest, EvidenceFirstRuntimeContext, EvidenceItem, EvidenceSourceCoverage, EvidenceTaskClassification, JsonObject, PromptAssemblyInput, PromptSection, SelfRepairAttemptRecord, SelfRepairFailureClassification, SelfRepairOutcomeSummary, SelfRepairVerificationSummary, TaskDecisionRequest } from "@deepseek/platform-contracts";
+import { AGENT_MODE_COMPATIBILITY, AGENT_MODE_SCHEMA_VERSION, CONTEXT_PIPELINE_SCHEMA_VERSION, EVIDENCE_FIRST_COMPATIBILITY, EVIDENCE_FIRST_SCHEMA_VERSION, SELF_REPAIR_COMPATIBILITY, SELF_REPAIR_SCHEMA_VERSION, TASK_DELIVERY_FLOW_COMPATIBILITY, TASK_DELIVERY_FLOW_SCHEMA_VERSION, asId } from "@deepseek/platform-contracts";
 import { createDefaultPromptAssembler, replayPromptAssembly, type PromptSectionProviderRegistration } from "../src/index.js";
 
 describe("prompt assembly", () => {
@@ -80,6 +80,26 @@ describe("prompt assembly", () => {
     assert.equal(pipelineText.indexOf("Session block") < pipelineText.indexOf("Current turn block"), true);
     assert.equal(result.trace.pipeline?.pipelineFingerprint, "pipeline:test");
     assert.deepEqual(result.trace.pipeline?.includedBlockIds, ["block-kernel", "block-project", "block-session", "block-current"]);
+  });
+
+  it("assembles task decision requests through stable sections with pipeline cache evidence", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const result = await assembler.assemble(input({
+      prompt: "继续",
+      contextPipelineManifest: pipelineManifest(),
+      taskDecision: taskDecisionRequest()
+    }));
+    const decisionSection = result.sections.find((section) => section.kind === "task.decision-request" && section.included);
+    const decisionText = result.messages.find((message) => message.content.includes("Task decision request:"))?.content ?? "";
+
+    assert.ok(decisionSection);
+    assert.equal(decisionText.includes("Return a TaskDecisionEnvelope"), true);
+    assert.equal(decisionText.includes("coding/general.v1"), true);
+    assert.equal(result.trace.pipeline?.pipelineFingerprint, "pipeline:test");
+    assert.equal(result.trace.pipeline?.layerPrefixHashes.includes("project:prefix-project"), true);
+    assert.equal(typeof decisionSection.evidenceFingerprint, "string");
+    assert.equal(decisionSection.evidenceFingerprint.length > 0, true);
+    assert.equal(result.messages.at(-1)?.content, "继续");
   });
 
   it("states lossless context priority below current instructions and policy", async () => {
@@ -327,6 +347,7 @@ function input(options: {
   readonly toolPolicy?: PromptAssemblyInput["toolPolicy"];
   readonly projectRules?: readonly AgentLoopProjectRuleEvidence[];
   readonly contextPipelineManifest?: ContextPipelineManifest;
+  readonly taskDecision?: TaskDecisionRequest;
 }): PromptAssemblyInput {
   const selectedNodes = options.projectionNodes ?? (options.contextContent ? [
     projectionNode("context-node-1", "memory-ref", "memory", options.contextContent, { memoryId: "memory-1", scope: "session" })
@@ -352,6 +373,7 @@ function input(options: {
     history: [{ role: "user", content: options.prompt }],
     ...(options.projectRules ? { projectRules: options.projectRules } : {}),
     ...(options.contextPipelineManifest ? { contextPipelineManifest: options.contextPipelineManifest } : {}),
+    ...(options.taskDecision ? { taskDecision: options.taskDecision } : {}),
     ...(options.evidenceFirst ? { evidenceFirst: options.evidenceFirst } : {}),
     ...(options.selfRepair ? { selfRepair: options.selfRepair } : {}),
     ...(options.phasePlan ? {
@@ -388,6 +410,41 @@ function input(options: {
     toolPolicy: options.toolPolicy ?? "all",
     budget: { hardLimitTokens: options.hardLimitTokens ?? 1024, reservedOutputTokens: 0 },
     compatibility: { schemaVersion: "1.0.0" }
+  };
+}
+
+function taskDecisionRequest(): TaskDecisionRequest {
+  return {
+    schemaVersion: TASK_DELIVERY_FLOW_SCHEMA_VERSION,
+    requestId: "task-decision-request:prompt-assembly",
+    brief: {
+      schemaVersion: TASK_DELIVERY_FLOW_SCHEMA_VERSION,
+      briefId: "task-brief:prompt-assembly",
+      rawInput: "继续",
+      normalizedIntent: "continue active task",
+      intentKind: "coding",
+      confidence: 0.8,
+      contextRequirements: ["active-task", "project-rules"],
+      assumptions: ["Continue the active task if present."],
+      missingInfo: [],
+      needsUserConfirmation: false,
+      compatibility: TASK_DELIVERY_FLOW_COMPATIBILITY,
+      redaction: { class: "internal", fields: ["rawInput"] }
+    },
+    evidenceRefs: ["ref:project-rules", "ref:active-task"],
+    constraints: ["Use prompt assembly for model-bound decisions."],
+    allowedTools: ["workspace.read", "process.check"],
+    riskLevel: "medium",
+    candidateProfiles: ["coding/general.v1"],
+    acceptanceDraft: [{
+      criterionId: "criterion:proof",
+      description: "Collect proof evidence before delivery.",
+      required: true,
+      evidenceRefs: ["ref:proof"]
+    }],
+    outputSchema: { kind: "TaskDecisionEnvelope" },
+    compatibility: TASK_DELIVERY_FLOW_COMPATIBILITY,
+    redaction: { class: "internal", fields: ["brief.rawInput"] }
   };
 }
 

@@ -116,6 +116,38 @@ describe("headless runtime", () => {
     await kernel.shutdown();
   });
 
+  it("records model request counts and token usage through unified audit evidence", async () => {
+    const deps = { ...createDeterministicRuntimeDependencies(), models: new UsageAuditingGateway() };
+    await registerRuntimeCoreTools(deps, "/workspace");
+    const kernel = await createDefaultRuntimeKernel(deps);
+    const events = await collectRuntimeEvents(runAgentLoop(deps, kernel, {
+      prompt: "audit usage",
+      caller: "runtime.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      sessionId: asId<"session">("session-usage-audit"),
+      turnId: asId<"turn">("turn-usage-audit"),
+      profile: defaultDeepSeekProfile
+    }));
+    const usageTotal = await deps.usage.total(asId<"session">("session-usage-audit"));
+    const auditRecords = (await deps.observability.drain()).filter((record) => record.kind === "audit");
+    const requestAudit = auditRecords.find((record) => record.name === "model.request.audit");
+    const usageAudit = auditRecords.find((record) => record.name === "model.usage.audit");
+
+    assert.equal(events.some((event) => event.kind === "model.requested"), true);
+    assert.equal(events.some((event) => event.kind === "usage.updated"), true);
+    assert.equal(usageTotal.inputTokens, 11);
+    assert.equal(usageTotal.outputTokens, 7);
+    assert.equal(requestAudit?.fields.requestCount, 1);
+    assert.equal(requestAudit?.fields.model, "deepseek-v4-flash");
+    assert.equal(usageAudit?.fields.inputTokens, 11);
+    assert.equal(usageAudit?.fields.outputTokens, 7);
+    assert.equal(usageAudit?.fields.totalTokens, 18);
+    assert.equal(usageAudit?.fields.providerRequestId, "req-usage-audit");
+    assert.equal(JSON.stringify(auditRecords).includes("sk-"), false);
+    await kernel.shutdown();
+  });
+
   it("carries context pipeline evidence into prompt assembly and model metadata when enabled", async () => {
     const gateway = new CapturingModelGateway();
     const deps = { ...createDeterministicRuntimeDependencies(), models: gateway };
@@ -820,6 +852,35 @@ class SingleToolCallModelGateway implements ModelGateway {
     }
     yield { kind: "tool-call", id: "call-runtime", name: this.name, input: this.input };
     yield { kind: "finish", reason: "tool-call" };
+    yield { kind: "done" };
+  }
+
+  async countTokens(text: string): Promise<number> {
+    return text.trim() ? text.trim().split(/\s+/).length : 0;
+  }
+}
+
+class UsageAuditingGateway implements ModelGateway {
+  async *stream(_request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    yield { kind: "delta", text: "audited" };
+    yield {
+      kind: "usage",
+      inputTokens: 11,
+      outputTokens: 7,
+      metadata: {
+        inputTokens: 11,
+        outputTokens: 7,
+        provider: {
+          provider: "deepseek",
+          protocol: "openai-chat-completions",
+          model: "deepseek-v4-flash",
+          requestId: "req-usage-audit"
+        },
+        cache: { hitTokens: 3, missTokens: 8 },
+        reasoningTokens: 2
+      }
+    };
+    yield { kind: "finish", reason: "stop" };
     yield { kind: "done" };
   }
 

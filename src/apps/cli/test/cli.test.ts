@@ -211,6 +211,19 @@ describe("cli host adapter", () => {
         model: "glm-5.1"
       }
     });
+    assert.deepEqual(parseCliArgs(["diagnostics", "flow", "inspect", "--prompt", "继续", "--output", "json"]), {
+      command: "diagnostics",
+      diagnosticsCommand: "flow",
+      prompt: "",
+      output: "json",
+      live: false,
+      diagnosticsInput: {
+        command: "flow",
+        action: "inspect",
+        prompt: "继续",
+        extraArgs: []
+      }
+    });
     assert.deepEqual(parseCliArgs(["index-provider", "set", "zvec", "enabled", "--user", "--output", "json"]), {
       command: "index-provider",
       prompt: "",
@@ -454,7 +467,7 @@ describe("cli host adapter", () => {
     assert.equal(lines.some((line) => line.includes("deepseek repo files|grep|recall|project-index")), true);
     assert.equal(lines.some((line) => line.includes("deepseek git status|diff|review")), true);
     assert.equal(lines.some((line) => line.includes("deepseek jump file|text|symbol")), true);
-    assert.equal(lines.some((line) => line.includes("deepseek diagnostics bundle|release|doctor|verify|refresh|evaluate|env")), true);
+    assert.equal(lines.some((line) => line.includes("deepseek diagnostics bundle|release|doctor|verify|refresh|evaluate|env|flow")), true);
     assert.equal(lines.some((line) => line.includes("deepseek chat [--session <session-id>]")), true);
     assert.equal(lines.join("\n").includes("stream-json"), false);
     assert.equal(lines.join("\n").includes(" -p "), false);
@@ -3106,6 +3119,62 @@ describe("cli host adapter", () => {
     assert.equal(serialized.includes("sk-diagnostics-secret-123456"), false);
   });
 
+  it("renders diagnostics flow inspect as JSON with task delivery decisions", async () => {
+    const lines: string[] = [];
+    await runCli(["diagnostics", "flow", "inspect", "--prompt", "继续", "--output", "json"], (line: string) => {
+      lines.push(line);
+    });
+    const parsed = JSON.parse(lines[0] ?? "{}") as {
+      kind?: string;
+      status?: string;
+      command?: string;
+      flow?: {
+        schemaVersion?: string;
+        brief?: { rawInput?: string; normalizedIntent?: string; needsUserConfirmation?: boolean };
+        decisionRequest?: { requestId?: string; candidateProfiles?: readonly string[] };
+        goal?: { goalId?: string; acceptanceCriteria?: readonly { criterionId?: string }[] };
+        plan?: { steps?: readonly { phase?: string; status?: string }[]; planningMode?: string };
+        acceptance?: { decision?: string; recommendedReturnPhase?: string };
+        delivery?: { status?: string; nextPhase?: string };
+      };
+    };
+    const serialized = lines.join("\n");
+
+    assert.equal(parsed.kind, "diagnostics.flow.inspect");
+    assert.equal(parsed.status === "pass" || parsed.status === "warn", true);
+    assert.equal(parsed.command, "flow");
+    assert.equal(parsed.flow?.brief?.rawInput, "继续");
+    assert.equal(parsed.flow?.brief?.needsUserConfirmation, false);
+    assert.equal(parsed.flow?.decisionRequest?.candidateProfiles?.includes("coding/general.v1"), true);
+    assert.equal(parsed.flow?.goal?.acceptanceCriteria?.some((criterion) => criterion.criterionId === "criterion:proof"), true);
+    assert.equal(parsed.flow?.plan?.steps?.some((step) => step.phase === "proof" && step.status === "required"), true);
+    assert.equal(parsed.flow?.acceptance?.decision, "verify_required");
+    assert.equal(parsed.flow?.delivery?.nextPhase, "proof");
+    assert.equal(serialized.includes("\u001b["), false);
+    assert.equal(serialized.includes("sk-diagnostics-secret-123456"), false);
+  });
+
+  it("renders diagnostics flow inspect as JSONL records", async () => {
+    const lines: string[] = [];
+    await runCli(["diagnostics", "flow", "inspect", "--prompt", "继续", "--output", "jsonl"], (line: string) => {
+      lines.push(line);
+    });
+    const records = lines.map((line) => JSON.parse(line) as {
+      kind?: string;
+      summary?: { briefId?: string; goalId?: string; deliveryStatus?: string };
+      phase?: { phase?: string; status?: string };
+      acceptance?: { decision?: string };
+      delivery?: { status?: string; nextPhase?: string };
+    });
+
+    assert.equal(records[0]?.kind, "diagnostics.flow.inspect");
+    assert.equal(records.some((record) => record.kind === "diagnostics.flow.inspect.summary" && record.summary?.deliveryStatus === "returned"), true);
+    assert.equal(records.some((record) => record.kind === "diagnostics.flow.inspect.phase" && record.phase?.phase === "proof" && record.phase.status === "required"), true);
+    assert.equal(records.some((record) => record.kind === "diagnostics.flow.inspect.acceptance" && record.acceptance?.decision === "verify_required"), true);
+    assert.equal(records.some((record) => record.kind === "diagnostics.flow.inspect.delivery" && record.delivery?.nextPhase === "proof"), true);
+    assert.equal(lines.join("\n").includes("\u001b["), false);
+  });
+
   it("renders diagnostics release evidence in JSONL", async () => {
     const lines: string[] = [];
     await runCli(["diagnostics", "release", "--output", "jsonl"], (line: string) => {
@@ -3260,7 +3329,7 @@ describe("cli host adapter", () => {
 
   it("renders diagnostics env prepare SWE-bench Lite dry-run as redacted JSON", async () => {
     const previousGlm = process.env.GLM_ANTHROPIC_API_KEY;
-    const secret = "2e3e884dec94408480485979fa73ffb5.lcg5M29IrVRSzqLH";
+    const secret = "fixture-glm-env-secret-123456";
     process.env.GLM_ANTHROPIC_API_KEY = secret;
     try {
       const lines: string[] = [];

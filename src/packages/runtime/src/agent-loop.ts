@@ -38,7 +38,7 @@ import { asId } from "@deepseek/platform-contracts";
 import { projectAgentLoopContext, projectionEventData } from "./context-projection.js";
 import { kernelError, toolIntentError } from "./errors.js";
 import { createEvidenceFirstRuntimeContext, evidenceFirstEventData, groundStrictClaims } from "./evidence-first.js";
-import { agentLoopEvent, collectRuntimeEvents, lastRuntimeEvent, recordRuntimeAdapterEvent } from "./events.js";
+import { agentLoopEvent, collectRuntimeEvents, lastRuntimeEvent, recordRuntimeAdapterEvent, recordRuntimeModelRequestAudit, recordRuntimeModelUsageAudit } from "./events.js";
 import {
   boundedModelText,
   buildToolResultFeedback,
@@ -620,6 +620,13 @@ export async function* runAgentLoop(
       ...(request.referenceContext ? { referenceContext: referenceContextSummary(request) } : {})
     }, request.agentId);
     await recordRuntimeAdapterEvent(deps, modelRequested);
+    await recordRuntimeModelRequestAudit(deps, modelRequested, {
+      phase: "runtime",
+      requestCount: 1,
+      providerId: String(request.profile.providerId),
+      model: request.profile.model,
+      promptAssemblyFingerprint: assembly.fingerprint
+    });
     yield modelRequested;
 
     let requestedTool = false;
@@ -687,6 +694,11 @@ export async function* runAgentLoop(
           metadata: modelEvent.metadata ?? {}
         }, request.agentId);
         await recordRuntimeAdapterEvent(deps, event);
+        await recordRuntimeModelUsageAudit(deps, event, {
+          inputTokens: modelEvent.inputTokens,
+          outputTokens: modelEvent.outputTokens,
+          ...(modelEvent.metadata ? { metadata: modelEvent.metadata } : {})
+        });
         yield event;
         continue;
       }

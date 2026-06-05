@@ -15,6 +15,7 @@ import type {
   ReadinessCommandResult,
   ReleaseVerificationSummary
 } from "@deepseek/platform-contracts";
+import type { TaskDeliveryFlowSummary } from "@deepseek/platform-contracts";
 import { invokeLocalReadinessCommand } from "@deepseek/command-system";
 import { InMemoryObservabilitySink } from "@deepseek/observability";
 import { NodePlatformRuntime } from "@deepseek/platform-abstraction";
@@ -39,6 +40,7 @@ import {
   productReadyClaimsFromInput
 } from "./governance-diagnostics.js";
 import { governanceEvidenceMatrixJsonLines, renderGovernanceEvidenceMatrixText } from "./governance-evidence-render.js";
+import { collectDiagnosticsFlowInspect, diagnosticsFlowInspectJsonLines } from "./flow-inspect.js";
 
 export interface CliDiagnosticNotice {
   readonly code: string;
@@ -47,7 +49,7 @@ export interface CliDiagnosticNotice {
 
 export interface CliDiagnosticsResult extends JsonObject {
   readonly schemaVersion: string;
-  readonly kind: "diagnostics.bundle" | "diagnostics.release" | "diagnostics.doctor" | "diagnostics.verify" | "diagnostics.refresh" | "diagnostics.evaluate" | "diagnostics.env.prepare";
+  readonly kind: "diagnostics.bundle" | "diagnostics.release" | "diagnostics.doctor" | "diagnostics.verify" | "diagnostics.refresh" | "diagnostics.evaluate" | "diagnostics.env.prepare" | "diagnostics.flow.inspect";
   readonly status: "pass" | "warn" | "fail";
   readonly command: DiagnosticsCommandName;
   readonly bundle?: DiagnosticBundle;
@@ -57,6 +59,7 @@ export interface CliDiagnosticsResult extends JsonObject {
   readonly verificationSummary?: ReleaseVerificationSummary;
   readonly refresh?: AcceptanceEvidenceRefreshSummary;
   readonly environment?: DiagnosticsEnvironmentPrepareSummary;
+  readonly flow?: TaskDeliveryFlowSummary;
   readonly evaluation?: CliEvaluationComparisonSummary;
   readonly indexProviders?: IndexProviderDiagnosticsSummary;
   readonly modeMatrix?: CliModeMatrixSummary;
@@ -76,6 +79,7 @@ export async function collectCliDiagnostics(command: DiagnosticsCommandName, opt
   if (command === "verify") return verifyDiagnostics(options);
   if (command === "refresh") return refreshDiagnostics(options);
   if (command === "env") return environmentDiagnostics(options);
+  if (command === "flow") return flowDiagnostics(options);
   if (command === "evaluate") return evaluateDiagnostics(options);
   if (command === "doctor") return doctorDiagnostics(options);
   return bundleDiagnostics(options);
@@ -188,6 +192,16 @@ export function renderDiagnosticsResult(result: CliDiagnosticsResult, output: Ag
     }
     for (const diagnostic of result.environment.diagnostics) {
       lines.push(`- ${diagnostic.id}: ${diagnostic.status} - ${diagnostic.message}`);
+    }
+  }
+  if (result.flow) {
+    lines.push(`- flow brief: ${result.flow.brief.briefId} intent=${result.flow.brief.normalizedIntent}`);
+    lines.push(`- flow goal: ${result.flow.goal.goalId} risk=${result.flow.goal.riskLevel}`);
+    lines.push(`- flow plan: ${result.flow.plan.planningMode} steps=${result.flow.plan.steps.length}`);
+    lines.push(`- flow acceptance: ${result.flow.acceptance.decision} return=${result.flow.acceptance.recommendedReturnPhase}`);
+    lines.push(`- flow delivery: ${result.flow.delivery.status}${result.flow.delivery.nextPhase ? ` next=${result.flow.delivery.nextPhase}` : ""}`);
+    for (const diagnostic of result.flow.diagnostics) {
+      lines.push(`- ${diagnostic.code}: ${diagnostic.message}`);
     }
   }
   if (result.evaluation) {
@@ -353,6 +367,19 @@ async function environmentDiagnostics(options: CliOptions): Promise<CliDiagnosti
     environment,
     referencePitFixtureIds: [...diagnosticPitIds],
     redaction: { class: "internal", fields: ["environment.dependencies.commandPlan.args", "environment.dependencies.secretRef", "environment.dependencies.metadata", "environment.executedSteps.args", "environment.executedSteps.stdoutPreview", "environment.executedSteps.stderrPreview", "environment.diagnostics.metadata"] }
+  };
+}
+
+async function flowDiagnostics(options: CliOptions): Promise<CliDiagnosticsResult> {
+  const inspected = collectDiagnosticsFlowInspect(options.diagnosticsInput);
+  return {
+    schemaVersion: diagnosticsSchemaVersion,
+    kind: "diagnostics.flow.inspect",
+    status: inspected.status,
+    command: "flow",
+    flow: inspected.flow,
+    referencePitFixtureIds: [...diagnosticPitIds],
+    redaction: { class: "internal", fields: ["flow.brief.rawInput", "flow.diagnostics.details"] }
   };
 }
 
@@ -684,6 +711,9 @@ function diagnosticsJsonLines(result: CliDiagnosticsResult): readonly JsonObject
   }
   if (result.environment) {
     entries.push(...environmentPrepareJsonLines(result.environment));
+  }
+  if (result.flow) {
+    entries.push(...diagnosticsFlowInspectJsonLines(result.schemaVersion, result.flow));
   }
   if (result.evaluation) {
     entries.push(...evaluationJsonLines(result.evaluation));

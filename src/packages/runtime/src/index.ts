@@ -49,3 +49,23 @@ export type {
   StageExecutionContext,
   StageExecutor
 } from "./staged-task.js";
+export {
+  classifyTaskGuidance,
+  createTaskBrief,
+  createTaskDecisionRequest,
+  createTaskDeliveryFlowSummary,
+  createTaskDeliveryPlan,
+  createTaskGoal,
+  invalidateTaskDecision,
+  reviewTaskAcceptance
+} from "./task-delivery-flow.js";
+export type {
+  CreateTaskBriefOptions,
+  CreateTaskDecisionRequestOptions,
+  CreateTaskDeliveryFlowSummaryOptions,
+  CreateTaskDeliveryPlanOptions,
+  CreateTaskGoalOptions,
+  DeterministicTaskDeliveryFlowSummary,
+  InvalidateTaskDecisionOptions,
+  ReviewTaskAcceptanceOptions
+} from "./task-delivery-flow.js";

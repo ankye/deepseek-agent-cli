@@ -8,6 +8,7 @@ import type { AgentModeName, AgentPhasePlan, AgentReasoningEffortMapping, AgentV
 import type { InteractionModeName } from "./interaction-mode.js";
 import type { ModelChatMessage, ModelProfile, ModelReasoningOptions, ModelToolChoice } from "./model.js";
 import type { AgentId, SessionId, TurnId } from "./ids.js";
+import type { TaskDecisionRequest } from "./task-delivery-flow.js";
 
 export const PROMPT_ASSEMBLY_SCHEMA_VERSION = "1.0.0";
 
@@ -19,6 +20,7 @@ export type PromptSectionKind =
   | "system.mode"
   | "project.instructions"
   | "task.intent"
+  | "task.decision-request"
   | "task.output-contract"
   | "task.work-order"
   | "context.projected"
@@ -45,6 +47,7 @@ export type PromptSectionSource =
   | "tool-result"
   | "skill-system"
   | "self-repair"
+  | "task-delivery-flow"
   | "capability-registry";
 export type PromptSectionBudgetClass = "required" | "high" | "normal" | "low" | "optional";
 export type PromptSectionTrust = "system" | "trusted" | "workspace" | "semantic" | "untrusted";
@@ -188,6 +191,7 @@ export interface PromptAssemblyInput {
   readonly history: readonly ModelChatMessage[];
   readonly contextProjection?: ContextProjectionResult;
   readonly contextPipelineManifest?: ContextPipelineManifest;
+  readonly taskDecision?: TaskDecisionRequest;
   readonly evidenceFirst?: EvidenceFirstRuntimeContext;
   readonly selfRepair?: SelfRepairOutcomeSummary;
   readonly projectRules?: readonly AgentLoopProjectRuleEvidence[];

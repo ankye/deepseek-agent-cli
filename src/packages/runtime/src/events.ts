@@ -1,6 +1,7 @@
 import type {
   AgentId,
   JsonObject,
+  ModelUsageMetadata,
   RuntimeDependencies,
   RuntimeEvent,
   SessionId,
@@ -102,5 +103,82 @@ export async function recordRuntimeAdapterEvent(deps: RuntimeDependencies, event
     at: event.createdAt,
     name: event.kind,
     fields: event.data
+  });
+}
+
+export async function recordRuntimeModelRequestAudit(
+  deps: RuntimeDependencies,
+  event: RuntimeEvent,
+  metadata: {
+    readonly phase: string;
+    readonly requestCount: number;
+    readonly providerId?: string;
+    readonly model: string;
+    readonly promptAssemblyFingerprint?: string;
+  }
+): Promise<void> {
+  await deps.observability.emit({
+    kind: "audit",
+    at: event.createdAt,
+    name: "model.request.audit",
+    trace: event.trace,
+    dataPrivacyClass: "local",
+    fields: {
+      schemaVersion: "1.0.0",
+      sessionId: event.sessionId,
+      ...(event.turnId ? { turnId: event.turnId } : {}),
+      phase: metadata.phase,
+      requestCount: metadata.requestCount,
+      ...(metadata.providerId ? { providerId: metadata.providerId } : {}),
+      model: metadata.model,
+      ...(metadata.promptAssemblyFingerprint ? { promptAssemblyFingerprint: metadata.promptAssemblyFingerprint } : {}),
+      redaction: { class: "internal", fields: ["promptAssemblyFingerprint"] }
+    },
+    redaction: { class: "internal", fields: ["fields.promptAssemblyFingerprint"] }
+  });
+}
+
+export async function recordRuntimeModelUsageAudit(
+  deps: RuntimeDependencies,
+  event: RuntimeEvent,
+  usage: {
+    readonly inputTokens: number;
+    readonly outputTokens: number;
+    readonly metadata?: ModelUsageMetadata;
+  }
+): Promise<void> {
+  await deps.usage.record({
+    sessionId: event.sessionId,
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    costMicros: 0,
+    elapsedMs: 0
+  });
+  const provider = usage.metadata?.provider;
+  const cache = usage.metadata?.cache;
+  const totalTokens = usage.inputTokens + usage.outputTokens;
+  await deps.observability.emit({
+    kind: "audit",
+    at: event.createdAt,
+    name: "model.usage.audit",
+    trace: event.trace,
+    dataPrivacyClass: "local",
+    fields: {
+      schemaVersion: "1.0.0",
+      sessionId: event.sessionId,
+      ...(event.turnId ? { turnId: event.turnId } : {}),
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      totalTokens,
+      usageStatus: "provider-reported",
+      ...(usage.metadata?.reasoningTokens !== undefined ? { reasoningTokens: usage.metadata.reasoningTokens } : {}),
+      ...(cache ? { cache } : {}),
+      ...(provider?.provider ? { provider: provider.provider } : {}),
+      ...(provider?.protocol ? { protocol: provider.protocol } : {}),
+      ...(provider?.model ? { model: provider.model } : {}),
+      ...(provider?.requestId ? { providerRequestId: provider.requestId } : {}),
+      redaction: { class: "internal", fields: ["cache"] }
+    },
+    redaction: { class: "internal", fields: ["fields.cache"] }
   });
 }
