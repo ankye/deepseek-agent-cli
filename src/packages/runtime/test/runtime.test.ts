@@ -178,6 +178,30 @@ describe("headless runtime", () => {
     await kernel.shutdown();
   });
 
+  it("records model-returned task decision envelopes in the agent loop summary", async () => {
+    const deps = { ...createDeterministicRuntimeDependencies(), models: new TaskDecisionEnvelopeModelGateway() };
+    await registerRuntimeCoreTools(deps, "/workspace");
+    const kernel = await createDefaultRuntimeKernel(deps);
+    const events = await collectRuntimeEvents(runAgentLoop(deps, kernel, {
+      prompt: "跑分",
+      caller: "runtime.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile
+    }));
+
+    const decisionReceived = events.find((event) => event.kind === "task.decision.received");
+    const completed = events.find((event) => event.kind === "agent.loop.completed");
+    assert.equal(events.filter((event) => event.kind === "model.requested").length, 1);
+    assert.equal(decisionReceived?.data.decisionId, "task-decision:model-evaluation");
+    const receivedFlow = decisionReceived?.data.taskDeliveryFlow as JsonObject | undefined;
+    const completedFlow = completed?.data.taskDeliveryFlow as JsonObject | undefined;
+    assert.equal(decisionReceived?.data.requestId, receivedFlow?.decisionRequestId);
+    assert.equal(completedFlow?.decisionId, "task-decision:model-evaluation");
+    assert.equal(completedFlow?.decisionSource, "model");
+    await kernel.shutdown();
+  });
+
   it("records model request counts and token usage through unified audit evidence", async () => {
     const deps = { ...createDeterministicRuntimeDependencies(), models: new UsageAuditingGateway() };
     await registerRuntimeCoreTools(deps, "/workspace");
@@ -1120,6 +1144,64 @@ class CapturingModelGateway implements ModelGateway {
   async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
     this.requests.push(request);
     yield { kind: "delta", text: "captured" };
+    yield { kind: "finish", reason: "stop" };
+    yield { kind: "done" };
+  }
+
+  async countTokens(text: string): Promise<number> {
+    return text.trim() ? text.trim().split(/\s+/).length : 0;
+  }
+}
+
+class TaskDecisionEnvelopeModelGateway implements ModelGateway {
+  readonly requests: ModelRequest[] = [];
+
+  async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    this.requests.push(request);
+    const flow = request.metadata?.taskDeliveryFlow as JsonObject | undefined;
+    const acceptance = [{
+      criterionId: "criterion:model-proof",
+      description: "Model-selected proof evidence exists before delivery.",
+      required: true,
+      evidenceRefs: ["ref:model-proof"]
+    }];
+    const envelope = {
+      schemaVersion: "1.0.0",
+      decisionId: "task-decision:model-evaluation",
+      requestId: String(flow?.decisionRequestId ?? "task-decision-request:missing"),
+      intentDecision: "run_evaluation_score",
+      goalProposal: {
+        schemaVersion: "1.0.0",
+        goalId: "task-goal:model-evaluation",
+        briefId: String(flow?.briefId ?? "task-brief:missing"),
+        statement: "Run the evaluation flow and collect proof before delivery.",
+        taskKind: "evaluation",
+        riskLevel: "medium",
+        acceptanceCriteria: acceptance,
+        nonGoals: ["Do not claim score without evidence."],
+        compatibility: { schemaVersion: "1.0.0", minReaderVersion: "1.0.0" },
+        redaction: { class: "internal" }
+      },
+      acceptanceCriteria: acceptance,
+      planSteps: [{
+        stepId: "task-step:model-evaluate",
+        phase: "runtime",
+        description: "Run the model-selected evaluation path.",
+        expectedRefs: ["ref:model-proof"],
+        status: "required"
+      }],
+      profileSelection: "coding/general.v1",
+      toolStrategy: ["Use governed diagnostics tools."],
+      verificationPlan: ["Collect score evidence."],
+      repairPolicy: ["Return to proof when evidence is missing."],
+      stopConditions: ["Budget exhausted."],
+      questionsForUser: [],
+      confidence: 0.88,
+      assumptions: ["Evaluation target is the active CLI."],
+      compatibility: { schemaVersion: "1.0.0", minReaderVersion: "1.0.0" },
+      redaction: { class: "internal" }
+    };
+    yield { kind: "delta", text: JSON.stringify(envelope) };
     yield { kind: "finish", reason: "stop" };
     yield { kind: "done" };
   }

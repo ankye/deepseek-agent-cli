@@ -74,7 +74,13 @@ import {
 } from "./modes/mode-state.js";
 import { runFinalVerification } from "./agent-loop-verification.js";
 import { projectReasoningForOutput, recordVisibleReasoning, recordVisibleReasoningProjection, visibleReasoningEvidence } from "./visible-reasoning.js";
-import { createTaskDeliveryFlowSummary, taskDeliveryFlowEventData } from "./task-delivery-flow.js";
+import {
+  createTaskDeliveryFlowSummary,
+  parseTaskDecisionEnvelopeText,
+  taskDecisionEnvelopeEventData,
+  taskDeliveryFlowEventData,
+  taskDeliveryFlowWithDecisionData
+} from "./task-delivery-flow.js";
 
 export const defaultAgentLoopLimits: AgentLoopLimits = {
   maxModelIterations: 4,
@@ -127,7 +133,7 @@ export async function* runAgentLoop(
   let visibleReasoningRecords: VisibleReasoningRecord[] = [];
   let visibleReasoningProjection: VisibleReasoningProjection | undefined;
   const taskDeliveryFlow = createTaskDeliveryFlowSummary({ rawInput: request.prompt, activeTaskAvailable: true });
-  const taskDeliveryFlowData = taskDeliveryFlowEventData(taskDeliveryFlow);
+  let taskDeliveryFlowData = taskDeliveryFlowEventData(taskDeliveryFlow);
   const signal = control.signal;
 
   const currentRepairOutcome = (): SelfRepairOutcomeSummary => outcomeFromState({
@@ -146,7 +152,8 @@ export async function* runAgentLoop(
     reasoningEffortMapping,
     outputContract: outputContractVerification,
     selfRepair: currentRepairOutcome(),
-    visibleReasoning: visibleReasoningProjection ?? (visibleReasoningRecords.length > 0 ? projectReasoningForOutput(visibleReasoningRecords, request.outputMode) : undefined)
+    visibleReasoning: visibleReasoningProjection ?? (visibleReasoningRecords.length > 0 ? projectReasoningForOutput(visibleReasoningRecords, request.outputMode) : undefined),
+    taskDeliveryFlow: taskDeliveryFlowData
   });
 
   const nextReasoningSequence = (): number => {
@@ -1073,6 +1080,13 @@ export async function* runAgentLoop(
       continue;
     }
     if (!requestedTool) {
+      const decisionEnvelope = parseTaskDecisionEnvelopeText(assistantText, taskDeliveryFlow.decisionRequest.requestId);
+      if (decisionEnvelope) {
+        taskDeliveryFlowData = taskDeliveryFlowWithDecisionData(taskDeliveryFlowData, decisionEnvelope, "model");
+        const decisionReceived = agentLoopEvent("task.decision.received", sessionId, turnId, trace, taskDecisionEnvelopeEventData(decisionEnvelope, taskDeliveryFlowData), request.agentId);
+        await recordRuntimeAdapterEvent(deps, decisionReceived);
+        yield decisionReceived;
+      }
       if (evidenceFirst?.classification.evidenceRequired) {
         const grounding = groundStrictClaims(assistantText, evidenceFirst);
         evidenceFirst = { ...evidenceFirst, summary: grounding.summary };

@@ -99,6 +99,7 @@ export type RuntimeEventKind =
   | "agent.repair.attempted"
   | "agent.repair.rerun"
   | "agent.result.reconciled"
+  | "task.decision.received"
   | "model.reasoning.effort.mapped"
   | "evidence.classified"
   | "evidence.plan.created"
@@ -436,6 +437,7 @@ export interface AgentLoopSummary extends JsonObject {
   readonly outputContract?: AgentLoopOutputContractVerification;
   readonly selfRepair?: SelfRepairOutcomeSummary;
   readonly visibleReasoning?: VisibleReasoningProjection;
+  readonly taskDeliveryFlow?: JsonObject;
   readonly diagnostics: readonly RedactedError[];
   readonly redaction: { readonly class: "internal"; readonly fields?: readonly string[] };
 }

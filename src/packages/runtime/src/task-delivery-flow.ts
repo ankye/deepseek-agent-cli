@@ -338,6 +338,61 @@ export function taskDeliveryFlowEventData(summary: TaskDeliveryFlowSummary): Jso
   };
 }
 
+export function parseTaskDecisionEnvelopeText(text: string, expectedRequestId: string): TaskDecisionEnvelope | undefined {
+  const parsed = parseJsonObjectCandidate(text);
+  if (!parsed) return undefined;
+  if (parsed.schemaVersion !== TASK_DELIVERY_FLOW_SCHEMA_VERSION) return undefined;
+  if (typeof parsed.decisionId !== "string" || !parsed.decisionId.startsWith("task-decision:")) return undefined;
+  if (parsed.requestId !== expectedRequestId) return undefined;
+  if (typeof parsed.intentDecision !== "string") return undefined;
+  if (!isJsonObject(parsed.goalProposal)) return undefined;
+  if (!Array.isArray(parsed.acceptanceCriteria) || !Array.isArray(parsed.planSteps)) return undefined;
+  if (!Array.isArray(parsed.toolStrategy) || !Array.isArray(parsed.verificationPlan)) return undefined;
+  if (!Array.isArray(parsed.repairPolicy) || !Array.isArray(parsed.stopConditions)) return undefined;
+  if (!Array.isArray(parsed.questionsForUser) || !Array.isArray(parsed.assumptions)) return undefined;
+  if (typeof parsed.confidence !== "number") return undefined;
+  return parsed as unknown as TaskDecisionEnvelope;
+}
+
+export function taskDeliveryFlowWithDecisionData(
+  flow: JsonObject,
+  envelope: TaskDecisionEnvelope,
+  source: "deterministic" | "model" = "model"
+): JsonObject {
+  return {
+    ...flow,
+    decisionId: envelope.decisionId,
+    decisionSource: source,
+    modelConfidence: envelope.confidence,
+    profileSelection: envelope.profileSelection,
+    planStepCount: envelope.planSteps.length,
+    acceptanceCriteriaCount: envelope.acceptanceCriteria.length,
+    questionCount: envelope.questionsForUser.length,
+    redaction: { class: "internal" }
+  };
+}
+
+export function taskDecisionEnvelopeEventData(envelope: TaskDecisionEnvelope, flow: JsonObject): JsonObject {
+  return {
+    schemaVersion: envelope.schemaVersion,
+    requestId: envelope.requestId,
+    decisionId: envelope.decisionId,
+    intentDecision: envelope.intentDecision,
+    confidence: envelope.confidence,
+    profileSelection: envelope.profileSelection,
+    planStepCount: envelope.planSteps.length,
+    acceptanceCriteriaCount: envelope.acceptanceCriteria.length,
+    toolStrategyCount: envelope.toolStrategy.length,
+    verificationPlanCount: envelope.verificationPlan.length,
+    repairPolicyCount: envelope.repairPolicy.length,
+    stopConditionCount: envelope.stopConditions.length,
+    questionCount: envelope.questionsForUser.length,
+    taskDeliveryFlow: flow,
+    compatibility: envelope.compatibility,
+    redaction: { class: "internal" }
+  };
+}
+
 function classifyIntent(lower: string, activeTaskAvailable: boolean): {
   readonly normalizedIntent: string;
   readonly intentKind: TaskIntentKind;
@@ -410,6 +465,24 @@ function classifyIntent(lower: string, activeTaskAvailable: boolean): {
     missingInfo: ["task-goal"],
     needsUserConfirmation: true
   };
+}
+
+function parseJsonObjectCandidate(text: string): JsonObject | undefined {
+  const trimmed = text.trim();
+  if (!trimmed) return undefined;
+  const candidate = trimmed.startsWith("```")
+    ? trimmed.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim()
+    : trimmed;
+  try {
+    const parsed: unknown = JSON.parse(candidate);
+    return isJsonObject(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isJsonObject(value: unknown): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function riskForIntent(intentKind: TaskIntentKind): TaskRiskLevel {

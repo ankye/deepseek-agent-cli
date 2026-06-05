@@ -28,6 +28,7 @@ export interface AgentLoopModeSummaryInput {
   readonly outputContract?: AgentLoopOutputContractVerification | undefined;
   readonly selfRepair?: SelfRepairOutcomeSummary | undefined;
   readonly visibleReasoning?: VisibleReasoningProjection | undefined;
+  readonly taskDeliveryFlow?: JsonObject | undefined;
 }
 
 export function referenceContextSummary(request: AgentLoopRequest): JsonObject {
@@ -84,6 +85,7 @@ export function summarizeAgentLoop(
     ...(mode?.outputContract ? { outputContract: mode.outputContract } : {}),
     ...(mode?.selfRepair ? { selfRepair: mode.selfRepair } : {}),
     ...(mode?.visibleReasoning ? { visibleReasoning: mode.visibleReasoning } : {}),
+    ...(mode?.taskDeliveryFlow ? { taskDeliveryFlow: mode.taskDeliveryFlow } : {}),
     diagnostics,
     redaction: { class: "internal", fields: ["assistantText", "diagnostics.details", "selfRepair.classifications.diagnostics", "selfRepair.attempts.diagnostics"] }
   };
