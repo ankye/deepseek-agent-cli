@@ -11,7 +11,7 @@ import type {
 import { CLI_TASK_EVALUATION_SCHEMA_VERSION } from "@deepseek/platform-contracts";
 import { evaluationLiveCredentialEnv, evaluationModelSelectionArgs } from "./evaluation-provider-selection.js";
 import { buildEvaluationStagedTaskSnapshot } from "./evaluation-stage-graph.js";
-import { createEvaluationProgressObserver } from "./evaluation-progress.js";
+import { createEvaluationProgressObserver, emitEvaluationInstrumentationProgress, type EvaluationProgressSink } from "./evaluation-progress.js";
 import { generatedArtifactMetrics } from "./generated-artifacts.js";
 import {
   emptyMetrics,
@@ -69,7 +69,7 @@ async function executeWebpageTask(
 ): Promise<CliEvaluationTaskRunRecord> {
   const runId = `eval:${baseline.baselineId}:${task.taskId}`;
   const stagedTask = buildEvaluationStagedTaskSnapshot(task, runId);
-  const events = createEventRecorder(runId, baseline.baselineId, task.taskId);
+  const events = createEventRecorder(runId, baseline.baselineId, task.taskId, options.progressSink);
   events.record("run_started", { dryRun: false });
   const workspaceRoot = await isolatedWorkspaceRoot(platform, runId);
   events.record("workspace_created", { workspaceRoot });
@@ -235,7 +235,7 @@ async function executeStructuredTask(
   options: CliEvaluationOptions
 ): Promise<CliEvaluationTaskRunRecord> {
   const runId = `eval:${baseline.baselineId}:${task.taskId}`;
-  const events = createEventRecorder(runId, baseline.baselineId, task.taskId);
+  const events = createEventRecorder(runId, baseline.baselineId, task.taskId, options.progressSink);
   events.record("run_started", { dryRun: false });
   const workspaceRoot = await isolatedWorkspaceRoot(platform, runId);
   events.record("workspace_created", { workspaceRoot });
@@ -751,7 +751,7 @@ function redactPromptArg(value: string): string {
   return value.includes("\n") || value.length > 80 ? "[PROMPT]" : value;
 }
 
-function createEventRecorder(runId: string, baselineId: string, taskId: string): EvaluationEventRecorder {
+function createEventRecorder(runId: string, baselineId: string, taskId: string, progressSink?: EvaluationProgressSink): EvaluationEventRecorder {
   const events: CliEvaluationInstrumentationEvent[] = [];
   return {
     events: () => events,
@@ -769,6 +769,7 @@ function createEventRecorder(runId: string, baselineId: string, taskId: string):
         metadata: metadata ?? {},
         redaction: { class: "internal", fields: ["metadata.workspaceRoot", "metadata.path", "metadata.command"] }
       });
+      emitEvaluationInstrumentationProgress(progressSink, taskId, baselineId, kind, metadata);
     }
   };
 }

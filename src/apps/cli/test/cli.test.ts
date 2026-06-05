@@ -3865,8 +3865,13 @@ describe("cli host adapter", () => {
     const text = progressLines.join("\n");
 
     assert.equal(summary.taskRuns.find((run) => run.task.taskId === "eval.webpage.generation")?.outcome, "solved");
+    assert.equal(text.includes("progress eval.webpage.generation: task started baseline=deepseek-cli"), true);
+    assert.equal(text.includes("progress eval.webpage.generation: agent command started"), true);
     assert.equal(text.includes("progress eval.webpage.generation: tool core.file.read started"), true);
     assert.equal(text.includes("progress eval.webpage.generation: tool core.file.read success"), true);
+    assert.equal(text.includes("progress eval.webpage.generation: checker started"), true);
+    assert.equal(text.includes("progress eval.webpage.generation: checker pass exit=0"), true);
+    assert.equal(text.includes("progress eval.webpage.generation: task solved"), true);
     assert.equal(text.includes("secret raw delta"), false);
   });
 

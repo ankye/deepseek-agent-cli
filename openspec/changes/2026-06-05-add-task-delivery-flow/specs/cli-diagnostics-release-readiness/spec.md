@@ -39,3 +39,11 @@ CLI diagnostics 必须暴露确定性的 `diagnostics flow inspect` 命令，用
 - **THEN** diagnostics may stream bounded public progress lines for allowlisted child events such as tool intent, tool result, repair started, repair stopped, loop completed, and loop failed
 - **AND** progress streaming ignores raw model deltas, provider raw chain-of-thought, raw stdout/stderr lines, raw model request or response bodies, raw secrets, environment credentials, and unrecognized child payloads
 - **中文** 当 `deepseek diagnostics evaluate --execute-task <id> --output text` 运行 DeepSeek CLI 子进程，且子进程在退出前输出 JSONL task events 时，diagnostics 可以为 tool intent、tool result、repair started、repair stopped、loop completed 与 loop failed 等 allowlist child events 流式输出有界公开进度行；progress streaming 必须忽略 raw model deltas、provider raw chain-of-thought、raw stdout/stderr lines、raw model request/response bodies、raw secrets、environment credentials 与未识别的 child payloads。
+
+#### Scenario: Diagnostics evaluation streams safe phase progress / Diagnostics Evaluate 流式输出安全阶段进度
+
+- **WHEN** `deepseek diagnostics evaluate --execute-task <id> --output text` advances through workspace preparation, agent command execution, checker execution, artifact scan, and final run outcome
+- **THEN** diagnostics may stream bounded public progress lines for those phase transitions before the final evaluation summary renders
+- **AND** those phase progress lines include only public task id, baseline id, phase labels, pass/fail state, exit code, outcome, and bounded counts
+- **AND** they do not include workspace paths, command arguments, prompts, model deltas, stdout/stderr content, provider request or response bodies, raw secrets, or environment credentials
+- **中文** 当 `deepseek diagnostics evaluate --execute-task <id> --output text` 经过 workspace preparation、agent command execution、checker execution、artifact scan 与最终 run outcome 阶段时，diagnostics 可以在最终 evaluation summary 渲染前流式输出这些 phase transitions 的有界公开进度行；这些阶段进度行只能包含 public task id、baseline id、phase labels、pass/fail state、exit code、outcome 与有界计数，不得包含 workspace paths、command arguments、prompts、model deltas、stdout/stderr content、provider request/response bodies、raw secrets 或 environment credentials。
