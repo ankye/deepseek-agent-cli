@@ -15,6 +15,7 @@ import { createChatPaletteState } from "../src/commands/palette-state.js";
 import { collectCliEvaluation } from "../src/diagnostics/evaluation.js";
 import { collectDeliveryCapabilitySummary } from "../src/diagnostics/delivery-capability.js";
 import { buildEvaluationDeliveryCapabilityEvidence } from "../src/diagnostics/evaluation-delivery-evidence.js";
+import { renderDiagnosticsResult } from "../src/diagnostics/index.js";
 import { collectModeMatrix } from "../src/diagnostics/mode-matrix.js";
 import { refreshAcceptanceEvidence } from "../src/diagnostics/refresh-evidence.js";
 import {
@@ -471,6 +472,111 @@ describe("cli host adapter", () => {
     assert.equal(lines.some((line) => line.includes("deepseek chat [--session <session-id>]")), true);
     assert.equal(lines.join("\n").includes("stream-json"), false);
     assert.equal(lines.join("\n").includes(" -p "), false);
+  });
+
+  it("renders diagnostics evaluation task execution trace in text output", () => {
+    const result = {
+      schemaVersion: "1.0.0",
+      kind: "diagnostics.evaluate",
+      status: "warn",
+      command: "evaluate",
+      evaluation: {
+        schemaVersion: "1.0.0",
+        kind: "cli.evaluation.comparison.summary",
+        status: "warn",
+        mode: "smoke",
+        dryRun: false,
+        taskCatalogVersion: "test",
+        reportTimestamp: "1970-01-01T00:00:00.000Z",
+        baselines: [],
+        taskRuns: [{
+          schemaVersion: "1.0.0",
+          kind: "cli.evaluation.task-run",
+          runId: "eval:deepseek-cli:eval.trace",
+          task: {
+            schemaVersion: "1.0.0",
+            taskId: "eval.trace",
+            title: "Trace task",
+            category: "diagnostic",
+            fixtureId: "fixture.trace",
+            workspaceSnapshotId: "snapshot.trace",
+            promptDigest: "sha256:test",
+            promptSummary: "Trace the task.",
+            allowedCapabilityProfile: "read-write",
+            timeBudgetMs: 1000,
+            checkCommands: ["node check.js"],
+            scoringRubricId: "rubric.trace",
+            mode: "smoke",
+            redaction: { class: "internal" }
+          },
+          baseline: {
+            baselineId: "deepseek-cli",
+            label: "DeepSeek CLI",
+            kind: "deepseek-cli",
+            status: "available",
+            configured: true,
+            diagnostics: [],
+            redaction: { class: "internal" }
+          },
+          dryRun: false,
+          outcome: "failed",
+          checks: [{
+            command: "node check.js",
+            status: "fail",
+            exitCode: 1,
+            redaction: { class: "internal" }
+          }],
+          metrics: {
+            retryCount: 0,
+            userInterventionCount: 0,
+            safetyViolationCount: 0,
+            recoveryUsed: false,
+            repairMetricsAvailability: "available",
+            repairActivationCount: 1,
+            repairSuccessCount: 0,
+            repairStopReason: "model-iteration-limit",
+            redaction: { class: "internal" }
+          },
+          stagedTask: {
+            schemaVersion: "1.0.0",
+            profileId: "profile.trace",
+            graphId: "graph.trace",
+            profileFingerprint: "htrace",
+            stageCount: 2,
+            refCount: 1,
+            executorKinds: ["model", "checker"],
+            graph: { schemaVersion: "1.0.0", graphId: "graph.trace", nodes: [], edges: [], redaction: { class: "internal" } },
+            runState: { schemaVersion: "1.0.0", stateId: "state.trace", status: "failed", currentNodeIds: ["checker"], completedNodeIds: ["model"], failedNodeIds: ["checker"], redaction: { class: "internal" } },
+            redaction: { class: "internal" }
+          },
+          instrumentationEvents: [
+            { schemaVersion: "1.0.0", eventId: "event-1", kind: "run_started", runId: "eval:deepseek-cli:eval.trace", baselineId: "deepseek-cli", taskId: "eval.trace", sequence: 1, recordedAt: "1970-01-01T00:00:00.000Z", metadata: {}, redaction: { class: "internal" } },
+            { schemaVersion: "1.0.0", eventId: "event-2", kind: "command_started", runId: "eval:deepseek-cli:eval.trace", baselineId: "deepseek-cli", taskId: "eval.trace", sequence: 2, recordedAt: "1970-01-01T00:00:00.000Z", metadata: { argCount: 9 }, redaction: { class: "internal" } },
+            { schemaVersion: "1.0.0", eventId: "event-3", kind: "checker_finished", runId: "eval:deepseek-cli:eval.trace", baselineId: "deepseek-cli", taskId: "eval.trace", sequence: 3, recordedAt: "1970-01-01T00:00:00.000Z", metadata: { exitCode: 1 }, redaction: { class: "internal" } }
+          ],
+          diagnostics: [],
+          evidencePaths: [],
+          redaction: { class: "internal" }
+        }],
+        baselineAggregates: [],
+        publicBenchmarkReferences: [],
+        packageScorecards: [],
+        gapFindings: [],
+        diagnostics: [],
+        evidencePaths: [],
+        nextAction: "Inspect trace.",
+        redaction: { class: "internal" }
+      },
+      referencePitFixtureIds: [],
+      redaction: { class: "internal" }
+    } as unknown as Parameters<typeof renderDiagnosticsResult>[0];
+
+    const lines = renderDiagnosticsResult(result, "text");
+
+    assert.equal(lines.some((line) => line.includes("trace: run_started -> command_started -> checker_finished")), true);
+    assert.equal(lines.some((line) => line.includes("last=checker_finished")), true);
+    assert.equal(lines.some((line) => line.includes("check: fail exit=1 command=node check.js")), true);
+    assert.equal(lines.some((line) => line.includes("staged: failed current=checker failed=checker executors=model, checker")), true);
   });
 
   it("runs context compactor CLI status with structured output", async () => {

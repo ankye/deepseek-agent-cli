@@ -29,6 +29,7 @@ import type { DiagnosticsEnvironmentPrepareSummary } from "./environment-prepare
 import { collectCliEvaluation, evaluationJsonLines } from "./evaluation.js";
 import type { CliEvaluationOptions } from "./evaluation.js";
 import { buildEvaluationDeliveryCapabilityEvidence } from "./evaluation-delivery-evidence.js";
+import { evaluationRunMetricText, evaluationRunTraceText } from "./evaluation-text-render.js";
 import { collectModeMatrix } from "./mode-matrix.js";
 import type { CliModeMatrixSummary } from "./mode-matrix.js";
 import { collectDeliveryCapabilitySummary } from "./delivery-capability.js";
@@ -223,6 +224,7 @@ export function renderDiagnosticsResult(result: CliDiagnosticsResult, output: Ag
     lines.push(`- next action: ${result.evaluation.nextAction}`);
     for (const run of result.evaluation.taskRuns) {
       lines.push(`- ${run.task.taskId}: ${run.outcome} (${run.baseline.baselineId})${evaluationRunMetricText(run)}`);
+      lines.push(...evaluationRunTraceText(run).map((line) => `  ${line}`));
     }
     for (const diagnostic of result.evaluation.diagnostics) {
       lines.push(`- ${diagnostic.code}: ${diagnostic.severity} - ${diagnostic.message}`);
@@ -250,16 +252,6 @@ export function renderDiagnosticsResult(result: CliDiagnosticsResult, output: Ag
   }
   lines.push(`- reference pits: ${result.referencePitFixtureIds.join(", ")}`);
   return lines;
-}
-
-function evaluationRunMetricText(run: NonNullable<CliDiagnosticsResult["evaluation"]>["taskRuns"][number]): string {
-  const repair = run.metrics.repairMetricsAvailability
-    ? ` repair=${run.metrics.repairMetricsAvailability}:${run.metrics.repairActivationCount ?? 0}/${run.metrics.repairSuccessCount ?? 0}${run.metrics.repairStopReason ? ` stop=${run.metrics.repairStopReason}` : ""}`
-    : "";
-  const evidence = run.metrics.evidenceManifestStatus
-    ? ` evidence=${run.metrics.evidenceManifestStatus} grounding=${run.metrics.claimGroundingRate ?? 0} unsupported=${run.metrics.unsupportedClaimCount ?? 0} assumptions=${run.metrics.assumptionCount ?? 0}`
-    : "";
-  return repair || evidence ? ` [${[repair.trim(), evidence.trim()].filter(Boolean).join(" ")}]` : "";
 }
 
 async function bundleDiagnostics(options: CliOptions): Promise<CliDiagnosticsResult> {

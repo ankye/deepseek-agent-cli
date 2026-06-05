@@ -25,3 +25,10 @@ CLI diagnostics 必须暴露确定性的 `diagnostics flow inspect` 命令，用
 - **THEN** it reads replay-safe audit records and usage-budget totals produced by runtime model request and usage handling
 - **AND** it does not parse provider-specific logs, raw provider responses, terminal output, or JSONL rendering artifacts as the source of truth for request or token counts
 - **中文** 当 diagnostics flow inspection、evaluation scoring 或 release-readiness evidence 需要 model request counts 或 token usage 时，必须读取 runtime model request 与 usage handling 产出的 replay-safe audit records 和 usage-budget totals；不得解析 provider-specific logs、raw provider responses、terminal output 或 JSONL rendering artifacts 作为请求数或 token 数的事实来源。
+
+#### Scenario: Diagnostics evaluation exposes public execution trace / Diagnostics Evaluate 暴露公开执行轨迹
+
+- **WHEN** `deepseek diagnostics evaluate --execute-task <id> --output text` renders an executed task run
+- **THEN** the text output includes a bounded public execution trace with instrumentation event order, final event, staged run status, active/failed stage ids, executor kinds, checker status, checker exit code, and repair stop reason when available
+- **AND** it does not render provider raw chain-of-thought, raw model request or response bodies, complete stdout/stderr, raw secrets, environment credentials, or unbounded command output
+- **中文** 当 `deepseek diagnostics evaluate --execute-task <id> --output text` 渲染已执行任务 run 时，文本输出必须包含有界的公开执行轨迹，包括 instrumentation event order、final event、staged run status、active/failed stage ids、executor kinds、checker status、checker exit code 与可用的 repair stop reason；不得渲染 provider raw chain-of-thought、raw model request/response bodies、完整 stdout/stderr、raw secrets、environment credentials 或无界 command output。

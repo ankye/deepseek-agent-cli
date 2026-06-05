@@ -1,7 +1,7 @@
 {
   "schemaVersion": "1.0.0",
   "kind": "cli.overall-delivery-capability-score.evidence",
-  "generatedAt": "2026-06-04T16:16:28.590Z",
+  "generatedAt": "2026-06-05T07:05:52.194Z",
   "command": "npx tsx src/apps/cli/src/index.ts diagnostics evaluate --full --execute-task all --live --compare-baseline deepseek-cli --provider glm --model glm-5.1 --output json",
   "invocation": {
     "schemaVersion": "1.0.0",
@@ -220,7 +220,7 @@
         "retryCount": 0,
         "evidenceManifestStatus": "passed",
         "repairMetricsAvailability": "available",
-        "repairActivationCount": 2,
+        "repairActivationCount": 0,
         "repairSuccessCount": 0
       },
       {
@@ -230,7 +230,7 @@
         "retryCount": 0,
         "evidenceManifestStatus": "passed",
         "repairMetricsAvailability": "available",
-        "repairActivationCount": 0,
+        "repairActivationCount": 2,
         "repairSuccessCount": 0
       },
       {
@@ -249,7 +249,7 @@
         "taskId": "eval.webpage.failing-first-repair",
         "outcome": "solved",
         "checkPassRate": 1,
-        "retryCount": 0,
+        "retryCount": 1,
         "evidenceManifestStatus": "passed",
         "unsupportedClaimCount": 0,
         "hallucinatedCommandCount": 0,
