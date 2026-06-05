@@ -209,6 +209,8 @@ describe("headless runtime", () => {
     assert.equal(completedFlow?.goalId, "task-goal:model-evaluation");
     assert.deepEqual(completedFlow?.planStepIds, ["task-step:model-evaluate"]);
     assert.deepEqual(completedFlow?.planPhases, ["runtime"]);
+    assert.equal(String(completed?.data.assistantText).includes("task-decision:model-evaluation"), false);
+    assert.match(String(completed?.data.assistantText), /Task decision recorded/i);
     await kernel.shutdown();
   });
 

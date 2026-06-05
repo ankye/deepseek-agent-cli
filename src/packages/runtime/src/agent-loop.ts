@@ -28,6 +28,7 @@ import type {
   SelfRepairPlan,
   SelfRepairVerificationSummary,
   SessionId,
+  TaskDecisionEnvelope,
   TraceContext,
   TurnId,
   VisibleReasoningProjection,
@@ -1086,6 +1087,7 @@ export async function* runAgentLoop(
         const decisionReceived = agentLoopEvent("task.decision.received", sessionId, turnId, trace, taskDecisionEnvelopeEventData(decisionEnvelope, taskDeliveryFlowData), request.agentId);
         await recordRuntimeAdapterEvent(deps, decisionReceived);
         yield decisionReceived;
+        assistantText = taskDecisionRuntimeStatus(decisionEnvelope);
       }
       if (evidenceFirst?.classification.evidenceRequired) {
         const grounding = groundStrictClaims(assistantText, evidenceFirst);
@@ -1239,6 +1241,13 @@ export async function* runAgentLoop(
     diagnostics.push(error);
     yield* emitFailureWithRepair("rejected", "model-iteration-limit", error);
   }
+}
+
+function taskDecisionRuntimeStatus(envelope: TaskDecisionEnvelope): string {
+  return [
+    "Task decision recorded.",
+    `Runtime execution, proof collection, and acceptance review are still required before delivery; planned steps=${envelope.planSteps.length}.`
+  ].join(" ");
 }
 
 function modelOutputOptions(request: AgentLoopRequest): ModelOutputOptions | undefined {
