@@ -15,7 +15,8 @@ import type {
   TaskGoal,
   TaskGuidanceEvent,
   TaskIntentKind,
-  TaskRiskLevel
+  TaskRiskLevel,
+  JsonObject
 } from "@deepseek/platform-contracts";
 import {
   TASK_DELIVERY_FLOW_COMPATIBILITY,
@@ -309,6 +310,31 @@ export function createTaskDeliveryFlowSummary(options: CreateTaskDeliveryFlowSum
     diagnostics: brief.needsUserConfirmation ? [diagnostic("TASK_BRIEF_NEEDS_USER_CONFIRMATION", "Task brief requires user confirmation before execution.")] : [],
     compatibility: TASK_DELIVERY_FLOW_COMPATIBILITY,
     redaction: { class: "internal", fields: ["brief.rawInput"] }
+  };
+}
+
+export function taskDeliveryFlowEventData(summary: TaskDeliveryFlowSummary): JsonObject {
+  return {
+    schemaVersion: summary.schemaVersion,
+    summaryId: summary.summaryId,
+    briefId: summary.brief.briefId,
+    decisionRequestId: summary.decisionRequest.requestId,
+    ...(summary.decisionEnvelope ? { decisionId: summary.decisionEnvelope.decisionId } : {}),
+    goalId: summary.goal.goalId,
+    planId: summary.plan.planId,
+    intentKind: summary.brief.intentKind,
+    normalizedIntent: summary.brief.intentKind === "unknown" ? "unknown task input" : summary.brief.normalizedIntent,
+    confidence: summary.brief.confidence,
+    needsUserConfirmation: summary.brief.needsUserConfirmation,
+    planningMode: summary.plan.planningMode,
+    acceptanceDecision: summary.acceptance.decision,
+    recommendedReturnPhase: summary.acceptance.recommendedReturnPhase,
+    deliveryStatus: summary.delivery.status,
+    ...(summary.delivery.nextPhase ? { nextPhase: summary.delivery.nextPhase } : {}),
+    phaseCount: summary.phases.length,
+    diagnosticCount: summary.diagnostics.length,
+    compatibility: summary.compatibility,
+    redaction: { class: "internal" }
   };
 }
 

@@ -116,6 +116,42 @@ describe("headless runtime", () => {
     await kernel.shutdown();
   });
 
+  it("attaches task delivery flow lineage to ordinary agent loop turns", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await registerRuntimeCoreTools(deps, "/workspace");
+    const kernel = await createDefaultRuntimeKernel(deps);
+    const events = await collectRuntimeEvents(runAgentLoop(deps, kernel, {
+      prompt: "继续",
+      caller: "runtime.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile
+    }));
+
+    const startedFlow = events.find((event) => event.kind === "agent.loop.started")?.data.taskDeliveryFlow as JsonObject | undefined;
+    const requestedFlow = events.find((event) => event.kind === "model.requested")?.data.taskDeliveryFlow as JsonObject | undefined;
+    assert.equal(typeof startedFlow?.summaryId, "string");
+    assert.equal(String(startedFlow?.summaryId).startsWith("task-flow:"), true);
+    assert.equal(String(startedFlow?.briefId).startsWith("task-brief:"), true);
+    assert.equal(String(startedFlow?.decisionRequestId).startsWith("task-decision-request:"), true);
+    assert.equal(String(startedFlow?.goalId).startsWith("task-goal:"), true);
+    assert.equal(String(startedFlow?.planId).startsWith("task-plan:"), true);
+    assert.equal(startedFlow?.intentKind, "coding");
+    assert.equal(startedFlow?.normalizedIntent, "continue current task");
+    assert.equal(startedFlow?.deliveryStatus, "returned");
+    assert.equal(requestedFlow?.summaryId, startedFlow?.summaryId);
+    assert.equal(requestedFlow?.planId, startedFlow?.planId);
+    assert.equal(JSON.stringify(startedFlow).includes("继续"), false);
+    const requestAudit = (await deps.observability.drain())
+      .filter((record) => record.kind === "audit")
+      .find((record) => record.name === "model.request.audit");
+    const auditFlow = requestAudit?.fields.taskDeliveryFlow as JsonObject | undefined;
+    assert.equal(auditFlow?.summaryId, startedFlow?.summaryId);
+    assert.equal(auditFlow?.planId, startedFlow?.planId);
+    assert.equal(JSON.stringify(auditFlow).includes("继续"), false);
+    await kernel.shutdown();
+  });
+
   it("records model request counts and token usage through unified audit evidence", async () => {
     const deps = { ...createDeterministicRuntimeDependencies(), models: new UsageAuditingGateway() };
     await registerRuntimeCoreTools(deps, "/workspace");
@@ -144,7 +180,7 @@ describe("headless runtime", () => {
     assert.equal(usageAudit?.fields.outputTokens, 7);
     assert.equal(usageAudit?.fields.totalTokens, 18);
     assert.equal(usageAudit?.fields.providerRequestId, "req-usage-audit");
-    assert.equal(JSON.stringify(auditRecords).includes("sk-"), false);
+    assert.equal(/\bsk-[A-Za-z0-9_-]{8,}\b/.test(JSON.stringify(auditRecords)), false);
     await kernel.shutdown();
   });
 

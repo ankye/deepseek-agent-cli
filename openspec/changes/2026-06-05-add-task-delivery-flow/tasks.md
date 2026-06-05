@@ -11,6 +11,7 @@
 - [x] 9. Record runtime model request and usage events through the unified audit/usage path.
 - [x] 10. Wire `diagnostics flow inspect` into CLI parsing, diagnostics collection, text rendering, JSON, and JSONL.
 - [x] 11. Validate OpenSpec and run focused plus broader verification.
+- [x] 12. Wire replay-safe task delivery flow lineage into ordinary agent-loop started, hook, model request, and model metadata paths.
 
 # 任务
 
@@ -25,3 +26,4 @@
 - [x] 9. 将 runtime model request 与 usage events 通过统一 audit/usage 路径记录。
 - [x] 10. 将 `diagnostics flow inspect` 接入 CLI parsing、diagnostics collection、text rendering、JSON 与 JSONL。
 - [x] 11. 校验 OpenSpec，并运行聚焦与扩大验证。
+- [x] 12. 将 replay-safe task delivery flow lineage 接入普通 agent-loop started、hook、model request 与 model metadata 路径。

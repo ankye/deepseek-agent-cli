@@ -115,6 +115,7 @@ export async function recordRuntimeModelRequestAudit(
     readonly providerId?: string;
     readonly model: string;
     readonly promptAssemblyFingerprint?: string;
+    readonly taskDeliveryFlow?: JsonObject;
   }
 ): Promise<void> {
   await deps.observability.emit({
@@ -132,6 +133,7 @@ export async function recordRuntimeModelRequestAudit(
       ...(metadata.providerId ? { providerId: metadata.providerId } : {}),
       model: metadata.model,
       ...(metadata.promptAssemblyFingerprint ? { promptAssemblyFingerprint: metadata.promptAssemblyFingerprint } : {}),
+      ...(metadata.taskDeliveryFlow ? { taskDeliveryFlow: metadata.taskDeliveryFlow } : {}),
       redaction: { class: "internal", fields: ["promptAssemblyFingerprint"] }
     },
     redaction: { class: "internal", fields: ["fields.promptAssemblyFingerprint"] }

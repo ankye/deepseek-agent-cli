@@ -57,7 +57,8 @@ export {
   createTaskDeliveryPlan,
   createTaskGoal,
   invalidateTaskDecision,
-  reviewTaskAcceptance
+  reviewTaskAcceptance,
+  taskDeliveryFlowEventData
 } from "./task-delivery-flow.js";
 export type {
   CreateTaskBriefOptions,

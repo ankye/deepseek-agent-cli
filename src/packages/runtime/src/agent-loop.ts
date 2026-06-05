@@ -74,6 +74,7 @@ import {
 } from "./modes/mode-state.js";
 import { runFinalVerification } from "./agent-loop-verification.js";
 import { projectReasoningForOutput, recordVisibleReasoning, recordVisibleReasoningProjection, visibleReasoningEvidence } from "./visible-reasoning.js";
+import { createTaskDeliveryFlowSummary, taskDeliveryFlowEventData } from "./task-delivery-flow.js";
 
 export const defaultAgentLoopLimits: AgentLoopLimits = {
   maxModelIterations: 4,
@@ -125,6 +126,8 @@ export async function* runAgentLoop(
   let visibleReasoningSequence = 0;
   let visibleReasoningRecords: VisibleReasoningRecord[] = [];
   let visibleReasoningProjection: VisibleReasoningProjection | undefined;
+  const taskDeliveryFlow = createTaskDeliveryFlowSummary({ rawInput: request.prompt, activeTaskAvailable: true });
+  const taskDeliveryFlowData = taskDeliveryFlowEventData(taskDeliveryFlow);
   const signal = control.signal;
 
   const currentRepairOutcome = (): SelfRepairOutcomeSummary => outcomeFromState({
@@ -339,6 +342,7 @@ export async function* runAgentLoop(
     workspaceRoot: request.workspaceRoot,
     model: request.profile.model,
     ...(request.referenceContext ? { referenceContext: referenceContextSummary(request) } : {}),
+    taskDeliveryFlow: taskDeliveryFlowData,
     limits
   }, request.agentId);
   await recordRuntimeAdapterEvent(deps, started);
@@ -380,6 +384,7 @@ export async function* runAgentLoop(
     promptHash: stableHash(request.prompt),
     caller: request.caller,
     workspaceRoot: request.workspaceRoot,
+    taskDeliveryFlow: taskDeliveryFlowData,
     ...(request.referenceContext ? { referenceContext: request.referenceContext } : {})
   });
   if (userInputResult.status === "blocked") {
@@ -566,7 +571,8 @@ export async function* runAgentLoop(
       },
       ...(assembly.trace.pipeline ? { contextPipeline: assembly.trace.pipeline } : {}),
       ...(evidenceFirst ? { evidenceFirst: evidenceFirstEventData(evidenceFirst) } : {}),
-      ...(contextProjection ? { contextProjection: projectionEventData(contextProjection) } : {})
+      ...(contextProjection ? { contextProjection: projectionEventData(contextProjection) } : {}),
+      taskDeliveryFlow: taskDeliveryFlowData
     });
     if (modelBeforeResult.status === "blocked") {
       diagnostics.push({ code: "HOOK_BLOCKED", message: "model-call.before hook blocked this iteration", retryable: false, redaction: { class: "internal" } });
@@ -617,6 +623,7 @@ export async function* runAgentLoop(
       ...(assembly.trace.pipeline ? { contextPipeline: assembly.trace.pipeline } : {}),
       ...(evidenceFirst ? { evidenceFirst: evidenceFirstEventData(evidenceFirst) } : {}),
       ...(contextProjection ? { contextProjection: projectionEventData(contextProjection) } : {}),
+      taskDeliveryFlow: taskDeliveryFlowData,
       ...(request.referenceContext ? { referenceContext: referenceContextSummary(request) } : {})
     }, request.agentId);
     await recordRuntimeAdapterEvent(deps, modelRequested);
@@ -625,7 +632,8 @@ export async function* runAgentLoop(
       requestCount: 1,
       providerId: String(request.profile.providerId),
       model: request.profile.model,
-      promptAssemblyFingerprint: assembly.fingerprint
+      promptAssemblyFingerprint: assembly.fingerprint,
+      taskDeliveryFlow: taskDeliveryFlowData
     });
     yield modelRequested;
 
@@ -649,6 +657,7 @@ export async function* runAgentLoop(
         trace,
         outputMode: request.outputMode,
         ...(contextProjection ? { contextProjection: projectionEventData(contextProjection) } : {}),
+        taskDeliveryFlow: taskDeliveryFlowData,
         promptAssembly: {
           fingerprint: assembly.fingerprint,
           budget: assembly.budget,
