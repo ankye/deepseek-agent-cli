@@ -12,6 +12,7 @@ import type {
   PromptAssemblyResult,
   RuntimeDependencies,
   SessionId,
+  TaskDecisionRequest,
   TraceContext,
   TurnId
 } from "@deepseek/platform-contracts";
@@ -32,6 +33,7 @@ export async function assemblePromptForIteration(
   mode?: {
     readonly phasePlan?: AgentPhasePlan | undefined;
     readonly reasoningEffortMapping?: AgentReasoningEffortMapping | undefined;
+    readonly taskDecision?: TaskDecisionRequest | undefined;
   }
 ): Promise<PromptAssemblyResult> {
   const assembler = deps.promptAssembler ?? createDefaultPromptAssembler();
@@ -51,6 +53,7 @@ export async function assemblePromptForIteration(
     history: messages,
     ...(contextProjection ? { contextProjection } : {}),
     ...(contextProjection?.pipeline ? { contextPipelineManifest: contextProjection.pipeline } : {}),
+    ...(mode?.taskDecision ? { taskDecision: mode.taskDecision } : {}),
     ...(evidenceFirst ? { evidenceFirst } : {}),
     ...(selfRepair ? { selfRepair } : {}),
     ...(request.projectRules ? { projectRules: request.projectRules } : {}),

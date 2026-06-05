@@ -549,7 +549,8 @@ export async function* runAgentLoop(
     const availableCapabilities = await deps.capabilities.listModelVisible();
     const assembly = await assemblePromptForIteration(deps, request, sessionId, turnId, trace, messages, contextProjection, availableCapabilities, limits, evidenceFirst, currentRepairOutcome(), {
       phasePlan,
-      reasoningEffortMapping
+      reasoningEffortMapping,
+      taskDecision: taskDeliveryFlow.decisionRequest
     });
     if (assembly.status === "rejected") {
       diagnostics.push(...assembly.diagnostics);

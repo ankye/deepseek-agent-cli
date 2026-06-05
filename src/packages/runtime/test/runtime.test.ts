@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentLoopReferenceContext, JsonObject, ModelGateway, ModelRequest, ModelStreamEvent, PolicyDecision, PolicyEngine, PolicyRequest } from "@deepseek/platform-contracts";
+import type { AgentLoopReferenceContext, JsonObject, ModelGateway, ModelRequest, ModelStreamEvent, PolicyDecision, PolicyEngine, PolicyRequest, PromptAssembler, PromptAssemblyInput, PromptAssemblyResult } from "@deepseek/platform-contracts";
 import { collectRuntimeEvents, createDefaultRuntimeKernel, createHeadlessRuntime, registerRuntimeCoreTools, runAgentLoop, runtimeEchoCapability } from "../src/index.js";
 import { createDeterministicRuntimeDependencies } from "@deepseek/testing-regression";
 import { defaultDeepSeekProfile } from "@deepseek/model-gateway";
@@ -149,6 +149,32 @@ describe("headless runtime", () => {
     assert.equal(auditFlow?.summaryId, startedFlow?.summaryId);
     assert.equal(auditFlow?.planId, startedFlow?.planId);
     assert.equal(JSON.stringify(auditFlow).includes("继续"), false);
+    await kernel.shutdown();
+  });
+
+  it("passes task decision requests through prompt assembly without extra model requests", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    if (!deps.promptAssembler) throw new Error("expected deterministic prompt assembler");
+    const promptAssembler = new CapturingPromptAssembler(deps.promptAssembler);
+    const loopDeps = { ...deps, promptAssembler };
+    await registerRuntimeCoreTools(loopDeps, "/workspace");
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "跑分",
+      caller: "runtime.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile
+    }));
+
+    assert.equal(promptAssembler.inputs.length, 1);
+    const taskDecision = promptAssembler.inputs[0]?.taskDecision;
+    assert.equal(taskDecision?.brief.normalizedIntent, "run evaluation score");
+    assert.equal(taskDecision?.riskLevel, "medium");
+    assert.equal(taskDecision?.outputSchema?.kind, "TaskDecisionEnvelope");
+    assert.equal(events.filter((event) => event.kind === "model.requested").length, 1);
+    const requestedFlow = events.find((event) => event.kind === "model.requested")?.data.taskDeliveryFlow as JsonObject | undefined;
+    assert.equal(requestedFlow?.decisionRequestId, taskDecision?.requestId);
     await kernel.shutdown();
   });
 
@@ -1100,6 +1126,17 @@ class CapturingModelGateway implements ModelGateway {
 
   async countTokens(text: string): Promise<number> {
     return text.trim() ? text.trim().split(/\s+/).length : 0;
+  }
+}
+
+class CapturingPromptAssembler implements PromptAssembler {
+  readonly inputs: PromptAssemblyInput[] = [];
+
+  constructor(private readonly delegate: PromptAssembler) {}
+
+  async assemble(input: PromptAssemblyInput): Promise<PromptAssemblyResult> {
+    this.inputs.push(input);
+    return this.delegate.assemble(input);
   }
 }
 
