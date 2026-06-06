@@ -4,6 +4,9 @@ import type {
   AgentLoopOutputContractVerification,
   AgentLoopRequest,
   AgentLoopSummary,
+  EvidenceFactClass,
+  EvidenceFirstRuntimeContext,
+  EvidenceItem,
   AgentModeSessionSummary,
   AgentPhasePlan,
   AgentReasoningEffortMapping,
@@ -35,7 +38,7 @@ import type {
   VisibleReasoningRecord,
   VisibleReasoningStatus
 } from "@deepseek/platform-contracts";
-import { asId } from "@deepseek/platform-contracts";
+import { EVIDENCE_FIRST_COMPATIBILITY, EVIDENCE_FIRST_SCHEMA_VERSION, asId } from "@deepseek/platform-contracts";
 import { projectAgentLoopContext, projectionEventData } from "./context-projection.js";
 import { kernelError, toolIntentError } from "./errors.js";
 import { createEvidenceFirstRuntimeContext, evidenceFirstEventData, groundStrictClaims } from "./evidence-first.js";
@@ -122,7 +125,7 @@ export async function* runAgentLoop(
   const restoredHistory = await restoreSessionHistory(deps, sessionId);
   const messages: ModelChatMessage[] = [...restoredHistory.messages, { role: "user", content: request.prompt }];
   let contextProjection: ContextProjectionResult | undefined;
-  let evidenceFirst: import("@deepseek/platform-contracts").EvidenceFirstRuntimeContext | undefined;
+  let evidenceFirst: EvidenceFirstRuntimeContext | undefined;
   let phasePlan: AgentPhasePlan | undefined;
   let modeSummary: AgentModeSessionSummary | undefined;
   let interactionModeState: InteractionModeState | undefined;
@@ -257,9 +260,11 @@ export async function* runAgentLoop(
           yield verificationCompleted;
           const stopped = await repairEvent(deps, "agent.repair.stopped", sessionId, turnId, trace, stopPayload({ stopReason: "completed", classification, plan, attempt: attemptCompleted }), request.agentId);
           repairStopReason = "completed";
-          repairContinuationRequested = true;
           yield stopped;
-          return true;
+          if (iterations < limits.maxModelIterations) {
+            repairContinuationRequested = true;
+            return true;
+          }
         }
       } else {
         const stopped = await repairEvent(deps, "agent.repair.stopped", sessionId, turnId, trace, stopPayload({ stopReason: decision.stopReason, classification }), request.agentId);
@@ -917,7 +922,7 @@ export async function* runAgentLoop(
           input: toolInput,
           sessionId,
           turnId,
-          timeoutMs: limits.toolTimeoutMs,
+          timeoutMs: toolTimeoutFor(toolInput, limits.toolTimeoutMs),
           trace
         };
         const toolEvents = await collectRuntimeEvents(kernel.execute({
@@ -931,15 +936,18 @@ export async function* runAgentLoop(
         const terminal = lastRuntimeEvent(toolEvents, (event) => event.kind === "capability.completed" || event.kind === "capability.failed" || event.kind === "capability.cancelled" || event.kind === "execution.rejected");
         const toolResultText = modelToolResultText(terminal);
         messages.push({ role: "tool", content: toolResultText, toolCallId, toolName });
+        const feedbackStatus = executionFeedbackStatus(terminal);
+        const recoverableToolFailure = isRecoverableToolError(terminal?.error);
         const executionFeedback = buildToolResultFeedback({
           toolCallId,
           toolName,
           capabilityId: String(preflight.capabilityId),
-          status: executionFeedbackStatus(terminal),
+          status: feedbackStatus,
           text: toolResultText,
           diagnostics: terminal?.error ? [terminal.error] : [],
           trace,
-          limitBytes: limits.maxOutputBytes
+          limitBytes: limits.maxOutputBytes,
+          ...(terminal?.kind === "capability.completed" || recoverableToolFailure ? { continuation: "continue" as const } : {})
         });
         const resultEvent = agentLoopEvent("model.tool.result", sessionId, turnId, trace, {
           toolCallId,
@@ -954,7 +962,7 @@ export async function* runAgentLoop(
             terminalKind: terminal?.kind ?? "unknown",
             feedback: executionFeedback
           })
-        }, request.agentId, terminal?.error);
+        }, request.agentId, recoverableToolFailure ? undefined : terminal?.error);
         await recordRuntimeAdapterEvent(deps, resultEvent);
         yield resultEvent;
         const toolResultReasoning = await emitVisibleReasoning({
@@ -1090,8 +1098,9 @@ export async function* runAgentLoop(
         assistantText = taskDecisionRuntimeStatus(decisionEnvelope);
       }
       if (evidenceFirst?.classification.evidenceRequired) {
-        const grounding = groundStrictClaims(assistantText, evidenceFirst);
-        evidenceFirst = { ...evidenceFirst, summary: grounding.summary };
+        const groundingContext = withToolResultEvidence(evidenceFirst, toolEvidenceEvents, sessionId, turnId, trace);
+        const grounding = groundStrictClaims(assistantText, groundingContext);
+        evidenceFirst = { ...groundingContext, summary: grounding.summary };
         const groundedEvent = agentLoopEvent("evidence.claims.grounded", sessionId, turnId, trace, {
           schemaVersion: evidenceFirst.schemaVersion,
           claimGroundingCount: grounding.claimGroundings.length,
@@ -1250,6 +1259,75 @@ function taskDecisionRuntimeStatus(envelope: TaskDecisionEnvelope): string {
   ].join(" ");
 }
 
+function withToolResultEvidence(
+  context: EvidenceFirstRuntimeContext,
+  toolEvents: readonly RuntimeEvent[],
+  sessionId: SessionId,
+  turnId: TurnId,
+  trace: TraceContext
+): EvidenceFirstRuntimeContext {
+  const existingFingerprints = new Set(context.selectedEvidence.map((item) => item.fingerprint));
+  const toolEvidence: EvidenceItem[] = [];
+  for (const event of toolEvents) {
+    if (event.kind !== "model.tool.result") continue;
+    const feedback = event.data.feedback;
+    if (!isToolFeedbackRecord(feedback)) continue;
+    const preview = feedback.preview;
+    if (!preview || typeof preview.text !== "string" || preview.text.trim().length === 0) continue;
+    const fingerprint = `tool-result:${stableHash(`${feedback.toolCallId}:${preview.text}`)}`;
+    if (existingFingerprints.has(fingerprint)) continue;
+    existingFingerprints.add(fingerprint);
+    toolEvidence.push({
+      schemaVersion: EVIDENCE_FIRST_SCHEMA_VERSION,
+      evidenceId: `evidence:${fingerprint}`,
+      sourceGroup: "runtime-record",
+      sourcePath: `tool:${feedback.toolName}:${feedback.toolCallId}`,
+      sourceLabel: `${feedback.toolName} result`,
+      factClasses: toolResultFactClasses(feedback.toolName, feedback.status),
+      preview: preview.text,
+      fingerprint,
+      freshness: { status: "current" },
+      trace: {
+        traceId: trace.traceId,
+        sessionId,
+        turnId
+      },
+      compatibility: EVIDENCE_FIRST_COMPATIBILITY,
+      redaction: { class: "internal", fields: ["preview"] }
+    });
+  }
+  if (toolEvidence.length === 0) return context;
+  return {
+    ...context,
+    selectedEvidence: [...context.selectedEvidence, ...toolEvidence],
+    summary: {
+      ...context.summary,
+      evidenceItemCount: context.summary.evidenceItemCount + toolEvidence.length
+    }
+  };
+}
+
+function isToolFeedbackRecord(value: unknown): value is {
+  readonly toolCallId: string;
+  readonly toolName: string;
+  readonly status: string;
+  readonly preview?: { readonly text?: string };
+} {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return typeof record.toolCallId === "string" && typeof record.toolName === "string" && typeof record.status === "string";
+}
+
+function toolResultFactClasses(toolName: string, status: string): readonly EvidenceFactClass[] {
+  const classes = new Set<EvidenceFactClass>(["feature", "code", "evaluation"]);
+  const lowerTool = toolName.toLowerCase();
+  const lowerStatus = status.toLowerCase();
+  if (lowerTool.includes("shell") || lowerTool.includes("command")) classes.add("command");
+  if (lowerTool.includes("file") || lowerTool.includes("search")) classes.add("docs");
+  if (lowerStatus !== "success") classes.add("architecture");
+  return [...classes].sort((left, right) => left.localeCompare(right));
+}
+
 function modelOutputOptions(request: AgentLoopRequest): ModelOutputOptions | undefined {
   const contract = request.outputContract;
   if (contract?.kind !== "json-object" && contract?.kind !== "command-plan") return undefined;
@@ -1383,6 +1461,20 @@ function stringValue(value: unknown): string | undefined {
 
 function jsonObjectValue(value: unknown): JsonObject | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? value as JsonObject : undefined;
+}
+
+function isRecoverableToolError(error: RedactedError | undefined): boolean {
+  if (!error) return false;
+  if (error.code === "KERNEL_SCHEDULER_TIMEOUT") return true;
+  if (error.code !== "KERNEL_EXECUTOR_FAILED") return false;
+  const details = jsonObjectValue(error.details);
+  return typeof details?.originalCode === "string" && details.originalCode.length > 0;
+}
+
+function toolTimeoutFor(input: unknown, maxToolTimeoutMs: number): number {
+  const requested = jsonObjectValue(input)?.timeoutMs;
+  if (typeof requested !== "number" || !Number.isFinite(requested) || requested <= 0) return maxToolTimeoutMs;
+  return Math.min(Math.floor(requested), maxToolTimeoutMs);
 }
 
 function hasEligibleRepairCheckpoint(deps: RuntimeDependencies, sessionId: SessionId, turnId: TurnId): boolean {

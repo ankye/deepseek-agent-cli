@@ -70,9 +70,13 @@ export function modelToolResultText(event: RuntimeEvent | undefined): string {
     const evidence = output.evidence;
     if (isJsonObjectForRuntime(evidence)) {
       const preview = evidence.preview;
-      if (isJsonObjectForRuntime(preview) && typeof preview.text === "string") return preview.text;
+      const status = typeof evidence.status === "string" ? evidence.status : "completed";
+      const capabilityId = typeof event.data.capabilityId === "string" ? event.data.capabilityId : "tool";
+      if (isJsonObjectForRuntime(preview) && typeof preview.text === "string") {
+        return status === "completed" ? preview.text : `Tool ${capabilityId} reported ${status}:\n${preview.text}`;
+      }
       return JSON.stringify({
-        status: evidence.status ?? "completed",
+        status,
         tool: evidence.tool ?? "",
         affectedPaths: evidence.affectedPaths ?? []
       });

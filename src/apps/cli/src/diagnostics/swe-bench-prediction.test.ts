@@ -18,12 +18,12 @@ class FakeSweBenchPlatform extends FakePlatformRuntime {
       return {
         exitCode: 0,
         stdout: [
-          "diff --git a/astropy/modeling/separable.py b/astropy/modeling/separable.py",
-          "--- a/astropy/modeling/separable.py",
-          "+++ b/astropy/modeling/separable.py",
-          "@@ -250,7 +250,7 @@",
-          "-        cright[-right.shape[0]:, -right.shape[1]:] = 1",
-          "+        cright[-right.shape[0]:, -right.shape[1]:] = right",
+          "diff --git a/src/example.py b/src/example.py",
+          "--- a/src/example.py",
+          "+++ b/src/example.py",
+          "@@ -1,2 +1,2 @@",
+          "-result = old_value",
+          "+result = new_value",
           ""
         ].join("\n"),
         stderr: "",
@@ -43,10 +43,10 @@ describe("SWE-bench prediction adapter", () => {
   it("runs the selected CLI provider and writes official prediction JSONL", async () => {
     const platform = new FakeSweBenchPlatform("fake");
     await platform.writeFile("/workspace/instance.json", JSON.stringify({
-      instance_id: "astropy__astropy-12907",
-      repo: "astropy/astropy",
-      base_commit: "d16bfe05a744909de4b27f5875fe0d4ed41ce607",
-      problem_statement: "Nested CompoundModels should preserve separability matrices."
+      instance_id: "demo__repo-1",
+      repo: "demo/repo",
+      base_commit: "0123456789abcdef0123456789abcdef01234567",
+      problem_statement: "Demo issue should update the placeholder value."
     }));
 
     const summary = await collectSweBenchPrediction({
@@ -67,10 +67,10 @@ describe("SWE-bench prediction adapter", () => {
     const child = platform.executedCommands.find((entry) => entry.command === process.execPath);
 
     assert.equal(summary.status, "pass");
-    assert.equal(prediction?.instance_id, "astropy__astropy-12907");
+    assert.equal(prediction?.instance_id, "demo__repo-1");
     assert.equal(prediction?.model_name_or_path, "glm-5.1");
-    assert.equal(prediction?.model_patch.includes("cright[-right.shape[0]:, -right.shape[1]:] = right"), true);
-    assert.equal(written.instance_id, "astropy__astropy-12907");
+    assert.equal(prediction?.model_patch.includes("result = new_value"), true);
+    assert.equal(written.instance_id, "demo__repo-1");
     assert.equal(child?.cwd, "/workspace/repo");
     assert.equal(child?.args.includes("--provider"), true);
     assert.equal(child?.args.includes("glm"), true);
@@ -104,8 +104,8 @@ describe("SWE-bench prediction adapter", () => {
   it("renders structured JSONL records for predictions and diagnostics", async () => {
     const platform = new FakeSweBenchPlatform("fake");
     await platform.writeFile("/workspace/instance.json", JSON.stringify({
-      instance_id: "astropy__astropy-12907",
-      problem_statement: "Nested CompoundModels should preserve separability matrices."
+      instance_id: "demo__repo-1",
+      problem_statement: "Demo issue should update the placeholder value."
     }));
     const summary = await collectSweBenchPrediction({
       action: "predict",
@@ -127,7 +127,7 @@ describe("SWE-bench prediction adapter", () => {
       const prediction = record.prediction;
       return record.kind === "diagnostics.swe-bench.prediction"
         && isRecord(prediction)
-        && prediction.instance_id === "astropy__astropy-12907";
+        && prediction.instance_id === "demo__repo-1";
     }), true);
   });
 });

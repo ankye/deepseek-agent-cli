@@ -30,4 +30,21 @@ describe("cli model selection", () => {
       maxOutputBytes: 96_000
     });
   });
+
+  it("widens GLM budgets for user-realistic SWE-bench prompts", () => {
+    const prompt = "给我完成 SWE-bench Lite 第 1 题测试，跑通并告诉我结果。";
+    const profile = resolveCliModelProfile({
+      modelProvider: "glm",
+      model: "glm-5.1",
+      prompt
+    });
+
+    assert.equal(profile.providerOptions?.max_tokens, 8192);
+    assert.deepEqual(resolveCliAgentLoopLimits(prompt), {
+      maxModelIterations: 48,
+      maxToolCalls: 96,
+      toolTimeoutMs: 180_000,
+      maxOutputBytes: 96_000
+    });
+  });
 });

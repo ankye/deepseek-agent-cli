@@ -33,6 +33,47 @@ export function resolveToolPath(deps: CoreCodingToolsDependencies, workspaceRoot
   return deps.platform.resolveWorkspacePath(workspaceRoot ?? deps.workspaceRoot, path);
 }
 
+export function isModelVisibleWorkspaceRelativePath(path: string): boolean {
+  const normalized = normalizeWorkspacePath(path).replace(/^\.\//, "");
+  if (hasHiddenModelVisibleSegment(normalized)) return false;
+  if (!normalized.startsWith(".deepseek/")) return true;
+  return !isInternalEvaluationArtifactPath(normalized);
+}
+
+export function workspaceRelativePath(root: string, path: string): string {
+  const normalizedRoot = normalizeWorkspacePath(root).replace(/\/$/, "");
+  const normalizedPath = normalizeWorkspacePath(path);
+  if (normalizedPath === normalizedRoot) return "";
+  return normalizedPath.startsWith(`${normalizedRoot}/`)
+    ? normalizedPath.slice(normalizedRoot.length + 1)
+    : normalizedPath;
+}
+
+function isInternalEvaluationArtifactPath(path: string): boolean {
+  return (
+    path === ".deepseek/evaluation-boundary-runs" ||
+    path.startsWith(".deepseek/evaluation-boundary-runs/") ||
+    path === ".deepseek/swebench-predictions" ||
+    path.startsWith(".deepseek/swebench-predictions/") ||
+    path === ".deepseek/swebench-reports" ||
+    path.startsWith(".deepseek/swebench-reports/") ||
+    path === ".deepseek/swebench-runs" ||
+    path.startsWith(".deepseek/swebench-runs/") ||
+    path === ".deepseek/swebench-venv" ||
+    path.startsWith(".deepseek/swebench-venv/") ||
+    path === ".deepseek/swe-lite-runs" ||
+    path.startsWith(".deepseek/swe-lite-runs/")
+  );
+}
+
+function hasHiddenModelVisibleSegment(path: string): boolean {
+  return path.split("/").some((segment) => segment === ".pytest_cache" || segment === ".venv" || segment === "__pycache__");
+}
+
+function normalizeWorkspacePath(path: string): string {
+  return path.replace(/\\/g, "/").replace(/\/+/g, "/").replace(/\/$/, "");
+}
+
 export function countOccurrences(content: string, expected: string): number {
   if (expected.length === 0) return 0;
   let count = 0;

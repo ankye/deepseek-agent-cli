@@ -12,6 +12,12 @@ For SWE-bench Lite style tests, the prompt sent to the CLI should look like a re
 
 对于 SWE-bench Lite 这类测试，发送给 CLI 的 prompt 应该像真实用户请求，例如：`给我完成 SWE-bench Lite 第 1 题测试，跑通并告诉我结果。` prompt 可以指明 benchmark family 与请求的题号，但不得包含预收集 instance metadata、正确 patch 位置、预期代码改动、隐藏拆解、harness command recipe 或评测员编写的验收标准。
 
+## Execution Envelope
+
+The evaluator may configure a neutral execution envelope around the prompt, such as provider, model, tool projection, timeout, and task-family budget. The envelope may let the CLI recognize that a SWE-bench prompt needs enough planning and tool-call budget to run, but it must not carry resolved instance metadata, target files, expected patches, harness recipes, or hidden decomposition.
+
+评测员可以在 prompt 外配置中性的执行信封，例如 provider、model、tool projection、timeout 与 task-family budget。执行信封可以让 CLI 识别 SWE-bench prompt 需要足够的规划和工具调用预算来运行，但不得携带已解析 instance metadata、目标文件、预期 patch、harness recipe 或隐藏拆解。
+
 ## Autonomy Requirement
 
 The CLI owns the work after the prompt is sent. It must discover which instance is meant, prepare or locate benchmark assets, inspect the repository, decide the plan, call tools, mutate the repo, collect the patch, run the official or configured verifier, and summarize the result. If it cannot do one of those steps, that is evidence: product gap, environment gap, tool gap, or model capability failure.
@@ -35,3 +41,27 @@ The same boundary applies when a maintainer guides a coding agent such as Codex 
 Evaluation reports should show what the CLI did: prompt digest, plan summary, tool calls, tool outcomes, repo changes, verifier command, verifier result, retries, and failure classification. Reports must not expose hidden chain-of-thought or raw provider reasoning; visible reasoning is an audit summary, not a transcript of private model cognition.
 
 评测报告应该展示 CLI 做了什么：prompt digest、plan summary、tool calls、tool outcomes、repo changes、verifier command、verifier result、retries 与 failure classification。报告不得暴露 hidden chain-of-thought 或 raw provider reasoning；visible reasoning 是审计摘要，不是私有模型认知 transcript。
+
+## Runtime Evidence Grounding
+
+Final answer acceptance must be grounded against both pre-dispatch project evidence and bounded runtime tool-result evidence. Tool-result evidence is the same redacted, size-limited preview that was already visible to the model and recorded in the audit trail; it must not reopen raw caches or unbounded command output. This prevents a completed run from being rejected only because the final answer cites a diff line, test result, or file content discovered during execution rather than during initial evidence selection.
+
+最终答案验收必须同时使用模型调度前的 project evidence 与有界 runtime tool-result evidence。tool-result evidence 使用已经展示给模型并写入 audit trail 的脱敏、限长 preview；不得重新打开原始 cache 或无限 command output。这样可以避免 run 已经完成修复，却仅因为最终答案引用的是执行过程中发现的 diff line、test result 或 file content，而不是初始 evidence selection 中的内容，就被误判失败。
+
+## Model-Visible Workspace Hygiene
+
+The measured CLI may use clean benchmark workspaces under the product-controlled `.deepseek/swebench-workspaces` area, but model-visible read, list, glob, and search tools must hide evaluator artifacts and runtime caches. Hidden model-visible segments include prior evaluation outputs, harness reports, `.pytest_cache`, `__pycache__`, and local virtual environment internals such as `.venv`. Governed shell execution may still use `.venv` inside the benchmark repository for dependency setup and verification; the restriction is about model-visible evidence, not about disabling the repo-local test environment.
+
+被测 CLI 可以使用产品控制的 `.deepseek/swebench-workspaces` 下的干净 benchmark workspace，但模型可见的 read、list、glob 与 search 工具必须隐藏评测员产物与运行缓存。模型不可见的 segment 包括历史 evaluation output、harness report、`.pytest_cache`、`__pycache__` 与 `.venv` 等本地 virtual environment 内部文件。受治理的 shell execution 仍可在 benchmark repository 内使用 `.venv` 做依赖安装与验证；这个限制针对模型可见 evidence，不是禁用 repo-local test environment。
+
+## Tool Preflight Repair Boundary
+
+Tool-intent preflight should repair model-authored absolute paths that are provably inside the active workspace root by converting them to executor-safe relative paths. Absolute paths outside the workspace, home-directory paths, parent traversal, null bytes, and ambiguous drive-relative paths remain rejected. This keeps full-access benchmark runs ergonomic without weakening the workspace boundary.
+
+tool-intent preflight 应该将模型生成且可证明位于 active workspace root 内的绝对路径修复为 executor-safe relative path。workspace 外绝对路径、home-directory path、parent traversal、null byte 与 ambiguous drive-relative path 仍必须拒绝。这样可以让 full-access benchmark run 更顺手，同时不削弱 workspace 边界。
+
+## Verification Stop Policy
+
+SWE-style runs should prefer focused proof over open-ended environment setup. Once a focused reproduction or repository test passes for the target behavior and a source diff exists, the CLI should stop chasing broad dependency installation or full-suite execution unless the focused evidence contradicts the claimed fix. Missing optional dependencies or broad-suite environment failures become reported verification gaps, not an instruction to keep spending turns.
+
+SWE 类 run 应优先使用 focused proof，而不是开放式环境搭建。一旦目标行为的 focused reproduction 或 repository test 已通过并且存在 source diff，CLI 应停止继续追 broad dependency installation 或 full-suite execution，除非 focused evidence 与 claimed fix 相互矛盾。缺失 optional dependency 或 broad-suite environment failure 应作为 verification gap 报告，而不是继续消耗轮次的指令。

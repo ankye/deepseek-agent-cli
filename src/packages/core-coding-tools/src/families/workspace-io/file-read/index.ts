@@ -8,7 +8,7 @@ import type {
 import { boundedText, defineToolManifest, failure, isDiagnostic, objectSchema, replay, success, undefinedError } from "../../../shared/tool-kit.js";
 import { coreToolIds } from "../../../shared/ids.js";
 import type { CoreCodingToolsDependencies } from "../../../shared/workspace.js";
-import { requireDeps, resolveToolPath } from "../../../shared/workspace.js";
+import { isModelVisibleWorkspaceRelativePath, requireDeps, resolveToolPath } from "../../../shared/workspace.js";
 
 const IMAGE_EXTENSIONS: ReadonlyMap<string, string> = new Map([
   [".png", "image/png"],
@@ -45,6 +45,9 @@ async function readFileTool(input: JsonObject, context: CapabilityExecutionConte
   const path = resolveToolPath(deps, parsed.workspaceRoot, parsed.path);
   if (!path.ok || !path.value) return failure("file.read", "PATH_REJECTED", path.error?.message ?? "Path rejected.", [String(parsed.path ?? "")]);
   const absolutePath = path.value.path;
+  if (!isModelVisibleWorkspaceRelativePath(path.value.relativePath)) {
+    return failure("file.read", "INTERNAL_ARTIFACT_REJECTED", "Internal evaluation artifacts are not model-visible through file.read.", [absolutePath]);
+  }
 
   const imageMime = detectImageMime(absolutePath);
   if (imageMime) {

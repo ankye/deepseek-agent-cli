@@ -13,12 +13,16 @@ DeepSeek CLI 评测必须衡量 CLI 从真实用户请求出发能完成什么�
 - Define evaluator intervention boundaries: observe, classify, and fix reusable CLI framework bugs, but do not solve benchmark tasks or inject task-specific hints.
 - Require reruns after framework fixes to use the same entry prompt and a clean benchmark workspace.
 - Require visible audit trails for plan/tool/result/failure/retry evidence without exposing hidden reasoning.
+- Require final acceptance grounding to use bounded runtime tool-result evidence, so verified diffs and test outputs are not rejected as unsupported claims.
+- Keep benchmark-local caches and virtualenv internals out of model-visible file tools while still allowing governed shell execution inside the repository.
 
 - 将真实用户风格短 prompt 定义为发送给被测 CLI 的唯一任务指令。
 - 要求被测 CLI 自己收集 benchmark 上下文、拆解工作、执行工具、验证并报告。
 - 定义评测员干预边界：可以观察、分类、修复可复用 CLI 框架缺陷，但不得代做 benchmark task 或注入题目专用提示。
 - 要求框架修复后的重跑使用同一个入口 prompt 与干净 benchmark workspace。
 - 要求暴露 plan/tool/result/failure/retry 的可审计轨迹，但不暴露隐藏 reasoning。
+- 要求最终验收 grounding 使用有界 runtime tool-result evidence，避免已验证的 diff 与 test output 被误判为 unsupported claim。
+- 将 benchmark 本地 cache 与 virtualenv 内部文件从模型可见文件工具中隐藏，同时仍允许在 repository 内受治理地执行 shell 验证。
 
 ## Non-Goals
 

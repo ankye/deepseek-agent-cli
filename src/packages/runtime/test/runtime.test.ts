@@ -434,6 +434,30 @@ describe("headless runtime", () => {
     await kernel.shutdown();
   });
 
+  it("grounds final strict claims with runtime tool-result evidence", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    const gateway = new ToolEvidenceGroundingModelGateway();
+    const loopDeps = { ...deps, models: gateway };
+    await loopDeps.platform.writeFile("/workspace/README.md", "DeepSeek CLI repository evidence\n");
+    await loopDeps.platform.writeFile("/workspace/src/source.py", "cright[-right.shape[0]:, -right.shape[1]:] = 1\n");
+    await registerRuntimeCoreTools(loopDeps, "/workspace");
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "Inspect repository code and report the exact code change.",
+      caller: "runtime.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      limits: { maxModelIterations: 3 }
+    }));
+
+    assert.equal(events.some((event) => event.kind === "model.tool.result"), true);
+    assert.equal(events.some((event) => event.kind === "evidence.unsupported-claim"), false);
+    assert.equal(events.at(-1)?.kind, "agent.loop.completed");
+    assert.equal(gateway.requests.length, 2);
+    await kernel.shutdown();
+  });
+
   it("classifies speculative tasks without mandatory evidence discovery", async () => {
     const deps = createDeterministicRuntimeDependencies();
     const gateway = new CapturingModelGateway();
@@ -1115,6 +1139,28 @@ class EvidenceRevisionModelGateway implements ModelGateway {
 class StubbornUnsupportedClaimModelGateway implements ModelGateway {
   async *stream(_request: ModelRequest): AsyncIterable<ModelStreamEvent> {
     yield { kind: "delta", text: "Run npx deepseek-cli init to start." };
+    yield { kind: "finish", reason: "stop" };
+    yield { kind: "done" };
+  }
+
+  async countTokens(text: string): Promise<number> {
+    return text.trim() ? text.trim().split(/\s+/).length : 0;
+  }
+}
+
+class ToolEvidenceGroundingModelGateway implements ModelGateway {
+  readonly requests: ModelRequest[] = [];
+
+  async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    this.requests.push(request);
+    const hasToolResult = request.messages?.some((message) => message.role === "tool" && message.toolName === "core.file.read");
+    if (!hasToolResult) {
+      yield { kind: "tool-call", id: "call-read-source", name: "core.file.read", input: { path: "src/source.py" } };
+      yield { kind: "finish", reason: "tool-call" };
+      yield { kind: "done" };
+      return;
+    }
+    yield { kind: "delta", text: "```diff\n- cright[-right.shape[0]:, -right.shape[1]:] = 1\n```\n" };
     yield { kind: "finish", reason: "stop" };
     yield { kind: "done" };
   }

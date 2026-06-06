@@ -8,7 +8,7 @@ import type {
 import { boundedText, defineToolManifest, failure, objectSchema, replay, success } from "../../../shared/tool-kit.js";
 import { coreToolIds } from "../../../shared/ids.js";
 import type { CoreCodingToolsDependencies } from "../../../shared/workspace.js";
-import { requireDeps } from "../../../shared/workspace.js";
+import { isModelVisibleWorkspaceRelativePath, requireDeps, workspaceRelativePath } from "../../../shared/workspace.js";
 
 export function defineSearchTextTool(deps: CoreCodingToolsDependencies | undefined) {
   return defineToolManifest(
@@ -57,28 +57,35 @@ async function searchTextTool(input: JsonObject, context: CapabilityExecutionCon
   };
 
   if (outputMode === "files_with_matches" && !glob && contextLines === 0 && !parsed.multiline && !parsed.caseInsensitive) {
-    const results = (await platformAsRegex.searchText(parsed.pattern, root)).slice(0, limit);
+    const results = (await platformAsRegex.searchText(parsed.pattern, root))
+      .map((result) => ({ ...result, displayPath: workspaceRelativePath(root, result.path) }))
+      .filter((result) => isModelVisibleWorkspaceRelativePath(result.displayPath))
+      .slice(0, limit);
     return success("search.text", results.map((result) => result.path), {
-      preview: boundedText(results.map((result) => `${result.path}:${result.line}: ${result.text}`).join("\n"), limitBytes),
+      preview: boundedText(results.map((result) => `${result.displayPath}:${result.line}: ${result.text}`).join("\n"), limitBytes),
       provider: results[0]?.metadata,
       metadata: { pattern: parsed.pattern, count: results.length, outputMode },
       replay: replay(context)
     });
   }
 
-  const candidateFiles = [...await platformAsRegex.findFiles("", root)].filter((file) => matchesGlob(file, glob)).sort();
-  const matchesPerFile: Array<{ path: string; hits: Array<{ line: number; text: string }> }> = [];
+  const candidateFiles = [...await platformAsRegex.findFiles("", root)]
+    .map((path) => ({ path, displayPath: workspaceRelativePath(root, path) }))
+    .filter((file) => isModelVisibleWorkspaceRelativePath(file.displayPath))
+    .filter((file) => matchesGlob(file.displayPath, glob))
+    .sort();
+  const matchesPerFile: Array<{ path: string; displayPath: string; hits: Array<{ line: number; text: string }> }> = [];
   for (const filePath of candidateFiles) {
-    const content = await platformAsRegex.readFile?.(filePath).catch(() => undefined);
+    const content = await platformAsRegex.readFile?.(filePath.path).catch(() => undefined);
     if (typeof content !== "string") continue;
     const hits = parsed.multiline ? matchMultiline(content, regex) : matchLineByLine(content, regex);
-    if (hits.length > 0) matchesPerFile.push({ path: filePath, hits });
+    if (hits.length > 0) matchesPerFile.push({ path: filePath.path, displayPath: filePath.displayPath, hits });
     if (matchesPerFile.length >= limit && outputMode === "files_with_matches") break;
   }
 
   const limited = matchesPerFile.slice(0, limit);
   if (outputMode === "count") {
-    const preview = limited.map((file) => `${file.path}: ${file.hits.length}`).join("\n");
+    const preview = limited.map((file) => `${file.displayPath}: ${file.hits.length}`).join("\n");
     return success("search.text", limited.map((file) => file.path), {
       preview: boundedText(preview, limitBytes),
       metadata: { pattern: parsed.pattern, count: limited.length, outputMode, totalHits: limited.reduce((acc, file) => acc + file.hits.length, 0) },
@@ -92,7 +99,7 @@ async function searchTextTool(input: JsonObject, context: CapabilityExecutionCon
       for (const hit of file.hits) {
         const start = Math.max(0, hit.line - 1 - contextLines);
         const end = Math.min(lines.length, hit.line + contextLines);
-        const slice = lines.slice(start, end).map((text, index) => `${file.path}:${start + index + 1}: ${text}`);
+        const slice = lines.slice(start, end).map((text, index) => `${file.displayPath}:${start + index + 1}: ${text}`);
         segments.push(slice.join("\n"));
       }
     }
@@ -103,7 +110,7 @@ async function searchTextTool(input: JsonObject, context: CapabilityExecutionCon
     });
   }
   return success("search.text", limited.map((file) => file.path), {
-    preview: boundedText(limited.map((file) => file.path).join("\n"), limitBytes),
+    preview: boundedText(limited.map((file) => file.displayPath).join("\n"), limitBytes),
     metadata: { pattern: parsed.pattern, count: limited.length, outputMode },
     replay: replay(context)
   });

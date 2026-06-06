@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, readFile as fsReadFile, rename, rm, stat as stat_, writ
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import type {
   JsonObject,
   NativeCapabilityName,
@@ -458,11 +459,13 @@ export class NodePlatformRuntime implements PlatformRuntime {
         ? Math.floor(options.outputLimitBytes)
         : undefined;
       const invocation = processSpawnInvocation(this.os, command, args, executionProfile);
+      const useProcessGroup = process.platform !== "win32";
       const child = spawn(invocation.command, [...invocation.args], {
         cwd: typeof options.cwd === "string" ? options.cwd : undefined,
         env: { ...process.env, ...profileEnv, ...scopedEnv },
         shell: false,
         stdio: [stdinMode === "ignore" ? "ignore" : "pipe", "pipe", "pipe"],
+        detached: useProcessGroup,
         windowsHide: true
       });
       const timeoutMs = typeof options.timeoutMs === "number" && Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? options.timeoutMs : undefined;
@@ -482,7 +485,7 @@ export class NodePlatformRuntime implements PlatformRuntime {
       const timer = timeoutMs
         ? setTimeout(() => {
           stderr += `${stderr ? "\n" : ""}Process timed out after ${timeoutMs}ms.`;
-          child.kill("SIGKILL");
+          killProcessTree(child, "SIGKILL");
           finish({ exitCode: 124, stdout, stderr, metadata: providerMetadata("argv", "degraded", [], "PROCESS_TIMEOUT", [diagnostic("PROCESS_TIMEOUT", "error", `Process timed out after ${timeoutMs}ms.`), ...profileDiagnostics], timeoutMs) });
         }, timeoutMs)
         : undefined;
@@ -883,6 +886,22 @@ function processSpawnInvocation(os: PlatformOsFamily, command: string, args: rea
     return { command: "cmd.exe", args: ["/d", "/s", "/c", command, ...args] };
   }
   return { command, args };
+}
+
+function killProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
+  if (child.pid === undefined) {
+    child.kill(signal);
+    return;
+  }
+  if (process.platform !== "win32") {
+    try {
+      process.kill(-child.pid, signal);
+      return;
+    } catch {
+      // Fall back to killing the direct child when the process group is already gone.
+    }
+  }
+  child.kill(signal);
 }
 
 export function createPlatformRuntime(os: PlatformOsFamily): PlatformRuntime {

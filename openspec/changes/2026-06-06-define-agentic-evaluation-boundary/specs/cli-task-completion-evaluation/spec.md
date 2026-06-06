@@ -41,6 +41,20 @@ The evaluator SHALL NOT solve the benchmark task for the evaluated CLI, but MAY 
 - **AND** the evaluator must not manually edit the benchmark repository, provide the expected source change, or change the entry prompt to include task-specific hints
 - **中文** 当 run 因可复用 CLI 缺陷失败，例如 tool schema gap、sandbox policy bug、repo execution bug、adapter bug、credential routing bug 或 verifier integration bug 时，评测员可以按正常 OpenSpec 与 test-first governance 修改 CLI 产品代码；下一次被计分 run 必须使用同一个入口 prompt、干净 benchmark repository checkout，并把新 run evidence 链接到框架修复；评测员不得手动编辑 benchmark repository、提供预期源码改动，或修改入口 prompt 加入题目专用提示。
 
+#### Scenario: Neutral execution envelope may widen budget / 中性执行信封可以扩大预算
+
+- **WHEN** the entry prompt names a task family such as SWE-bench Lite but does not include hidden decomposition or solution hints
+- **THEN** the CLI may classify the task as an evaluation task and widen provider output, model-iteration, tool-call, timeout, or output-record budgets for that task family
+- **AND** the widened envelope must not encode the resolved instance id, target repository file, target line, correct patch, hidden task plan, verifier command recipe, or evaluator acceptance checklist
+- **中文** 当入口 prompt 指明 SWE-bench Lite 这类任务族但不包含隐藏拆解或解题提示时，CLI 可以把任务归类为 evaluation task，并为该任务族扩大 provider output、model-iteration、tool-call、timeout 或 output-record 预算；扩大的执行信封不得编码已解析 instance id、目标 repo 文件、目标行、正确 patch、隐藏任务计划、verifier command recipe 或评测员验收清单。
+
+#### Scenario: Focused verification can satisfy delivery / Focused Verification 可满足交付
+
+- **WHEN** a SWE-style run has a source diff and focused verification evidence for the target behavior
+- **THEN** the CLI may complete with the focused proof and report any broad-suite or dependency setup failures as verification gaps
+- **AND** it should not keep installing optional dependencies or running broad suites unless the focused evidence contradicts the claimed fix
+- **中文** 当 SWE 类 run 已经具备 source diff 与目标行为的 focused verification evidence 时，CLI 可以使用 focused proof 完成交付，并将 broad-suite 或 dependency setup 失败报告为 verification gap；除非 focused evidence 与 claimed fix 矛盾，否则不应继续安装 optional dependency 或反复运行 broad suite。
+
 #### Scenario: Product upgrade guidance follows the same boundary / 产品升级指导遵守同一边界
 
 - **WHEN** a maintainer evaluates a coding agent by asking it to update or upgrade the CLI product
@@ -61,3 +75,27 @@ CLI task-completion evaluation 必须暴露 CLI 做了什么的可审计执行�
 - **THEN** the evaluation evidence includes bounded records for prompt digest, plan summary when available, tool calls, tool results, repository diff summary, verifier command/result, retries, failure classification, and rerun linkage
 - **AND** the evidence must not expose hidden chain-of-thought or raw provider reasoning
 - **中文** 当被测 CLI run 完成、失败、超时或中断时，evaluation evidence 必须包含有界记录：prompt digest、可用时的 plan summary、tool calls、tool results、repository diff summary、verifier command/result、retries、failure classification 与 rerun linkage；evidence 不得暴露 hidden chain-of-thought 或 raw provider reasoning。
+
+#### Scenario: Final grounding uses bounded tool-result evidence / 最终 Grounding 使用有界工具结果证据
+
+- **WHEN** the CLI final answer cites a code line, diff snippet, test result, command outcome, or file content discovered through a governed tool call during the run
+- **THEN** final evidence grounding may use the bounded, redacted tool-result preview already returned to the model and recorded in the audit trail
+- **AND** the run must not be rejected as an unsupported claim solely because that evidence was not part of the initial pre-dispatch evidence selection
+- **AND** grounding must not reopen raw command output, hidden caches, secrets, or unbounded provider responses
+- **中文** 当 CLI 最终答案引用运行过程中通过受治理工具调用发现的 code line、diff snippet、test result、command outcome 或 file content 时，最终 evidence grounding 可以使用已经返回给模型并记录在 audit trail 中的有界、脱敏 tool-result preview；不得仅因为该 evidence 不属于模型调度前的 initial evidence selection 就把 run 判为 unsupported claim；grounding 不得重新打开 raw command output、hidden cache、secret 或无限 provider response。
+
+#### Scenario: Internal evaluation artifacts are not model-visible evidence / 内部评测产物不能作为模型可见证据
+
+- **WHEN** a measured run uses model-visible workspace tools such as file read, glob, or text search
+- **THEN** prior evaluation traces, prediction files, harness reports, historical benchmark run outputs, `.pytest_cache`, `__pycache__`, and local virtualenv internals such as `.venv` are filtered or rejected as internal artifacts
+- **AND** full-access tool projection may still allow repository mutation, process execution, and verification commands, but it must not expose evaluator-side answer artifacts through model-visible tools or shell path references
+- **AND** the evaluated CLI may still use governed product adapters or clean benchmark repositories to discover and execute the task
+- **AND** repo-local shell execution may still use `.venv` for dependency setup and verification when governed by the tool policy
+- **中文** 当被计分 run 使用模型可见 workspace 工具，例如 file read、glob 或 text search 时，历史 evaluation trace、prediction file、harness report、旧 benchmark run output、`.pytest_cache`、`__pycache__` 与 `.venv` 等本地 virtualenv 内部文件必须作为内部产物被过滤或拒绝；full-access tool projection 仍可允许 repository mutation、process execution 与 verification command，但不得通过模型可见工具或 shell path reference 暴露评测侧答案产物；被测 CLI 仍可通过受治理的产品 adapter 或干净 benchmark repository 发现并执行任务；受工具策略治理时，repo-local shell execution 仍可使用 `.venv` 做依赖安装与验证。
+
+#### Scenario: Workspace-contained absolute paths are repaired / Workspace 内绝对路径可修复
+
+- **WHEN** a model-authored tool call provides an absolute path or `cwd` that resolves inside the active workspace root
+- **THEN** tool-intent preflight repairs it to an executor-safe workspace-relative value and records the repair
+- **AND** absolute paths outside the workspace remain rejected before execution
+- **中文** 当模型生成的 tool call 提供的 absolute path 或 `cwd` 可解析到 active workspace root 内时，tool-intent preflight 必须将其修复为 executor-safe workspace-relative value 并记录 repair；workspace 外 absolute path 仍必须在执行前拒绝。

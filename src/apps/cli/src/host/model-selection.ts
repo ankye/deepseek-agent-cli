@@ -1,5 +1,5 @@
 import { defaultDeepSeekProfile, defaultGlmAnthropicProfile } from "@deepseek/model-gateway";
-import type { ModelProfile } from "@deepseek/platform-contracts";
+import type { AgentLoopLimits, ModelProfile } from "@deepseek/platform-contracts";
 import type { CliOptions } from "../types.js";
 
 const GLM_EXPANDED_TASK_MAX_TOKENS = 8192;
@@ -8,6 +8,13 @@ export const EXPANDED_TASK_AGENT_LOOP_LIMITS = {
   maxModelIterations: 24,
   maxToolCalls: 64,
   maxOutputBytes: 96_000
+} as const;
+
+export const SWE_BENCH_AGENT_LOOP_LIMITS = {
+  ...EXPANDED_TASK_AGENT_LOOP_LIMITS,
+  maxModelIterations: 48,
+  maxToolCalls: 96,
+  toolTimeoutMs: 180_000
 } as const;
 
 export function resolveCliModelProfile(options: Pick<CliOptions, "modelProvider" | "model" | "prompt">, env: Readonly<Record<string, string | undefined>> = {}): ModelProfile {
@@ -33,7 +40,9 @@ export function resolveCliModelProfile(options: Pick<CliOptions, "modelProvider"
   };
 }
 
-export function resolveCliAgentLoopLimits(prompt: string): typeof EXPANDED_TASK_AGENT_LOOP_LIMITS | undefined {
+export function resolveCliAgentLoopLimits(prompt: string): Partial<AgentLoopLimits> | undefined {
+  const lower = prompt.toLowerCase();
+  if (isSweBenchPrompt(lower)) return SWE_BENCH_AGENT_LOOP_LIMITS;
   return usesExpandedTaskBudget(prompt) ? EXPANDED_TASK_AGENT_LOOP_LIMITS : undefined;
 }
 
@@ -41,12 +50,21 @@ export function usesExpandedTaskBudget(prompt: string): boolean {
   const lower = prompt.toLowerCase();
   return (
     lower.includes("evaluation task id:") ||
+    isSweBenchPrompt(lower) ||
     lower.includes("website") ||
     lower.includes("webpage") ||
     lower.includes("html") ||
     lower.includes("网页") ||
     lower.includes("网站") ||
     lower.includes("页面")
+  );
+}
+
+function isSweBenchPrompt(lower: string): boolean {
+  return (
+    lower.includes("swe-bench") ||
+    lower.includes("swebench") ||
+    lower.includes("swe bench")
   );
 }
 

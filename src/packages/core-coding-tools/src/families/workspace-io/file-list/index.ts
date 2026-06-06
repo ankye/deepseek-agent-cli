@@ -8,7 +8,7 @@ import type {
 import { boundedText, defineToolManifest, failure, objectSchema, replay, success } from "../../../shared/tool-kit.js";
 import { coreToolIds } from "../../../shared/ids.js";
 import type { CoreCodingToolsDependencies } from "../../../shared/workspace.js";
-import { requireDeps, resolveToolPath } from "../../../shared/workspace.js";
+import { isModelVisibleWorkspaceRelativePath, requireDeps, resolveToolPath, workspaceRelativePath } from "../../../shared/workspace.js";
 
 export function defineFileListTool(deps: CoreCodingToolsDependencies | undefined) {
   return defineToolManifest(
@@ -38,7 +38,8 @@ async function listFilesTool(input: JsonObject, context: CapabilityExecutionCont
   const pattern = parsed.pattern ?? "";
   const limit = parsed.limit ?? 200;
   const sort = parsed.sort ?? "mtime-desc";
-  const files = [...await deps.platform.findFiles(pattern, root)];
+  const files = (await deps.platform.findFiles(pattern, root))
+    .filter((path) => isModelVisibleWorkspaceRelativePath(workspaceRelativePath(deps.workspaceRoot, path)));
   const ordered = await orderFiles(deps.platform as unknown as { statFile?: (path: string) => Promise<{ mtimeMs: number }> }, files, sort);
   const limited = ordered.slice(0, limit);
   return success("file.list", limited, {

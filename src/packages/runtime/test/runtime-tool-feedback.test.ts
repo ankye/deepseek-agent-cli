@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import type {
+  CapabilityExecutionContext,
   JsonObject,
   ModelGateway,
   ModelRequest,
@@ -15,6 +16,7 @@ import {
   collectRuntimeEvents,
   createDefaultRuntimeKernel,
   registerRuntimeCoreTools,
+  runtimeEchoCapability,
   runAgentLoop
 } from "../src/index.js";
 import { boundedModelText, toolFeedbackPreview } from "../src/model-tooling.js";
@@ -61,6 +63,133 @@ describe("agent loop typed tool feedback", () => {
     await kernel.shutdown();
   });
 
+  it("emits failed feedback when a completed capability reports failed evidence", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await deps.capabilities.register({
+      ...runtimeEchoCapability,
+      id: "runtime.failed-evidence" as typeof runtimeEchoCapability.id,
+      name: "Runtime Failed Evidence",
+      sideEffect: "none",
+      permissions: []
+    }, async () => ({
+      ok: true,
+      value: {
+        evidence: {
+          tool: "test.run",
+          status: "failed",
+          affectedPaths: ["/workspace"],
+          preview: {
+            text: "exit code 2\nmissing test file\n",
+            byteLength: 30,
+            lineCount: 2,
+            truncated: false,
+            limitBytes: 8000,
+            redaction: { class: "internal" }
+          },
+          diagnostics: [],
+          metadata: { exitCode: 2 },
+          replay: {},
+          redaction: { class: "internal", fields: ["preview.text", "affectedPaths"] }
+        }
+      }
+    }));
+    const loopDeps = { ...deps, models: new OneToolThenFinishModelGateway("runtime.failed-evidence", {}) };
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "run a failing test",
+      caller: "runtime.feedback.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile
+    }));
+
+    const feedback = readFeedback(events);
+    assert.ok(feedback);
+    assert.equal(feedback.status, "failed");
+    assert.equal(feedback.continuation, "continue");
+    assert.match(feedback.preview.text, /Tool runtime\.failed-evidence reported failed/);
+    assert.match(feedback.preview.text, /exit code 2/);
+    await kernel.shutdown();
+  });
+
+  it("passes bounded model-requested tool timeouts into the kernel envelope", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await deps.capabilities.register({
+      ...runtimeEchoCapability,
+      id: "runtime.timeout-observer" as typeof runtimeEchoCapability.id,
+      name: "Runtime Timeout Observer",
+      inputSchema: {
+        type: "object",
+        properties: {
+          timeoutMs: { type: "number" }
+        }
+      }
+    }, async (_input: JsonObject, context: CapabilityExecutionContext) => ({
+      ok: true,
+      value: {
+        evidence: {
+          tool: "timeout.observer",
+          status: "completed",
+          affectedPaths: [],
+          preview: {
+            text: `observed timeout ${context.envelope.timeoutMs}`,
+            byteLength: 22,
+            lineCount: 1,
+            truncated: false,
+            limitBytes: 8000,
+            redaction: { class: "internal" }
+          },
+          diagnostics: [],
+          metadata: { observedTimeoutMs: context.envelope.timeoutMs },
+          replay: {},
+          redaction: { class: "internal", fields: ["preview.text"] }
+        }
+      }
+    }));
+    const loopDeps = { ...deps, models: new OneToolThenFinishModelGateway("runtime.timeout-observer", { timeoutMs: 90_000 }) };
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "run a longer tool",
+      caller: "runtime.feedback.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      limits: { toolTimeoutMs: 120_000 }
+    }));
+
+    const completed = events.find((event) => event.kind === "capability.completed");
+    const output = completed?.data.output as { evidence?: { metadata?: { observedTimeoutMs?: number } } } | undefined;
+    assert.equal(output?.evidence?.metadata?.observedTimeoutMs, 90_000);
+    await kernel.shutdown();
+  });
+
+  it("emits a terminal failed event when a repairable tool error happens on the final model iteration", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await deps.capabilities.register({
+      ...runtimeEchoCapability,
+      id: "runtime.throwing-tool" as typeof runtimeEchoCapability.id,
+      name: "Runtime Throwing Tool"
+    }, async () => {
+      throw new Error("simulated tool failure");
+    });
+    const loopDeps = { ...deps, models: new OneToolThenFinishModelGateway("runtime.throwing-tool", {}) };
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "trigger a repairable tool failure",
+      caller: "runtime.feedback.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      selfRepair: { enabled: true, maxAttempts: 1, requireCheckpointForWrites: false, verificationMode: "minimal" },
+      limits: { maxModelIterations: 1, maxRepairAttempts: 1 }
+    }));
+
+    assert.equal(events.some((event) => event.kind === "agent.repair.attempt.completed"), true);
+    assert.equal(events.at(-1)?.kind, "agent.loop.failed");
+    assert.equal(events.at(-1)?.data.reason, "tool-terminal-error");
+    await kernel.shutdown();
+  });
+
   it("emits a denied feedback DTO when policy rejects the tool execution", async () => {
     const deps = createDeterministicRuntimeDependencies();
     await deps.platform.writeFile("/workspace/README.md", "feedback deny\n");
@@ -102,6 +231,68 @@ describe("agent loop typed tool feedback", () => {
     assert.equal(feedback.status, "rejected");
     assert.equal(feedback.continuation, "continue");
     assert.equal(feedback.preview.truncated, false);
+    await kernel.shutdown();
+  });
+
+  it("continues after a structured tool policy failure so the model can choose a safer command", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    const loopDeps = {
+      ...deps,
+      models: new OneToolThenFinishModelGateway("core.shell.run", {
+        command: "pip3 install --break-system-packages 'numpy<2' 2>&1 | tail -5"
+      }),
+      policy: new AllowAllPolicyEngine()
+    };
+    await registerRuntimeCoreTools(loopDeps, "/workspace");
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "try unsafe host package install and recover",
+      caller: "runtime.feedback.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      live: true,
+      toolProjection: "all",
+      limits: { maxModelIterations: 2 }
+    }));
+
+    const feedback = readFeedback(events);
+    assert.ok(feedback);
+    assert.equal(feedback.status, "failed");
+    assert.equal(feedback.continuation, "continue");
+    assert.equal(feedback.diagnostics[0]?.details?.originalCode, "HOST_PACKAGE_INSTALL_REJECTED");
+    assert.equal(events.at(-1)?.kind, "agent.loop.completed");
+    await kernel.shutdown();
+  });
+
+  it("continues after a tool scheduler timeout so the model can degrade or report partial verification", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await deps.capabilities.register({
+      ...runtimeEchoCapability,
+      id: "runtime.timeout-tool" as typeof runtimeEchoCapability.id,
+      name: "Runtime Timeout Tool"
+    }, async () => {
+      const error = new Error("Task cancelled: timeout");
+      error.name = "SCHEDULER_TASK_TIMEOUT";
+      throw error;
+    });
+    const loopDeps = { ...deps, models: new OneToolThenFinishModelGateway("runtime.timeout-tool", {}) };
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "run a slow verification and continue",
+      caller: "runtime.feedback.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      limits: { maxModelIterations: 2 }
+    }));
+
+    const feedback = readFeedback(events);
+    assert.ok(feedback);
+    assert.equal(feedback.status, "timeout");
+    assert.equal(feedback.continuation, "continue");
+    assert.equal(feedback.diagnostics[0]?.code, "KERNEL_SCHEDULER_TIMEOUT");
+    assert.equal(events.at(-1)?.kind, "agent.loop.completed");
     await kernel.shutdown();
   });
 
@@ -416,6 +607,16 @@ class DenyAllPolicyEngine implements PolicyEngine {
       action: "deny",
       reason: "Denied by runtime feedback test policy",
       audit: { policy: "deny-all-feedback-test" }
+    };
+  }
+}
+
+class AllowAllPolicyEngine implements PolicyEngine {
+  async decide(request: PolicyRequest): Promise<PolicyDecision> {
+    return {
+      action: "allow",
+      reason: "Allowed by runtime feedback test policy",
+      audit: request.auditEvidence ?? { policy: "allow-all-feedback-test" }
     };
   }
 }

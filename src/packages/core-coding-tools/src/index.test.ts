@@ -4,7 +4,19 @@ import { InMemoryCapabilityRegistry } from "@deepseek/capability-registry";
 import { FakePlatformRuntime } from "@deepseek/platform-abstraction";
 import { InMemoryWorkspaceStateManager } from "@deepseek/workspace-state-management";
 import { asId, TOOL_FAMILY_DOMAIN_IDS, TOOL_FAMILY_IDS } from "@deepseek/platform-contracts";
-import type { CapabilityExecutionContext, CoreToolResult, ExecutionEnvelope, JsonObject, SerializableResult, TraceContext } from "@deepseek/platform-contracts";
+import type {
+  CapabilityExecutionContext,
+  CoreToolResult,
+  ExecutionEnvelope,
+  JsonObject,
+  ProcessResult,
+  ProcessRunObserver,
+  ProcessRunOptions,
+  SerializableResult,
+  ShellProfile,
+  ShellProviderDescriptor,
+  TraceContext
+} from "@deepseek/platform-contracts";
 import { analyzeResourceScope, createSandboxAuditEvidence, createSandboxRequirement, createSecretRedactionDecision } from "@deepseek/policy-sandbox";
 import {
   buildToolFamilyParityMatrix,
@@ -17,6 +29,24 @@ import {
 } from "./index.js";
 
 const workspaceRoot = "/workspace";
+
+class ShellCapableFakePlatform extends FakePlatformRuntime {
+  readonly executedCommands: { readonly command: string; readonly args: readonly string[]; readonly cwd?: string }[] = [];
+
+  override async resolveShell(profile: ShellProfile = "bash"): Promise<SerializableResult<ShellProviderDescriptor>> {
+    return super.resolveShell(profile);
+  }
+
+  override async runProcess(
+    command: string,
+    args: readonly string[],
+    options: ProcessRunOptions = {},
+    observer?: ProcessRunObserver
+  ): Promise<ProcessResult> {
+    this.executedCommands.push({ command, args: [...args], ...(options.cwd ? { cwd: options.cwd } : {}) });
+    return super.runProcess(command, args, options, observer);
+  }
+}
 
 async function invoke(
   id: (typeof coreToolIds)[keyof typeof coreToolIds],
@@ -206,6 +236,184 @@ describe("core coding tool executors", () => {
     const search = await invoke(coreToolIds.searchText, { pattern: "alpha", workspaceRoot }, { platform });
     assert.equal(search.ok, true);
     assert.equal(search.value?.evidence.provider?.selectedProvider, "js");
+    assert.match(search.value?.evidence.preview?.text ?? "", /README\.md:1/);
+    assert.equal((search.value?.evidence.preview?.text ?? "").includes(workspaceRoot), false);
+  });
+
+  it("keeps internal evaluation artifacts out of model-visible read, list, glob, and search tools", async () => {
+    const platform = new FakePlatformRuntime("fake", workspaceRoot, { searchProvider: "js" });
+    await platform.writeFile(`${workspaceRoot}/src/swe-task.ts`, "export const safe = 'swe-bench';");
+    await platform.writeFile(`${workspaceRoot}/.deepseek/evaluation-boundary-runs/run.jsonl`, "hidden old trace swe-bench");
+    await platform.writeFile(`${workspaceRoot}/.deepseek/swebench-runs/probe/patch.diff`, "hidden old patch swe-bench");
+    await platform.writeFile(`${workspaceRoot}/.deepseek/swebench-venv/lib/python/site.py`, "hidden env package swe-bench");
+    await platform.writeFile(`${workspaceRoot}/.deepseek/swebench-workspaces/astropy__astropy-12907/repo/.pytest_cache/v/cache/lastfailed`, "hidden pytest cache swe-bench");
+    await platform.writeFile(`${workspaceRoot}/.deepseek/swebench-workspaces/astropy__astropy-12907/repo/.venv/lib/python/site.py`, "hidden local venv swe-bench");
+    await platform.writeFile(`${workspaceRoot}/.deepseek/swebench-workspaces/astropy__astropy-12907/repo/__pycache__/separable.pyc`, "hidden bytecode swe-bench");
+
+    const read = await invoke(coreToolIds.fileRead, {
+      path: ".deepseek/evaluation-boundary-runs/run.jsonl",
+      workspaceRoot
+    }, { platform });
+    assert.equal(read.ok, false);
+    assert.equal(read.error?.code, "INTERNAL_ARTIFACT_REJECTED");
+
+    const envRead = await invoke(coreToolIds.fileRead, {
+      path: ".deepseek/swebench-venv/lib/python/site.py",
+      workspaceRoot
+    }, { platform });
+    assert.equal(envRead.ok, false);
+    assert.equal(envRead.error?.code, "INTERNAL_ARTIFACT_REJECTED");
+
+    const list = await invoke(coreToolIds.fileList, { pattern: "swe", workspaceRoot }, { platform });
+    assert.equal(list.ok, true);
+    assert.match(list.value?.evidence.preview?.text ?? "", /src\/swe-task\.ts/);
+    assert.equal((list.value?.evidence.preview?.text ?? "").includes("evaluation-boundary-runs"), false);
+    assert.equal((list.value?.evidence.preview?.text ?? "").includes("swebench-runs"), false);
+    assert.equal((list.value?.evidence.preview?.text ?? "").includes("swebench-venv"), false);
+    assert.equal((list.value?.evidence.preview?.text ?? "").includes(".pytest_cache"), false);
+    assert.equal((list.value?.evidence.preview?.text ?? "").includes(".venv"), false);
+    assert.equal((list.value?.evidence.preview?.text ?? "").includes("__pycache__"), false);
+
+    const glob = await invoke(coreToolIds.workspaceGlob, { pattern: "**/*swe*", workspaceRoot }, { platform });
+    assert.equal(glob.ok, true);
+    assert.match(glob.value?.evidence.preview?.text ?? "", /src\/swe-task\.ts/);
+    assert.equal((glob.value?.evidence.preview?.text ?? "").includes("evaluation-boundary-runs"), false);
+    assert.equal((glob.value?.evidence.preview?.text ?? "").includes("swebench-runs"), false);
+    assert.equal((glob.value?.evidence.preview?.text ?? "").includes("swebench-venv"), false);
+    assert.equal((glob.value?.evidence.preview?.text ?? "").includes(".pytest_cache"), false);
+    assert.equal((glob.value?.evidence.preview?.text ?? "").includes(".venv"), false);
+    assert.equal((glob.value?.evidence.preview?.text ?? "").includes("__pycache__"), false);
+
+    const search = await invoke(coreToolIds.searchText, {
+      pattern: "swe-bench",
+      workspaceRoot,
+      outputMode: "files_with_matches"
+    }, { platform });
+    assert.equal(search.ok, true);
+    assert.match(search.value?.evidence.preview?.text ?? "", /src\/swe-task\.ts/);
+    assert.equal((search.value?.evidence.preview?.text ?? "").includes("patch.diff"), false);
+    assert.equal((search.value?.evidence.preview?.text ?? "").includes("swebench-venv"), false);
+    assert.equal((search.value?.evidence.preview?.text ?? "").includes(".pytest_cache"), false);
+    assert.equal((search.value?.evidence.preview?.text ?? "").includes(".venv"), false);
+    assert.equal((search.value?.evidence.preview?.text ?? "").includes("__pycache__"), false);
+  });
+
+  it("rejects shell commands that directly reference internal evaluation artifacts", async () => {
+    const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
+    await platform.writeFile(`${workspaceRoot}/.deepseek/evaluation-boundary-runs/run.jsonl`, "hidden trace");
+
+    const result = await invoke(coreToolIds.shellRun, {
+      command: "cat",
+      args: [".deepseek/evaluation-boundary-runs/run.jsonl"],
+      cwd: ".",
+      workspaceRoot
+    }, { platform });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.error?.code, "INTERNAL_ARTIFACT_REJECTED");
+  });
+
+  it("runs model-authored shell command strings through the host shell", async () => {
+    const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
+
+    const shellString = await invoke(coreToolIds.shellRun, {
+      command: "echo hello && pwd",
+      workspaceRoot
+    }, { platform });
+
+    assert.equal(shellString.ok, true);
+    assert.deepEqual(platform.executedCommands[0], {
+      command: "bash",
+      args: ["-lc", "echo hello && pwd"],
+      cwd: workspaceRoot
+    });
+    assert.equal(shellString.value?.evidence.metadata.shellSyntax, true);
+
+    const argv = await invoke(coreToolIds.shellRun, {
+      command: "echo",
+      args: ["hello"],
+      workspaceRoot
+    }, { platform });
+
+    assert.equal(argv.ok, true);
+    assert.deepEqual(platform.executedCommands[1], {
+      command: "echo",
+      args: ["hello"],
+      cwd: workspaceRoot
+    });
+  });
+
+  it("rejects model-authored host pip installs unless they target a local virtual environment", async () => {
+    const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
+
+    const rejected = await invoke(coreToolIds.shellRun, {
+      command: "pip3 install --break-system-packages 'numpy<2' 2>&1 | tail -5",
+      workspaceRoot
+    }, { platform });
+
+    assert.equal(rejected.ok, false);
+    assert.equal(rejected.error?.code, "HOST_PACKAGE_INSTALL_REJECTED");
+    assert.equal(platform.executedCommands.length, 0);
+
+    const localVenv = await invoke(coreToolIds.shellRun, {
+      command: "source .venv/bin/activate && pip install numpy",
+      cwd: ".deepseek/swebench-workspaces/astropy__astropy-12907/repo",
+      workspaceRoot
+    }, { platform });
+
+    assert.equal(localVenv.ok, true);
+    assert.equal(platform.executedCommands.length, 1);
+    assert.deepEqual(platform.executedCommands[0], {
+      command: "bash",
+      args: ["-lc", "source .venv/bin/activate && pip install numpy"],
+      cwd: `${workspaceRoot}/.deepseek/swebench-workspaces/astropy__astropy-12907/repo`
+    });
+  });
+
+  it("rejects SWE-bench commands that replace the checkout with the same package from an index", async () => {
+    const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
+
+    const rejected = await invoke(coreToolIds.shellRun, {
+      command: "source .venv/bin/activate && pip install astropy 2>&1 | tail -10",
+      cwd: ".deepseek/swebench-workspaces/astropy__astropy-12907/repo",
+      workspaceRoot
+    }, { platform });
+
+    assert.equal(rejected.ok, false);
+    assert.equal(rejected.error?.code, "SWE_BENCH_BOUNDARY_REJECTED");
+    assert.equal(platform.executedCommands.length, 0);
+
+    const editableLocal = await invoke(coreToolIds.shellRun, {
+      command: "source .venv/bin/activate && pip install -e .[test]",
+      cwd: ".deepseek/swebench-workspaces/astropy__astropy-12907/repo",
+      workspaceRoot
+    }, { platform });
+
+    assert.equal(editableLocal.ok, true);
+    assert.equal(platform.executedCommands.length, 1);
+  });
+
+  it("rejects SWE-bench shell history mining while keeping workspace status commands available", async () => {
+    const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
+
+    const rejected = await invoke(coreToolIds.shellRun, {
+      command: "git log --all --oneline -- astropy/modeling/separable.py | head -10",
+      cwd: ".deepseek/swebench-workspaces/astropy__astropy-12907/repo",
+      workspaceRoot
+    }, { platform });
+
+    assert.equal(rejected.ok, false);
+    assert.equal(rejected.error?.code, "SWE_BENCH_BOUNDARY_REJECTED");
+    assert.equal(platform.executedCommands.length, 0);
+
+    const status = await invoke(coreToolIds.shellRun, {
+      command: "git status --short",
+      cwd: ".deepseek/swebench-workspaces/astropy__astropy-12907/repo",
+      workspaceRoot
+    }, { platform });
+
+    assert.equal(status.ok, true);
+    assert.equal(platform.executedCommands.length, 1);
   });
 
   it("globs workspace files, views local assets, and reads bounded notebooks", async () => {
@@ -352,7 +560,7 @@ describe("core coding tool executors", () => {
   });
 
   it("runs shell, git, test, and todo tools with structured evidence", async () => {
-    const platform = new FakePlatformRuntime("fake", workspaceRoot);
+    const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
     await platform.writeFile(`${workspaceRoot}/package.json`, JSON.stringify({ scripts: { test: "node --test", lint: "eslint ." } }));
 
     const shell = await invoke(coreToolIds.shellRun, { command: "echo", args: ["ok"], workspaceRoot }, { platform });
@@ -370,6 +578,14 @@ describe("core coding tool executors", () => {
     const test = await invoke(coreToolIds.testRun, { command: "npm", args: ["test"], workspaceRoot, intent: "unit" }, { platform });
     assert.equal(test.ok, true);
     assert.equal(test.value?.evidence.metadata.intent, "unit");
+
+    const absoluteWorkspaceTest = await invoke(coreToolIds.testRun, { command: "npm", args: ["test"], cwd: workspaceRoot, workspaceRoot, intent: "unit" }, { platform });
+    assert.equal(absoluteWorkspaceTest.ok, true);
+    assert.equal(platform.executedCommands.at(-1)?.cwd, workspaceRoot);
+
+    const outsideWorkspaceTest = await invoke(coreToolIds.testRun, { command: "npm", args: ["test"], cwd: "/tmp/outside", workspaceRoot }, { platform });
+    assert.equal(outsideWorkspaceTest.ok, false);
+    assert.equal(outsideWorkspaceTest.error?.code, "PATH_REJECTED");
 
     const scripts = await invoke(coreToolIds.packageManager, { operation: "scripts", workspaceRoot }, { platform });
     assert.equal(scripts.ok, true);

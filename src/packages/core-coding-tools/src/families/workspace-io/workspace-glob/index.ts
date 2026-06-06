@@ -8,7 +8,7 @@ import type {
 import { boundedText, defineToolManifest, failure, objectSchema, replay, success } from "../../../shared/tool-kit.js";
 import { coreToolIds } from "../../../shared/ids.js";
 import type { CoreCodingToolsDependencies } from "../../../shared/workspace.js";
-import { requireDeps, resolveToolPath } from "../../../shared/workspace.js";
+import { isModelVisibleWorkspaceRelativePath, requireDeps, resolveToolPath } from "../../../shared/workspace.js";
 
 const TOOL_NAME = "workspace.glob" as CoreCodingToolName;
 const DEFAULT_LIMIT = 200;
@@ -52,6 +52,7 @@ async function workspaceGlobTool(input: JsonObject, context: CapabilityExecution
   const root = normalizePath(rootPath.value.path);
   const matches = files
     .map((file) => ({ absolute: normalizePath(file), relative: normalizePath(file).slice(root.length).replace(/^\//, "") }))
+    .filter((file) => isModelVisibleWorkspaceRelativePath(file.relative))
     .filter((file) => matcher.test(file.relative))
     .sort((a, b) => a.relative.localeCompare(b.relative));
   const limit = boundedLimit(parsed.limit);

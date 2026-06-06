@@ -192,12 +192,16 @@ export function normalizeWorkspacePath(
     diagnostics.push(diagnostic("TOOL_INTENT_HOME_PATH_REJECTED", "Home-directory paths are not workspace-safe", field));
     return { diagnostics, repairs };
   }
-  if (isAbsolutePath(trimmed)) {
-    diagnostics.push(diagnostic("TOOL_INTENT_ABSOLUTE_PATH_REJECTED", "Absolute paths must not come from model tool intent", field));
-    return { diagnostics, repairs };
-  }
-
   let next = trimmed;
+  if (isAbsolutePath(trimmed)) {
+    const contained = workspaceRelativeFromAbsolute(trimmed, workspaceRoot, platform);
+    if (!contained) {
+      diagnostics.push(diagnostic("TOOL_INTENT_ABSOLUTE_PATH_REJECTED", "Absolute paths must not come from model tool intent", field));
+      return { diagnostics, repairs };
+    }
+    next = contained.executorValue;
+    repairs.push(repair("path-normalized", field, value, contained.modelValue, contained.executorValue));
+  }
   if (/\0/.test(next)) {
     diagnostics.push(diagnostic("TOOL_INTENT_NULL_BYTE_REJECTED", "Null bytes are not allowed in workspace paths", field));
     return { diagnostics, repairs };
@@ -315,6 +319,35 @@ function isHomePath(value: string): boolean {
 
 function isAbsolutePath(value: string): boolean {
   return value.startsWith("/") || value.startsWith("\\") || /^[a-zA-Z]:[\\/]/.test(value);
+}
+
+function workspaceRelativeFromAbsolute(
+  value: string,
+  workspaceRoot: string,
+  platform: ToolIntentPreflightRequest["platform"]
+): { readonly modelValue: string; readonly executorValue: string } | undefined {
+  const separator = platform === "windows" ? "\\" : "/";
+  const root = normalizeAbsolutePathForPlatform(workspaceRoot, separator);
+  const candidate = normalizeAbsolutePathForPlatform(value, separator);
+  const compareRoot = platform === "windows" ? root.toLowerCase() : root;
+  const compareCandidate = platform === "windows" ? candidate.toLowerCase() : candidate;
+  if (compareCandidate === compareRoot) {
+    return { modelValue: root, executorValue: "." };
+  }
+  const prefix = compareRoot.endsWith(separator) ? compareRoot : `${compareRoot}${separator}`;
+  if (!compareCandidate.startsWith(prefix)) return undefined;
+  const relative = candidate.slice(prefix.length);
+  if (!relative || relative.startsWith("..")) return undefined;
+  return {
+    modelValue: candidate,
+    executorValue: relative
+  };
+}
+
+function normalizeAbsolutePathForPlatform(value: string, separator: "\\" | "/"): string {
+  const normalized = value.trim().replace(/[\\/]+/g, separator);
+  if (/^[a-zA-Z]:[\\/]?$/.test(normalized)) return normalized;
+  return normalized.replace(/[\\/]+$/, "");
 }
 
 function looksLikeWindowsDriveRelative(value: string): boolean {

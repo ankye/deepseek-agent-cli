@@ -55,4 +55,40 @@ describe("task delivery flow runtime controller", () => {
     assert.equal(invalidation.preservedFields.includes("goalProposal"), true);
     assert.equal(invalidation.invalidatedFields.includes("profileSelection"), true);
   });
+
+  it("classifies short SWE-bench Lite prompts as executable evaluation tasks", () => {
+    const summary = createTaskDeliveryFlowSummary({
+      rawInput: "给我完成 SWE-bench Lite 第 1 题测试，跑通并告诉我结果。",
+      activeTaskAvailable: true
+    });
+
+    assert.equal(summary.brief.intentKind, "evaluation");
+    assert.equal(summary.brief.normalizedIntent, "run swe-bench lite task");
+    assert.equal(summary.brief.needsUserConfirmation, false);
+    assert.equal(summary.decisionRequest.candidateProfiles[0], "evaluation/swe-bench-lite.v1");
+    assert.equal(summary.decisionEnvelope.profileSelection, "evaluation/swe-bench-lite.v1");
+    assert.equal(summary.decisionRequest.allowedTools.includes("workspace.write"), true);
+    assert.equal(summary.decisionRequest.allowedTools.includes("shell.run"), true);
+    assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("benchmark workspace")), true);
+    assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes(".deepseek/swebench-workspaces")), true);
+    assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("repo/")), true);
+    assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("minimal failing regression")), true);
+    assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("full dependency installation")), true);
+    assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("project-local virtual environment")), true);
+    assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("host/global package installers")), true);
+    assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("same package from a package index")), true);
+    assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("upstream git history")), true);
+    assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("After a focused regression fails")), true);
+    assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("After focused verification passes")), true);
+    assert.equal(summary.decisionEnvelope.toolStrategy.some((step) => step.includes("benchmark instance")), true);
+    assert.equal(summary.decisionEnvelope.toolStrategy.some((step) => step.includes("repo root")), true);
+    assert.equal(summary.decisionEnvelope.toolStrategy.some((step) => step.includes("minimal reproduction")), true);
+    assert.equal(summary.decisionEnvelope.toolStrategy.some((step) => step.includes("one dependency setup attempt")), true);
+    assert.equal(summary.decisionEnvelope.toolStrategy.some((step) => step.includes("patch the checkout directly")), true);
+    assert.equal(summary.decisionEnvelope.toolStrategy.some((step) => step.includes("do not keep installing dependencies")), true);
+    assert.equal(summary.decisionEnvelope.verificationPlan.some((step) => step.includes("focused benchmark")), true);
+    assert.equal(summary.decisionEnvelope.verificationPlan.some((step) => step.includes("full dependency installation")), true);
+    assert.equal(summary.plan.planningMode, "catalog-profile");
+    assert.equal(summary.delivery.status, "returned");
+  });
 });

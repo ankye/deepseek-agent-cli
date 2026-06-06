@@ -48,6 +48,35 @@ describe("tool intent preflight", () => {
     assert.equal(result.repairs.some((repair) => repair.kind === "path-separator-normalized"), true);
   });
 
+  it("repairs workspace-contained absolute paths while rejecting outside absolute paths", async () => {
+    const preflight = new DeterministicToolIntentPreflight();
+    const result = await preflight.check({
+      providerId: deepseek,
+      intent: {
+        name: "core_test_run",
+        source: "model",
+        input: {
+          command: "python3",
+          args: ["-m", "pytest"],
+          cwd: "/repo/.deepseek/swebench-workspaces/astropy__astropy-12907/repo"
+        }
+      },
+      workspaceRoot: "/repo",
+      platform: "linux",
+      modelVisibleCapabilities: [asId<"capability">("core.test.run")]
+    });
+
+    assert.equal(result.status, "repaired");
+    assert.equal(result.diagnostics.length, 0);
+    assert.equal(result.repaired?.input.cwd, ".deepseek/swebench-workspaces/astropy__astropy-12907/repo");
+    assert.equal(result.repaired?.input.workspaceRoot, "/repo");
+    assert.equal(result.repairs.some((repair) => repair.kind === "path-normalized" && repair.before === "/repo/.deepseek/swebench-workspaces/astropy__astropy-12907/repo"), true);
+
+    const outside = normalizeWorkspacePath("/tmp/outside", "/repo", "linux");
+    assert.equal(outside.value, undefined);
+    assert.equal(outside.diagnostics[0]?.code, "TOOL_INTENT_ABSOLUTE_PATH_REJECTED");
+  });
+
   it("rejects unsafe absolute paths, parent traversal, home paths, null bytes, and ambiguous drive-relative paths", () => {
     const unsafe = [
       ["/etc/passwd", "TOOL_INTENT_ABSOLUTE_PATH_REJECTED"],

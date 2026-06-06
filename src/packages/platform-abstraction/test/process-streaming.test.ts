@@ -1,5 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { access, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { NodePlatformRuntime } from "../src/index.js";
 
 describe("platform process streaming", () => {
@@ -34,5 +37,22 @@ describe("platform process streaming", () => {
 
     assert.equal(result.exitCode, 0);
     assert.equal(exited, true);
+  });
+
+  it("kills descendant processes when a process times out", async () => {
+    const platform = new NodePlatformRuntime();
+    const dir = await mkdtemp(join(tmpdir(), "deepseek-process-timeout-"));
+    const marker = join(dir, "child-survived.txt");
+    const childCode = `setTimeout(() => require("node:fs").writeFileSync(${JSON.stringify(marker)}, "alive"), 600); setTimeout(() => {}, 5000);`;
+    const parentCode = `require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(childCode)}], { stdio: "ignore" }); setTimeout(() => {}, 5000);`;
+
+    try {
+      const result = await platform.runProcess(process.execPath, ["-e", parentCode], { timeoutMs: 100 });
+      assert.equal(result.exitCode, 124);
+      await new Promise((resolve) => setTimeout(resolve, 900));
+      await assert.rejects(access(marker));
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

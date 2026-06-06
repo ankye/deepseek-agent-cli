@@ -93,11 +93,27 @@ export function summarizeAgentLoop(
 
 export function executionFeedbackStatus(terminal: import("@deepseek/platform-contracts").RuntimeEvent | undefined): ToolFeedbackStatus {
   if (!terminal) return "failed";
-  if (terminal.kind === "capability.completed") return "success";
-  if (terminal.kind === "capability.cancelled") return "cancelled";
+  if (terminal.kind === "capability.completed") {
+    return completedCapabilityEvidenceStatus(terminal) === "failed" ? "failed" : "success";
+  }
+  if (terminal.kind === "capability.cancelled") {
+    return terminal.error?.code === "KERNEL_SCHEDULER_TIMEOUT" ? "timeout" : "cancelled";
+  }
   if (terminal.kind === "execution.rejected") {
     return terminal.error?.code === "KERNEL_POLICY_DENIED" ? "denied" : "rejected";
   }
   if (terminal.error?.code === "KERNEL_SCHEDULER_TIMEOUT") return "timeout";
   return "failed";
+}
+
+function completedCapabilityEvidenceStatus(terminal: import("@deepseek/platform-contracts").RuntimeEvent): string | undefined {
+  const output = terminal.data.output;
+  if (!isJsonObject(output)) return undefined;
+  const evidence = output.evidence;
+  if (!isJsonObject(evidence)) return undefined;
+  return typeof evidence.status === "string" ? evidence.status : undefined;
+}
+
+function isJsonObject(value: unknown): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
