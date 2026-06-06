@@ -6,6 +6,7 @@
 - [x] 4. Implement live process policy gating with a separate `allowWorkspaceProcesses` option.
 - [x] 5. Implement `diagnostics swe-bench predict` collection, JSON/JSONL/text rendering, and redacted invocation metadata.
 - [x] 6. Run focused tests, OpenSpec validation, and a single-instance real GLM probe.
+- [x] 7. Add `diagnostics swe-bench evaluate` so CLI-owned SWE-bench flow can invoke the official harness and record resolved/test-count evidence.
 
 # 任务
 
@@ -15,3 +16,4 @@
 - [x] 4. 使用独立 `allowWorkspaceProcesses` option 实现 live process policy gate。
 - [x] 5. 实现 `diagnostics swe-bench predict` collection、JSON/JSONL/text rendering 与脱敏 invocation metadata。
 - [x] 6. 运行 focused tests、OpenSpec validation 与单题真实 GLM probe。
+- [x] 7. 增加 `diagnostics swe-bench evaluate`，使 CLI-owned SWE-bench flow 可以调用官方 harness 并记录 resolved/test-count 证据。

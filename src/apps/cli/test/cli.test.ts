@@ -367,6 +367,40 @@ describe("cli host adapter", () => {
         extraArgs: []
       }
     });
+    assert.deepEqual(parseCliArgs([
+      "diagnostics",
+      "swe-bench",
+      "evaluate",
+      "--predictions-path",
+      ".deepseek/swe-lite-runs/glm.jsonl",
+      "--report-dir",
+      ".deepseek/swe-lite-runs/harness",
+      "--run-id",
+      "glm-run",
+      "--instance-id",
+      "astropy__astropy-12907",
+      "--harness-python",
+      ".deepseek/swebench-venv/bin/python",
+      "--output",
+      "json"
+    ]), {
+      command: "diagnostics",
+      diagnosticsCommand: "swe-bench",
+      prompt: "",
+      output: "json",
+      live: false,
+      diagnosticsInput: {
+        command: "swe-bench",
+        action: "evaluate",
+        dryRun: false,
+        instanceIds: ["astropy__astropy-12907"],
+        predictionsPath: ".deepseek/swe-lite-runs/glm.jsonl",
+        reportDir: ".deepseek/swe-lite-runs/harness",
+        runId: "glm-run",
+        harnessPython: ".deepseek/swebench-venv/bin/python",
+        extraArgs: []
+      }
+    });
     assert.deepEqual(parseCliArgs(["diagnostics", "refresh", "--full", "--dry-run", "--output", "jsonl"]), {
       command: "diagnostics",
       diagnosticsCommand: "refresh",
@@ -468,7 +502,8 @@ describe("cli host adapter", () => {
     assert.equal(lines.some((line) => line.includes("deepseek repo files|grep|recall|project-index")), true);
     assert.equal(lines.some((line) => line.includes("deepseek git status|diff|review")), true);
     assert.equal(lines.some((line) => line.includes("deepseek jump file|text|symbol")), true);
-    assert.equal(lines.some((line) => line.includes("deepseek diagnostics bundle|release|doctor|verify|refresh|evaluate|env|flow")), true);
+    assert.equal(lines.some((line) => line.includes("deepseek diagnostics bundle|release|doctor|verify|refresh|evaluate|env|flow|swe-bench")), true);
+    assert.equal(lines.some((line) => line.includes("--predictions-path <path>")), true);
     assert.equal(lines.some((line) => line.includes("deepseek chat [--session <session-id>]")), true);
     assert.equal(lines.join("\n").includes("stream-json"), false);
     assert.equal(lines.join("\n").includes(" -p "), false);
