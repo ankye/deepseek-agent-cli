@@ -370,6 +370,23 @@ describe("core coding tool executors", () => {
     });
   });
 
+  it("allows SWE-bench shell commands to invoke the benchmark-local virtualenv by absolute path", async () => {
+    const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
+
+    const result = await invoke(coreToolIds.shellRun, {
+      command: `${workspaceRoot}/.deepseek/swebench-workspaces/astropy__astropy-12907/repo/.venv/bin/python3 test_regression_separability.py`,
+      cwd: ".deepseek/swebench-workspaces/astropy__astropy-12907/repo",
+      workspaceRoot
+    }, { platform });
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(platform.executedCommands[0], {
+      command: "bash",
+      args: ["-lc", `${workspaceRoot}/.deepseek/swebench-workspaces/astropy__astropy-12907/repo/.venv/bin/python3 test_regression_separability.py`],
+      cwd: `${workspaceRoot}/.deepseek/swebench-workspaces/astropy__astropy-12907/repo`
+    });
+  });
+
   it("rejects SWE-bench commands that replace the checkout with the same package from an index", async () => {
     const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
 

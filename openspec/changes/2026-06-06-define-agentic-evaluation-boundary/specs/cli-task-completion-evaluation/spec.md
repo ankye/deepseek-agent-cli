@@ -80,9 +80,10 @@ CLI task-completion evaluation 必须暴露 CLI 做了什么的可审计执行�
 
 - **WHEN** the CLI final answer cites a code line, diff snippet, test result, command outcome, or file content discovered through a governed tool call during the run
 - **THEN** final evidence grounding may use the bounded, redacted tool-result preview already returned to the model and recorded in the audit trail
+- **AND** Markdown/check-mark summaries of test names and pass status may be grounded from equivalent `test_name: PASS` style tool-result evidence
 - **AND** the run must not be rejected as an unsupported claim solely because that evidence was not part of the initial pre-dispatch evidence selection
 - **AND** grounding must not reopen raw command output, hidden caches, secrets, or unbounded provider responses
-- **中文** 当 CLI 最终答案引用运行过程中通过受治理工具调用发现的 code line、diff snippet、test result、command outcome 或 file content 时，最终 evidence grounding 可以使用已经返回给模型并记录在 audit trail 中的有界、脱敏 tool-result preview；不得仅因为该 evidence 不属于模型调度前的 initial evidence selection 就把 run 判为 unsupported claim；grounding 不得重新打开 raw command output、hidden cache、secret 或无限 provider response。
+- **中文** 当 CLI 最终答案引用运行过程中通过受治理工具调用发现的 code line、diff snippet、test result、command outcome 或 file content 时，最终 evidence grounding 可以使用已经返回给模型并记录在 audit trail 中的有界、脱敏 tool-result preview；Markdown/勾选形式的测试名称与通过状态总结，可以由等价的 `test_name: PASS` 类 tool-result evidence 支撑；不得仅因为该 evidence 不属于模型调度前的 initial evidence selection 就把 run 判为 unsupported claim；grounding 不得重新打开 raw command output、hidden cache、secret 或无限 provider response。
 
 #### Scenario: Internal evaluation artifacts are not model-visible evidence / 内部评测产物不能作为模型可见证据
 
@@ -90,8 +91,8 @@ CLI task-completion evaluation 必须暴露 CLI 做了什么的可审计执行�
 - **THEN** prior evaluation traces, prediction files, harness reports, historical benchmark run outputs, `.pytest_cache`, `__pycache__`, and local virtualenv internals such as `.venv` are filtered or rejected as internal artifacts
 - **AND** full-access tool projection may still allow repository mutation, process execution, and verification commands, but it must not expose evaluator-side answer artifacts through model-visible tools or shell path references
 - **AND** the evaluated CLI may still use governed product adapters or clean benchmark repositories to discover and execute the task
-- **AND** repo-local shell execution may still use `.venv` for dependency setup and verification when governed by the tool policy
-- **中文** 当被计分 run 使用模型可见 workspace 工具，例如 file read、glob 或 text search 时，历史 evaluation trace、prediction file、harness report、旧 benchmark run output、`.pytest_cache`、`__pycache__` 与 `.venv` 等本地 virtualenv 内部文件必须作为内部产物被过滤或拒绝；full-access tool projection 仍可允许 repository mutation、process execution 与 verification command，但不得通过模型可见工具或 shell path reference 暴露评测侧答案产物；被测 CLI 仍可通过受治理的产品 adapter 或干净 benchmark repository 发现并执行任务；受工具策略治理时，repo-local shell execution 仍可使用 `.venv` 做依赖安装与验证。
+- **AND** repo-local shell execution may still use `.venv`, including workspace-contained absolute `.venv` paths, for dependency setup and verification when governed by the tool policy
+- **中文** 当被计分 run 使用模型可见 workspace 工具，例如 file read、glob 或 text search 时，历史 evaluation trace、prediction file、harness report、旧 benchmark run output、`.pytest_cache`、`__pycache__` 与 `.venv` 等本地 virtualenv 内部文件必须作为内部产物被过滤或拒绝；full-access tool projection 仍可允许 repository mutation、process execution 与 verification command，但不得通过模型可见工具或 shell path reference 暴露评测侧答案产物；被测 CLI 仍可通过受治理的产品 adapter 或干净 benchmark repository 发现并执行任务；受工具策略治理时，repo-local shell execution 仍可使用 `.venv`，包括 workspace 内绝对 `.venv` 路径，做依赖安装与验证。
 
 #### Scenario: Workspace-contained absolute paths are repaired / Workspace 内绝对路径可修复
 

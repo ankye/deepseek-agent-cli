@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { EVIDENCE_FIRST_COMPATIBILITY, EVIDENCE_FIRST_SCHEMA_VERSION, type EvidenceFirstRuntimeContext, type EvidenceTaskClassification } from "@deepseek/platform-contracts";
+import { EVIDENCE_FIRST_COMPATIBILITY, EVIDENCE_FIRST_SCHEMA_VERSION, type EvidenceFirstRuntimeContext, type EvidenceItem, type EvidenceTaskClassification } from "@deepseek/platform-contracts";
 import { createDeterministicRuntimeDependencies } from "@deepseek/testing-regression";
 import { explainEvidenceCandidateSelection, groundStrictClaims } from "../src/index.js";
 import { asId } from "@deepseek/platform-contracts";
@@ -124,6 +124,48 @@ describe("evidence-first runtime helpers", () => {
 
     assert.equal(result.unsupportedClaims.length, 0);
     assert.equal(result.claimGroundings[0]?.certainty, "inferred");
+  });
+
+  it("grounds markdown pass-list claims from tool-result pass evidence", () => {
+    const toolResultEvidence: EvidenceItem = {
+      schemaVersion: EVIDENCE_FIRST_SCHEMA_VERSION,
+      evidenceId: "evidence:tool-result-tests",
+      sourceGroup: "tests",
+      sourcePath: "runtime-record:tool-result",
+      sourceLabel: "core.shell.run result",
+      factClasses: ["feature"],
+      preview: [
+        "test_coord_matrix: PASS",
+        "test_cdot: PASS",
+        "test_cstack: PASS",
+        "test_arith_oper: PASS",
+        "test_separable[cm1]: PASS",
+        "test_separable[cm2]: PASS",
+        "test_separable[cm3]: PASS",
+        "test_separable[cm4]: PASS",
+        "test_separable[cm5]: PASS",
+        "test_separable[cm6]: PASS",
+        "test_separable[cm7]: PASS",
+        "test_custom_model_separable: PASS"
+      ].join("\n"),
+      fingerprint: "fnv1a:tool-result-tests",
+      freshness: { status: "current" },
+      trace: {},
+      compatibility: EVIDENCE_FIRST_COMPATIBILITY,
+      redaction: { class: "internal", fields: ["preview"] }
+    };
+    const context = {
+      ...evidenceContext(),
+      selectedEvidence: [toolResultEvidence]
+    };
+
+    const result = groundStrictClaims([
+      "- `test_cdot` ✅",
+      "- `test_separable[cm1]` ~ `test_separable[cm7]` ✅（6 个参数化用例）"
+    ].join("\n"), context, "agent.loop.answer");
+
+    assert.equal(result.unsupportedClaims.length, 0);
+    assert.equal(result.claimGroundings.every((claim) => claim.certainty !== "unsupported"), true);
   });
 });
 

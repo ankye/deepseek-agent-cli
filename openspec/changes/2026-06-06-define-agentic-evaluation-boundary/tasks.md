@@ -11,6 +11,8 @@
 - [x] 9. Rerun the same short SWE-bench Lite prompt against a clean benchmark workspace and record evidence.
 - [x] 10. Add test-first preflight repair for workspace-contained absolute tool paths while preserving outside-path rejection.
 - [x] 11. Add SWE task-flow stop guidance after focused verification passes and a source diff exists.
+- [x] 12. Add test-first grounding normalization for Markdown/check-mark test pass summaries backed by tool-result PASS evidence.
+- [x] 13. Add test-first shell policy allowance for SWE-bench repo-local `.venv` absolute paths while keeping caches hidden from model-visible file tools.
 
 # 任务
 
@@ -25,6 +27,8 @@
 - [x] 9. 使用同一个 SWE-bench Lite 短 prompt 在干净 benchmark workspace 上重跑，并记录证据。
 - [x] 10. 用 test-first 方式支持 workspace 内绝对 tool path 的 preflight 修复，同时保持 workspace 外路径拒绝。
 - [x] 11. 增加 focused verification 已通过且存在 source diff 后的 SWE task-flow 停止指引。
+- [x] 12. 用 test-first 方式支持由 tool-result PASS 证据支撑的 Markdown/勾选测试通过总结 grounding 归一化。
+- [x] 13. 用 test-first 方式允许 SWE-bench repo-local `.venv` 的 workspace 内绝对路径用于 shell 策略，同时继续从模型可见文件工具隐藏 cache。
 
 ## Acceptance Evidence / 验收证据
 
@@ -32,8 +36,12 @@
 - Benchmark repo diff after the run changes only `astropy/modeling/separable.py` and `astropy/modeling/tests/test_separable.py`; no evaluator-authored benchmark patch was injected.
 - Remaining improvement evidence: GLM still spent many turns on Python/dependency verification, hit one tool timeout, and had one `core.test.run` rejection for a workspace-internal absolute path before recovering.
 - Follow-up repairs landed from that evidence: workspace-contained absolute `cwd`/path values are repaired by tool-intent preflight, and SWE task flow now instructs the model to stop chasing full dependency setup once focused verification and a diff are available.
+- `../deepseek-agent-cli-evaluation-artifact-archive/current-runs/swe-lite-1-short-prompt-postfix-grounding-20260606-132559.jsonl`: same short prompt after grounding normalization, GLM `glm-5.1`; final `agent.loop.completed`, exit code 0, 33 model requests, 32 tool results. One first-pass unsupported claim was revised successfully and final grounding completed.
+- Follow-up repair evidence from that run: shell policy allowed completion but still surfaced two recoverable absolute `.venv` path rejections before the final shell-policy fix; core tool coverage now allows SWE-bench repo-local absolute `.venv` execution while keeping model-visible cache filtering.
 
 - `../deepseek-agent-cli-evaluation-artifact-archive/current-runs/swe-lite-1-short-prompt-toolgrounding-20260606-125651.jsonl`：同一个短 prompt，GLM `glm-5.1`，`--tool-projection all`，干净 benchmark checkout；最终 `agent.loop.completed`，退出码 0，44 次模型请求、43 个工具结果，第二次最终 grounding 的 `unsupportedClaimCount=0`。
 - run 后 benchmark repo diff 只修改 `astropy/modeling/separable.py` 与 `astropy/modeling/tests/test_separable.py`；没有注入评测员编写的 benchmark patch。
 - 剩余改进证据：GLM 仍在 Python/dependency 验证上消耗较多轮次，出现 1 次 tool timeout，并在恢复前遇到 1 次 workspace 内绝对路径导致的 `core.test.run` 拒绝。
 - 已基于该证据落地的后续修复：tool-intent preflight 会修复 workspace 内绝对 `cwd`/path 值；SWE task flow 现在明确要求 focused verification 与 diff 已具备时停止继续追完整依赖安装。
+- `../deepseek-agent-cli-evaluation-artifact-archive/current-runs/swe-lite-1-short-prompt-postfix-grounding-20260606-132559.jsonl`：grounding 归一化后使用同一个短 prompt，GLM `glm-5.1`；最终 `agent.loop.completed`，退出码 0，33 次模型请求、32 个工具结果。第一次 grounding 的 1 个 unsupported claim 被成功修订，最终 grounding 完成。
+- 该 run 的后续修复证据：shell policy 虽允许最终完成，但在最终 shell-policy 修复前仍出现两次可恢复的绝对 `.venv` 路径误拒；core tool 覆盖现在允许 SWE-bench repo-local 绝对 `.venv` 执行，同时继续保持模型可见 cache 过滤。

@@ -654,12 +654,38 @@ function strictDirectEvidenceRequired(factClass: EvidenceFactClass): boolean {
 }
 
 function hasTokenOverlap(evidence: string, claim: string): boolean {
+  if (hasPassedSymbolEvidence(evidence, claim)) return true;
   const evidenceTokens = tokenSet(evidence);
   const claimTokens = tokenSet(claim);
   const meaningful = [...claimTokens].filter((token) => token.length >= 5);
   if (meaningful.length === 0) return false;
   const overlap = meaningful.filter((token) => evidenceTokens.has(token)).length;
   return overlap >= Math.min(2, meaningful.length);
+}
+
+function hasPassedSymbolEvidence(evidence: string, claim: string): boolean {
+  if (!/(?:✅|\bpass(?:ed)?\b|通过)/i.test(claim)) return false;
+  const symbols = extractTestLikeSymbols(claim);
+  if (symbols.length === 0) return false;
+  return symbols.every((symbol) => {
+    const escaped = escapeRegExp(symbol);
+    const passNearSymbol = new RegExp(`(?:${escaped}[^\\n]{0,80}\\bpass(?:ed)?\\b|\\bpass(?:ed)?\\b[^\\n]{0,80}${escaped}|${escaped}[^\\n]{0,80}通过|通过[^\\n]{0,80}${escaped})`, "i");
+    return passNearSymbol.test(evidence);
+  });
+}
+
+function extractTestLikeSymbols(value: string): readonly string[] {
+  const symbols = new Set<string>();
+  for (const match of value.matchAll(/`([^`]+)`|([A-Za-z_][A-Za-z0-9_]*(?:\[[A-Za-z0-9_]+\])?)/g)) {
+    const symbol = (match[1] ?? match[2] ?? "").trim();
+    if (/^(?:pass|passed)$/i.test(symbol)) continue;
+    if (symbol.includes("_") || /\[[A-Za-z0-9_]+\]/.test(symbol)) symbols.add(symbol);
+  }
+  return [...symbols];
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function tokenSet(value: string): ReadonlySet<string> {

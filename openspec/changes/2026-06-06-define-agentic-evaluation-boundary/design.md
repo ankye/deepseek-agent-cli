@@ -48,11 +48,15 @@ Final answer acceptance must be grounded against both pre-dispatch project evide
 
 最终答案验收必须同时使用模型调度前的 project evidence 与有界 runtime tool-result evidence。tool-result evidence 使用已经展示给模型并写入 audit trail 的脱敏、限长 preview；不得重新打开原始 cache 或无限 command output。这样可以避免 run 已经完成修复，却仅因为最终答案引用的是执行过程中发现的 diff line、test result 或 file content，而不是初始 evidence selection 中的内容，就被误判失败。
 
+When the final answer summarizes tests with Markdown names, PASS words, check marks, or Chinese pass wording, grounding may normalize those expressions against test symbols and PASS markers found in the bounded tool-result preview. This is a formatting equivalence for test outcomes, not a relaxation for package, command, release, or secret-sensitive claims.
+
+当最终答案用 Markdown 名称、PASS 字样、勾选符号或中文通过表述总结测试时，grounding 可以将这些表达与有界 tool-result preview 中的测试符号和 PASS 标记做归一化匹配。这只是测试结果表述的格式等价，不放宽 package、command、release 或 secret-sensitive claim 的证据要求。
+
 ## Model-Visible Workspace Hygiene
 
-The measured CLI may use clean benchmark workspaces under the product-controlled `.deepseek/swebench-workspaces` area, but model-visible read, list, glob, and search tools must hide evaluator artifacts and runtime caches. Hidden model-visible segments include prior evaluation outputs, harness reports, `.pytest_cache`, `__pycache__`, and local virtual environment internals such as `.venv`. Governed shell execution may still use `.venv` inside the benchmark repository for dependency setup and verification; the restriction is about model-visible evidence, not about disabling the repo-local test environment.
+The measured CLI may use clean benchmark workspaces under the product-controlled `.deepseek/swebench-workspaces` area, but model-visible read, list, glob, and search tools must hide evaluator artifacts and runtime caches. Hidden model-visible segments include prior evaluation outputs, harness reports, `.pytest_cache`, `__pycache__`, and local virtual environment internals such as `.venv`. Governed shell execution may still use `.venv` inside the benchmark repository, including workspace-contained absolute `.venv` paths, for dependency setup and verification; the restriction is about model-visible evidence, not about disabling the repo-local test environment.
 
-被测 CLI 可以使用产品控制的 `.deepseek/swebench-workspaces` 下的干净 benchmark workspace，但模型可见的 read、list、glob 与 search 工具必须隐藏评测员产物与运行缓存。模型不可见的 segment 包括历史 evaluation output、harness report、`.pytest_cache`、`__pycache__` 与 `.venv` 等本地 virtual environment 内部文件。受治理的 shell execution 仍可在 benchmark repository 内使用 `.venv` 做依赖安装与验证；这个限制针对模型可见 evidence，不是禁用 repo-local test environment。
+被测 CLI 可以使用产品控制的 `.deepseek/swebench-workspaces` 下的干净 benchmark workspace，但模型可见的 read、list、glob 与 search 工具必须隐藏评测员产物与运行缓存。模型不可见的 segment 包括历史 evaluation output、harness report、`.pytest_cache`、`__pycache__` 与 `.venv` 等本地 virtual environment 内部文件。受治理的 shell execution 仍可在 benchmark repository 内使用 `.venv`，包括 workspace 内绝对 `.venv` 路径，做依赖安装与验证；这个限制针对模型可见 evidence，不是禁用 repo-local test environment。
 
 ## Tool Preflight Repair Boundary
 

@@ -164,7 +164,13 @@ function internalArtifactPathReference(command: string, args: readonly string[])
   return [command, ...args]
     .flatMap((value) => String(value).split(/\s+/))
     .map((value) => value.replace(/^['"]|['"]$/g, ""))
-    .find((value) => value.includes(".deepseek/") && !isModelVisibleWorkspaceRelativePath(value.slice(value.indexOf(".deepseek/"))));
+    .find((value) => value.includes(".deepseek/") && !isShellAccessibleDeepseekPath(value.slice(value.indexOf(".deepseek/"))));
+}
+
+function isShellAccessibleDeepseekPath(path: string): boolean {
+  const normalized = path.replace(/\\/g, "/").replace(/\/+/g, "/").replace(/\/$/, "");
+  if (/^\.deepseek\/swebench-workspaces\/[^/]+\/repo\/\.venv(?:\/|$)/.test(normalized)) return true;
+  return isModelVisibleWorkspaceRelativePath(normalized);
 }
 
 function hostPackageInstallViolation(command: string, args: readonly string[]): string | undefined {
