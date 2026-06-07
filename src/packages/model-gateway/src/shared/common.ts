@@ -163,10 +163,17 @@ export function formatAnthropicToolChoice(choice: ModelToolChoice): JsonValue {
 }
 
 export function usageEvent(inputTokens: number, outputTokens: number, cacheReadInputTokens: number | undefined, provider: ModelProviderEventMetadata): ModelStreamEvent {
+  const cache = cacheReadInputTokens !== undefined
+    ? {
+        hitTokens: cacheReadInputTokens,
+        missTokens: Math.max(0, inputTokens),
+        hitRate: cacheReadInputTokens + inputTokens > 0 ? cacheReadInputTokens / (cacheReadInputTokens + inputTokens) : 0
+      }
+    : undefined;
   const metadata: ModelUsageMetadata = {
     inputTokens,
     outputTokens,
-    ...(cacheReadInputTokens !== undefined ? { cache: { hitTokens: cacheReadInputTokens } } : {}),
+    ...(cache ? { cache } : {}),
     provider
   };
   return {

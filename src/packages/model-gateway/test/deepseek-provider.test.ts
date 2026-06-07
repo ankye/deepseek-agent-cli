@@ -786,6 +786,6 @@ describe("GLM Anthropic-compatible provider", () => {
     assert.equal(usageEvents.length, 1);
     assert.equal(usageEvents[0]?.kind === "usage" ? usageEvents[0].inputTokens : 0, 183);
     assert.equal(usageEvents[0]?.kind === "usage" ? usageEvents[0].outputTokens : 0, 13);
-    assert.deepEqual(usageEvents[0]?.kind === "usage" ? usageEvents[0].metadata?.cache : undefined, { hitTokens: 0 });
+    assert.deepEqual(usageEvents[0]?.kind === "usage" ? usageEvents[0].metadata?.cache : undefined, { hitTokens: 0, missTokens: 183, hitRate: 0 });
   });
 });

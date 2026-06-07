@@ -36,6 +36,56 @@ describe("agent loop typed tool feedback", () => {
     assert.equal(hasLoneSurrogate(preview.text), false);
   });
 
+  it("bounds tool result continuation messages before sending them back to the model", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    const longOutput = `${"x".repeat(240)}SHOULD_NOT_REACH_MODEL`;
+    await deps.capabilities.register({
+      ...runtimeEchoCapability,
+      id: "runtime.large-tool-output" as typeof runtimeEchoCapability.id,
+      name: "Runtime Large Tool Output",
+      sideEffect: "none",
+      permissions: []
+    }, async () => ({
+      ok: true,
+      value: {
+        evidence: {
+          tool: "large.output",
+          status: "completed",
+          affectedPaths: [],
+          preview: {
+            text: longOutput,
+            byteLength: Buffer.byteLength(longOutput, "utf8"),
+            lineCount: 1,
+            truncated: false,
+            limitBytes: Buffer.byteLength(longOutput, "utf8"),
+            redaction: { class: "internal" }
+          },
+          diagnostics: [],
+          metadata: {},
+          replay: {},
+          redaction: { class: "internal", fields: ["preview.text"] }
+        }
+      }
+    }));
+    const gateway = new RecordingSingleToolCallModelGateway("runtime.large-tool-output", {});
+    const loopDeps = { ...deps, models: gateway };
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+    await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "run large tool",
+      caller: "runtime.feedback.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      limits: { maxOutputBytes: 80 }
+    }));
+
+    const toolMessage = gateway.requests[1]?.messages?.find((message) => message.role === "tool");
+    assert.ok(toolMessage, "second model request should include bounded tool feedback");
+    assert.equal(Buffer.byteLength(toolMessage.content, "utf8") <= 80, true);
+    assert.equal(toolMessage.content.includes("SHOULD_NOT_REACH_MODEL"), false);
+    await kernel.shutdown();
+  });
+
   it("emits a success feedback DTO when a tool execution completes", async () => {
     const deps = createDeterministicRuntimeDependencies();
     await deps.platform.writeFile("/workspace/README.md", "feedback success\n");

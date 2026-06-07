@@ -935,7 +935,6 @@ export async function* runAgentLoop(
         }
         const terminal = lastRuntimeEvent(toolEvents, (event) => event.kind === "capability.completed" || event.kind === "capability.failed" || event.kind === "capability.cancelled" || event.kind === "execution.rejected");
         const toolResultText = modelToolResultText(terminal);
-        messages.push({ role: "tool", content: toolResultText, toolCallId, toolName });
         const feedbackStatus = executionFeedbackStatus(terminal);
         const recoverableToolFailure = isRecoverableToolError(terminal?.error);
         const executionFeedback = buildToolResultFeedback({
@@ -949,6 +948,7 @@ export async function* runAgentLoop(
           limitBytes: limits.maxOutputBytes,
           ...(terminal?.kind === "capability.completed" || recoverableToolFailure ? { continuation: "continue" as const } : {})
         });
+        messages.push({ role: "tool", content: executionFeedback.preview.text, toolCallId, toolName });
         const resultEvent = agentLoopEvent("model.tool.result", sessionId, turnId, trace, {
           toolCallId,
           toolName,

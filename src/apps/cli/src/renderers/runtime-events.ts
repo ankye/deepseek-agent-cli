@@ -184,15 +184,16 @@ export function statusTelemetryFromEvents(events: readonly RuntimeEvent[]): Cont
   const reasoningEvent = [...events].reverse().find((event) => event.kind === "model.reasoning.effort.mapped");
   const contextEvent = [...events].reverse().find((event) => event.kind === "context.projection.completed" || event.kind === "context.projection.cache-hit" || event.kind === "context.projection.degraded");
   const usageEvent = [...events].reverse().find((event) => event.kind === "usage.updated");
+  const aggregateCache = aggregateCacheTelemetry(events);
   const contextBudget = jsonObject(contextEvent?.data.budget) ?? jsonObject(jsonObject(modelEvent?.data.contextProjection)?.budget);
   const usageMetadata = jsonObject(usageEvent?.data.metadata);
   const cache = jsonObject(usageMetadata?.cache);
-  const hitTokens = numberValue(cache?.hitTokens);
-  const missTokens = numberValue(cache?.missTokens);
+  const hitTokens = aggregateCache?.hitTokens ?? numberValue(cache?.hitTokens);
+  const missTokens = aggregateCache?.missTokens ?? numberValue(cache?.missTokens);
   const derivedHitRate = hitTokens !== undefined || missTokens !== undefined
     ? ratio(hitTokens ?? 0, (hitTokens ?? 0) + (missTokens ?? 0))
     : undefined;
-  const hitRate = numberValue(cache?.hitRate) ?? derivedHitRate;
+  const hitRate = aggregateCache?.hitRate ?? numberValue(cache?.hitRate) ?? derivedHitRate;
   const selectedTokens = numberValue(contextBudget?.selectedTokens) ?? numberValue(contextBudget?.selectedTokensEstimate) ?? numberValue(contextEvent?.data.estimatedTokens) ?? 0;
   const hardLimitTokens = numberValue(contextBudget?.hardLimitTokens) ?? numberValue(contextBudget?.hardLimit) ?? 0;
   const softLimitTokens = numberValue(contextBudget?.softLimitTokens);
@@ -236,6 +237,28 @@ function cacheStatus(cache: JsonObject | undefined, hitTokens: number | undefine
   const explicit = stringValue(cache?.status);
   if (explicit === "available" || explicit === "estimated" || explicit === "unavailable") return explicit;
   return hitTokens !== undefined || missTokens !== undefined ? "available" : "unavailable";
+}
+
+function aggregateCacheTelemetry(events: readonly RuntimeEvent[]): { readonly hitTokens: number; readonly missTokens: number; readonly hitRate: number } | undefined {
+  let hitTokens = 0;
+  let missTokens = 0;
+  let sawCache = false;
+  for (const event of events) {
+    if (event.kind !== "usage.updated") continue;
+    const cache = jsonObject(jsonObject(event.data.metadata)?.cache);
+    const hit = numberValue(cache?.hitTokens);
+    const miss = numberValue(cache?.missTokens) ?? numberValue(event.data.inputTokens);
+    if (hit === undefined && miss === undefined) continue;
+    sawCache = true;
+    hitTokens += hit ?? 0;
+    missTokens += miss ?? 0;
+  }
+  if (!sawCache) return undefined;
+  return {
+    hitTokens,
+    missTokens,
+    hitRate: ratio(hitTokens, hitTokens + missTokens) ?? 0
+  };
 }
 
 function budgetPressure(selectedTokens: number, hardLimitTokens: number, softLimitTokens: number | undefined): ContextStatuslineTelemetry["context"]["budgetPressure"] {

@@ -143,6 +143,26 @@ describe("chat TUI framework", () => {
     assert.equal(JSON.stringify(telemetry).includes("prefix-kernel"), false);
   });
 
+  it("projects aggregate cache telemetry across model requests instead of the final request only", () => {
+    const telemetry = statusTelemetryFromEvents([
+      runtimeEvent("model.requested", { model: "glm-5.1" }),
+      runtimeEvent("usage.updated", {
+        inputTokens: 200,
+        outputTokens: 20,
+        metadata: { cache: { hitTokens: 800, missTokens: 200 } }
+      }),
+      runtimeEvent("usage.updated", {
+        inputTokens: 900,
+        outputTokens: 40,
+        metadata: { cache: { hitTokens: 100, missTokens: 900 } }
+      })
+    ]);
+
+    assert.equal(telemetry.cache.hitTokens, 900);
+    assert.equal(telemetry.cache.missTokens, 1100);
+    assert.equal(telemetry.cache.hitRate, 0.45);
+  });
+
   it("records degraded diagnostics when terminal profile cannot host interactive TUI", () => {
     const state = createChatTuiState({
       enabled: false,
