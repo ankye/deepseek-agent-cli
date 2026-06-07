@@ -124,6 +124,49 @@ describe("SWE-bench prediction adapter", () => {
     assert.equal(JSON.stringify(summary).includes("GLM_ANTHROPIC_API_KEY"), false);
   });
 
+  it("preserves child CLI traces and appends supervised prediction records", async () => {
+    const platform = new FakeSweBenchPlatform("fake");
+    await platform.writeFile("/workspace/instance.json", JSON.stringify({
+      instance_id: "demo__repo-1",
+      repo: "demo/repo",
+      base_commit: "0123456789abcdef0123456789abcdef01234567",
+      problem_statement: "Demo issue should update the placeholder value."
+    }));
+    await platform.writeFile("/workspace/predictions/glm.jsonl", `${JSON.stringify({
+      instance_id: "demo__repo-0",
+      model_name_or_path: "glm-5.1",
+      model_patch: "diff --git a/old b/old\n"
+    })}\n`);
+
+    const summary = await collectSweBenchPrediction({
+      action: "predict",
+      dryRun: false,
+      live: true,
+      instanceFile: "/workspace/instance.json",
+      repoDir: "/workspace/repo",
+      outputPath: "/workspace/predictions/glm.jsonl",
+      traceOutputPath: "/workspace/traces/demo__repo-1.jsonl",
+      appendOutput: true,
+      modelProvider: "glm",
+      model: "glm-5.1",
+      extraArgs: [],
+      platform
+    });
+
+    const trace = await platform.readFile("/workspace/traces/demo__repo-1.jsonl");
+    const lines = (await platform.readFile("/workspace/predictions/glm.jsonl")).split(/\r?\n/).filter(Boolean);
+    const appended = JSON.parse(lines[1] as string) as JsonObject;
+
+    assert.equal(summary.status, "pass");
+    assert.equal(trace, "{\"kind\":\"agent.loop.completed\"}\n");
+    assert.equal(lines.length, 2);
+    assert.equal(appended.instance_id, "demo__repo-1");
+    assert.equal(typeof appended.model_patch === "string" && appended.model_patch.includes("result = new_value"), true);
+    assert.equal(summary.traceOutputPath, "/workspace/traces/demo__repo-1.jsonl");
+    assert.equal(JSON.stringify(summary).includes("agent.loop.completed"), false);
+    assert.equal(summary.redaction.fields?.includes("traceOutputPath"), true);
+  });
+
   it("runs the official harness for a prediction and records the resolved report", async () => {
     const platform = new FakeSweBenchPlatform("fake");
     await platform.writeFile("/workspace/predictions/glm.jsonl", JSON.stringify({

@@ -254,7 +254,7 @@ export function cliUsageLines(): readonly string[] {
     "  deepseek palette action <action> <target-id> [--output text|json|jsonl]",
     "  deepseek revert preview --request <id>|--turn <id>|--session <id> [--path <path>] [--output text|json|jsonl]",
     "  deepseek revert apply --request <id>|--turn <id>|--session <id> [--path <path>] [--output text|json|jsonl]",
-    "  deepseek diagnostics bundle|release|doctor|verify|refresh|evaluate|env|flow|swe-bench [prepare|inspect|predict|evaluate] [--prompt <text>] [--profile <id>] [--execute] [--baseline <id>] [--instance-file <path>] [--repo-dir <path>] [--output-path <path>] [--predictions-path <path>] [--report-dir <path>] [--run-id <id>] [--instance-id <id>] [--cache-trace-path <jsonl>] [--cache-hit-target <rate>] [--full] [--dry-run] [--live] [--output text|json|jsonl]",
+    "  deepseek diagnostics bundle|release|doctor|verify|refresh|evaluate|env|flow|swe-bench [prepare|inspect|predict|evaluate] [--prompt <text>] [--profile <id>] [--execute] [--baseline <id>] [--instance-file <path>] [--repo-dir <path>] [--output-path <path>] [--predictions-path <path>] [--trace-output-path <jsonl>] [--append-output] [--report-dir <path>] [--run-id <id>] [--instance-id <id>] [--cache-trace-path <jsonl>] [--cache-hit-target <rate>] [--full] [--dry-run] [--live] [--output text|json|jsonl]",
     "  deepseek tools-smoke [--output text|jsonl]",
     "  deepseek <init|config|auth|doctor|privacy|verify-install> [--output text|json]",
     "Notes:",
@@ -289,7 +289,6 @@ function parseCheckInput(args: readonly string[]): JsonObject {
     args: commandArguments(args, 2, new Set(["--output"]))
   };
 }
-
 function parseFileAction(value: string | undefined): NonNullable<CliOptions["fileAction"]> {
   if (value === "preview") return "preview";
   if (value === "refs" || value === "references") return "references";
@@ -562,6 +561,7 @@ function parseDiagnosticsInput(command: DiagnosticsCommandName, args: readonly s
     const repoDir = readFlagValue(args, "--repo-dir");
     const outputPath = readFlagValue(args, "--output-path");
     const predictionsPath = readFlagValue(args, "--predictions-path");
+    const traceOutputPath = readFlagValue(args, "--trace-output-path");
     const reportDir = readFlagValue(args, "--report-dir");
     const runId = readFlagValue(args, "--run-id");
     const datasetName = readFlagValue(args, "--dataset-name");
@@ -574,6 +574,8 @@ function parseDiagnosticsInput(command: DiagnosticsCommandName, args: readonly s
     if (repoDir) input.repoDir = repoDir;
     if (outputPath) input.outputPath = outputPath;
     if (predictionsPath) input.predictionsPath = predictionsPath;
+    if (traceOutputPath) input.traceOutputPath = traceOutputPath;
+    if (args.includes("--append-output")) input.appendOutput = true;
     if (reportDir) input.reportDir = reportDir;
     if (runId) input.runId = runId;
     if (datasetName) input.datasetName = datasetName;
@@ -584,7 +586,7 @@ function parseDiagnosticsInput(command: DiagnosticsCommandName, args: readonly s
     if (instanceIds.length > 0) input.instanceIds = instanceIds;
     const timeoutMs = parsePositiveNumberFlag(args, "--timeout-ms");
     if (timeoutMs) input.timeoutMs = timeoutMs;
-    input.extraArgs = extraDiagnosticsArgs(args, new Set(["--dry-run"]), new Set(["predict", "evaluate"]));
+    input.extraArgs = extraDiagnosticsArgs(args, new Set(["--dry-run", "--append-output"]), new Set(["predict", "evaluate"]));
   }
   return input as JsonObject;
 }
@@ -614,7 +616,7 @@ function extraDiagnosticsArgs(args: readonly string[], knownBooleanFlags: Readon
       value === "--instance-file" ||
       value === "--repo-dir" ||
       value === "--output-path" ||
-      value === "--predictions-path" ||
+      value === "--predictions-path" || value === "--trace-output-path" ||
       value === "--report-dir" ||
       value === "--run-id" ||
       value === "--instance-id" ||

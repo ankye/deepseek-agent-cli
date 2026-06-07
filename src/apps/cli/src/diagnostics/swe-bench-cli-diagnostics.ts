@@ -12,6 +12,8 @@ export async function collectSweBenchCliDiagnostics(options: CliOptions): Promis
     ...(typeof options.diagnosticsInput?.repoDir === "string" ? { repoDir: options.diagnosticsInput.repoDir } : {}),
     ...(typeof options.diagnosticsInput?.outputPath === "string" ? { outputPath: options.diagnosticsInput.outputPath } : {}),
     ...(typeof options.diagnosticsInput?.predictionsPath === "string" ? { outputPath: options.diagnosticsInput.predictionsPath } : {}),
+    ...(typeof options.diagnosticsInput?.traceOutputPath === "string" ? { traceOutputPath: options.diagnosticsInput.traceOutputPath } : {}),
+    ...(options.diagnosticsInput?.appendOutput === true ? { appendOutput: true } : {}),
     ...(typeof options.diagnosticsInput?.reportDir === "string" ? { reportDir: options.diagnosticsInput.reportDir } : {}),
     ...(typeof options.diagnosticsInput?.runId === "string" ? { runId: options.diagnosticsInput.runId } : {}),
     ...(Array.isArray(options.diagnosticsInput?.instanceIds) ? { instanceIds: options.diagnosticsInput.instanceIds.filter((item): item is string => typeof item === "string") } : {}),
@@ -34,6 +36,6 @@ export async function collectSweBenchCliDiagnostics(options: CliOptions): Promis
     command: "swe-bench",
     sweBench,
     referencePitFixtureIds: [...diagnosticPitIds],
-    redaction: { class: "internal", fields: ["sweBench.repoDir", "sweBench.outputPath", "sweBench.evaluation.cache.tracePath", "sweBench.predictions.model_patch", "sweBench.commandPlan.args", "sweBench.executedCommands.args", "sweBench.diagnostics.metadata"] }
+    redaction: { class: "internal", fields: ["sweBench.repoDir", "sweBench.outputPath", "sweBench.traceOutputPath", "sweBench.evaluation.cache.tracePath", "sweBench.predictions.model_patch", "sweBench.commandPlan.args", "sweBench.executedCommands.args", "sweBench.diagnostics.metadata"] }
   };
 }

@@ -429,6 +429,49 @@ describe("cli host adapter", () => {
       ]).diagnosticsInput?.cacheHitTarget,
       0
     );
+    assert.deepEqual(parseCliArgs([
+      "diagnostics",
+      "swe-bench",
+      "predict",
+      "--instance-file",
+      ".deepseek/swe-lite-runs/demo/instance.json",
+      "--repo-dir",
+      ".deepseek/swe-lite-runs/demo/repo",
+      "--output-path",
+      ".deepseek/swe-lite-runs/predictions.jsonl",
+      "--trace-output-path",
+      ".deepseek/swe-lite-runs/traces/demo.jsonl",
+      "--append-output",
+      "--live",
+      "--provider",
+      "glm",
+      "--model",
+      "glm-5.1",
+      "--output",
+      "json"
+    ]), {
+      command: "diagnostics",
+      diagnosticsCommand: "swe-bench",
+      prompt: "",
+      output: "json",
+      live: true,
+      modelProvider: "glm",
+      model: "glm-5.1",
+      diagnosticsInput: {
+        command: "swe-bench",
+        live: true,
+        action: "predict",
+        dryRun: false,
+        instanceFile: ".deepseek/swe-lite-runs/demo/instance.json",
+        repoDir: ".deepseek/swe-lite-runs/demo/repo",
+        outputPath: ".deepseek/swe-lite-runs/predictions.jsonl",
+        traceOutputPath: ".deepseek/swe-lite-runs/traces/demo.jsonl",
+        appendOutput: true,
+        provider: "glm",
+        model: "glm-5.1",
+        extraArgs: []
+      }
+    });
     assert.deepEqual(parseCliArgs(["diagnostics", "refresh", "--full", "--dry-run", "--output", "jsonl"]), {
       command: "diagnostics",
       diagnosticsCommand: "refresh",

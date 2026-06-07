@@ -1,0 +1,11 @@
+- [x] Add OpenSpec scenario for supervised prediction trace capture and append output.
+- [x] Add failing adapter test for child trace persistence and prediction append.
+- [x] Add failing parser test for `--trace-output-path` and `--append-output`.
+- [x] Implement minimal adapter/parser support with internal redaction.
+- [x] Run focused tests, OpenSpec validation, typecheck, lint, boundaries, full tests, and commit.
+
+- [x] 增加监督式 prediction trace capture 与 append output 的 OpenSpec 场景。
+- [x] 增加 child trace persistence 与 prediction append 的 adapter 红测。
+- [x] 增加 `--trace-output-path` 与 `--append-output` 的 parser 红测。
+- [x] 实现最小 adapter/parser 支持，并保持 internal redaction。
+- [x] 运行 focused tests、OpenSpec validation、typecheck、lint、boundaries、全量 tests，并提交。

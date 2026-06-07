@@ -74,6 +74,7 @@ export interface SweBenchPredictionSummary extends JsonObject {
   readonly instanceId?: string;
   readonly repoDir?: string;
   readonly outputPath?: string;
+  readonly traceOutputPath?: string;
   readonly invocation: JsonObject;
   readonly predictions: readonly SweBenchPredictionRecord[];
   readonly commandPlan: readonly JsonObject[];
@@ -98,6 +99,8 @@ export interface CollectSweBenchPredictionOptions {
   readonly harnessPython?: string;
   readonly cacheTracePath?: string;
   readonly cacheHitTarget?: number;
+  readonly traceOutputPath?: string;
+  readonly appendOutput?: boolean;
   readonly modelProvider?: "deepseek" | "glm";
   readonly model?: string;
   readonly timeoutMs?: number;
@@ -162,13 +165,15 @@ export async function collectSweBenchPrediction(options: CollectSweBenchPredicti
         stderrBytes: result.stderr.length
       }));
     }
+    if (nonEmpty(options.traceOutputPath)) {
+      await writeChildTrace(platform, options.traceOutputPath as string, result.stdout);
+    }
   }
 
   const patch = options.dryRun ? "" : await collectGitDiff(platform, repoDir, diagnostics, executedCommands);
   const prediction = predictionRecord(instance.instanceId, modelName, patch);
   if (!options.dryRun) {
-    await platform.ensureDirectory(dirname(options.outputPath as string));
-    await platform.writeFile(options.outputPath as string, `${JSON.stringify(prediction)}\n`);
+    await writePredictionRecord(platform, options.outputPath as string, prediction, options.appendOutput === true);
   }
   if (!options.dryRun && patch.trim().length === 0) {
     diagnostics.push(diagnostic("SWE_BENCH_EMPTY_PATCH", "warn", "SWE-bench prediction patch is empty after the agent run."));
@@ -262,20 +267,22 @@ function summary(
     ...(instance ? { instanceId: instance.instanceId } : {}),
     ...(options.repoDir ? { repoDir: options.repoDir } : {}),
     ...(options.outputPath ? { outputPath: options.outputPath } : {}),
+    ...(options.traceOutputPath ? { traceOutputPath: options.traceOutputPath } : {}),
     invocation: {
       provider: options.modelProvider ?? "deepseek",
       providerSource: options.modelProvider ? "explicit" : "default",
       model: options.model ?? (options.modelProvider === "glm" ? "glm-5.1" : "deepseek-cli"),
       live: options.live,
       dryRun: options.dryRun,
-      action: options.action
+      action: options.action,
+      ...(options.appendOutput !== undefined ? { appendOutput: options.appendOutput } : {})
     },
     predictions,
     commandPlan,
     executedCommands,
     ...(evaluation ? { evaluation } : {}),
     diagnostics,
-    redaction: { class: "internal", fields: ["repoDir", "outputPath", "evaluation.predictionsPath", "evaluation.reportDir", "evaluation.reportPath", "evaluation.cache.tracePath", "predictions.model_patch", "diagnostics.metadata", "commandPlan.args", "executedCommands.args"] }
+    redaction: { class: "internal", fields: ["repoDir", "outputPath", "traceOutputPath", "evaluation.predictionsPath", "evaluation.reportDir", "evaluation.reportPath", "evaluation.cache.tracePath", "predictions.model_patch", "diagnostics.metadata", "commandPlan.args", "executedCommands.args"] }
   };
 }
 
@@ -640,6 +647,38 @@ async function collectGitDiff(
     return "";
   }
   return result.stdout;
+}
+
+async function writeChildTrace(platform: PlatformRuntime, traceOutputPath: string, stdout: string): Promise<void> {
+  await platform.ensureDirectory(dirname(traceOutputPath));
+  await platform.writeFile(traceOutputPath, stdout);
+}
+
+async function writePredictionRecord(
+  platform: PlatformRuntime,
+  outputPath: string,
+  prediction: SweBenchPredictionRecord,
+  appendOutput: boolean
+): Promise<void> {
+  await platform.ensureDirectory(dirname(outputPath));
+  const line = `${JSON.stringify(prediction)}\n`;
+  if (!appendOutput) {
+    await platform.writeFile(outputPath, line);
+    return;
+  }
+  const existing = await readExistingFileOrEmpty(platform, outputPath);
+  const prefix = existing.length === 0 || existing.endsWith("\n") ? existing : `${existing}\n`;
+  await platform.writeFile(outputPath, `${prefix}${line}`);
+}
+
+async function readExistingFileOrEmpty(platform: PlatformRuntime, path: string): Promise<string> {
+  try {
+    return await platform.readFile(path);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes("not found") || message.includes("ENOENT")) return "";
+    throw error;
+  }
 }
 
 function childCommandPlan(instance: SweBenchInstance, options: CollectSweBenchPredictionOptions, modelName: string): JsonObject {
