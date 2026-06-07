@@ -2,6 +2,8 @@ import { dirname, isAbsolute, join } from "node:path";
 import type { JsonObject, PlatformRuntime } from "@deepseek/platform-contracts";
 import { NodePlatformRuntime } from "@deepseek/platform-abstraction";
 import { evaluationLiveCredentialEnv, evaluationModelSelectionArgs } from "./evaluation-provider-selection.js";
+import { summarizeSweBenchChildTrace } from "./swe-bench-child-trace.js";
+import type { SweBenchChildTraceSummary } from "./swe-bench-child-trace.js";
 
 export interface SweBenchPredictionDiagnostic extends JsonObject {
   readonly code: string;
@@ -79,6 +81,7 @@ export interface SweBenchPredictionSummary extends JsonObject {
   readonly predictions: readonly SweBenchPredictionRecord[];
   readonly commandPlan: readonly JsonObject[];
   readonly executedCommands: readonly JsonObject[];
+  readonly childTrace?: SweBenchChildTraceSummary;
   readonly evaluation?: SweBenchEvaluationSummary;
   readonly diagnostics: readonly SweBenchPredictionDiagnostic[];
   readonly redaction: { readonly class: "internal"; readonly fields?: readonly string[] };
@@ -149,6 +152,7 @@ export async function collectSweBenchPrediction(options: CollectSweBenchPredicti
   const repoDir = options.repoDir as string;
   const commandPlan = [childCommandPlan(instance, options, modelName), gitDiffCommandPlan(repoDir)];
   const executedCommands: JsonObject[] = [];
+  let childTrace: SweBenchChildTraceSummary | undefined;
 
   if (options.live && !options.dryRun) {
     const command = await childCommand(platform, instance, options, modelName);
@@ -168,6 +172,17 @@ export async function collectSweBenchPrediction(options: CollectSweBenchPredicti
     if (nonEmpty(options.traceOutputPath)) {
       await writeChildTrace(platform, options.traceOutputPath as string, result.stdout);
     }
+    childTrace = summarizeSweBenchChildTrace(result.stdout, options.traceOutputPath);
+    if (childTrace.terminalKind === "agent.loop.failed" || childTrace.terminalKind === "agent.loop.cancelled") {
+      diagnostics.push(diagnostic("SWE_BENCH_CHILD_TRACE_TERMINAL_FAILED", "warn", "SWE-bench child CLI trace did not end with a clean completed event.", {
+        terminalKind: childTrace.terminalKind,
+        terminalStatus: childTrace.terminalStatus,
+        terminalReason: childTrace.terminalReason,
+        iterationCount: childTrace.iterationCount,
+        modelRequestCount: childTrace.modelRequestCount,
+        toolIntentCount: childTrace.toolIntentCount
+      }));
+    }
   }
 
   const patch = options.dryRun ? "" : await collectGitDiff(platform, repoDir, diagnostics, executedCommands);
@@ -179,7 +194,7 @@ export async function collectSweBenchPrediction(options: CollectSweBenchPredicti
     diagnostics.push(diagnostic("SWE_BENCH_EMPTY_PATCH", "warn", "SWE-bench prediction patch is empty after the agent run."));
   }
 
-  return summary(options, diagnostics, [prediction], commandPlan, executedCommands, instance, undefined);
+  return summary(options, diagnostics, [prediction], commandPlan, executedCommands, instance, undefined, childTrace);
 }
 
 export function sweBenchPredictionJsonLines(summary: SweBenchPredictionSummary): readonly JsonObject[] {
@@ -227,6 +242,9 @@ export function renderSweBenchPredictionText(summary: SweBenchPredictionSummary)
     `- predictions: ${summary.predictions.length}`
   ];
   if (summary.outputPath) lines.push(`- output: ${summary.outputPath}`);
+  if (summary.childTrace) {
+    lines.push(`- child trace: terminal=${summary.childTrace.terminalKind ?? "unknown"} reason=${summary.childTrace.terminalReason ?? "none"} iterations=${summary.childTrace.iterationCount} modelRequests=${summary.childTrace.modelRequestCount} toolIntents=${summary.childTrace.toolIntentCount}`);
+  }
   for (const prediction of summary.predictions) {
     lines.push(`- ${prediction.instance_id}: patchBytes=${prediction.model_patch.length} model=${prediction.model_name_or_path}`);
   }
@@ -253,7 +271,8 @@ function summary(
   commandPlan: readonly JsonObject[],
   executedCommands: readonly JsonObject[],
   instance: SweBenchInstance | undefined,
-  evaluation: SweBenchEvaluationSummary | undefined
+  evaluation: SweBenchEvaluationSummary | undefined,
+  childTrace: SweBenchChildTraceSummary | undefined = undefined
 ): SweBenchPredictionSummary {
   const hasError = diagnostics.some((entry) => entry.severity === "error");
   const hasWarn = diagnostics.some((entry) => entry.severity === "warn");
@@ -280,9 +299,10 @@ function summary(
     predictions,
     commandPlan,
     executedCommands,
+    ...(childTrace ? { childTrace } : {}),
     ...(evaluation ? { evaluation } : {}),
     diagnostics,
-    redaction: { class: "internal", fields: ["repoDir", "outputPath", "traceOutputPath", "evaluation.predictionsPath", "evaluation.reportDir", "evaluation.reportPath", "evaluation.cache.tracePath", "predictions.model_patch", "diagnostics.metadata", "commandPlan.args", "executedCommands.args"] }
+    redaction: { class: "internal", fields: ["repoDir", "outputPath", "traceOutputPath", "childTrace.tracePath", "evaluation.predictionsPath", "evaluation.reportDir", "evaluation.reportPath", "evaluation.cache.tracePath", "predictions.model_patch", "diagnostics.metadata", "commandPlan.args", "executedCommands.args"] }
   };
 }
 

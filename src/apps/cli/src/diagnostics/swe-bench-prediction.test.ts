@@ -6,6 +6,7 @@ import { collectSweBenchPrediction, sweBenchPredictionJsonLines } from "./swe-be
 
 class FakeSweBenchPlatform extends FakePlatformRuntime {
   readonly executedCommands: { readonly command: string; readonly args: readonly string[]; readonly cwd?: string; readonly env?: JsonObject }[] = [];
+  agentStdout = "{\"kind\":\"agent.loop.completed\"}\n";
 
   override async runProcess(command: string, args: readonly string[], options: ProcessRunOptions = {}): Promise<ProcessResult> {
     this.executedCommands.push({
@@ -75,7 +76,7 @@ class FakeSweBenchPlatform extends FakePlatformRuntime {
     }
     return {
       exitCode: 0,
-      stdout: "{\"kind\":\"agent.loop.completed\"}\n",
+      stdout: this.agentStdout,
       stderr: "",
       metadata: fakeProviderMetadata()
     };
@@ -163,8 +164,53 @@ describe("SWE-bench prediction adapter", () => {
     assert.equal(appended.instance_id, "demo__repo-1");
     assert.equal(typeof appended.model_patch === "string" && appended.model_patch.includes("result = new_value"), true);
     assert.equal(summary.traceOutputPath, "/workspace/traces/demo__repo-1.jsonl");
-    assert.equal(JSON.stringify(summary).includes("agent.loop.completed"), false);
+    assert.equal(summary.childTrace?.terminalKind, "agent.loop.completed");
+    assert.equal(summary.childTrace?.modelRequestCount, 0);
+    assert.equal(JSON.stringify(summary).includes("\"kind\":\"agent.loop.completed\""), false);
     assert.equal(summary.redaction.fields?.includes("traceOutputPath"), true);
+  });
+
+  it("warns when the supervised child trace ends in a failed terminal event", async () => {
+    const platform = new FakeSweBenchPlatform("fake");
+    platform.agentStdout = [
+      JSON.stringify({ kind: "model.requested", data: { iteration: 1 } }),
+      JSON.stringify({ kind: "model.delta", data: { text: "raw model body should stay in the trace file only" } }),
+      JSON.stringify({ kind: "model.tool.intent", data: { toolName: "core.shell.run", iteration: 1 } }),
+      JSON.stringify({ kind: "usage.updated", data: { inputTokens: 100, outputTokens: 10 } }),
+      JSON.stringify({ kind: "agent.loop.failed", data: { status: "rejected", reason: "model-iteration-limit", iterations: 48, toolCalls: 48 } }),
+      ""
+    ].join("\n");
+    await platform.writeFile("/workspace/instance.json", JSON.stringify({
+      instance_id: "demo__repo-1",
+      repo: "demo/repo",
+      base_commit: "0123456789abcdef0123456789abcdef01234567",
+      problem_statement: "Demo issue should update the placeholder value."
+    }));
+
+    const summary = await collectSweBenchPrediction({
+      action: "predict",
+      dryRun: false,
+      live: true,
+      instanceFile: "/workspace/instance.json",
+      repoDir: "/workspace/repo",
+      outputPath: "/workspace/predictions/glm.jsonl",
+      traceOutputPath: "/workspace/traces/demo__repo-1.jsonl",
+      modelProvider: "glm",
+      model: "glm-5.1",
+      extraArgs: [],
+      platform
+    });
+
+    assert.equal(summary.status, "warn");
+    assert.equal(summary.childTrace?.terminalKind, "agent.loop.failed");
+    assert.equal(summary.childTrace?.terminalStatus, "rejected");
+    assert.equal(summary.childTrace?.terminalReason, "model-iteration-limit");
+    assert.equal(summary.childTrace?.iterationCount, 48);
+    assert.equal(summary.childTrace?.modelRequestCount, 1);
+    assert.equal(summary.childTrace?.usageEventCount, 1);
+    assert.equal(summary.childTrace?.toolIntentCount, 1);
+    assert.equal(summary.diagnostics.some((entry) => entry.code === "SWE_BENCH_CHILD_TRACE_TERMINAL_FAILED"), true);
+    assert.equal(JSON.stringify(summary).includes("raw model body"), false);
   });
 
   it("runs the official harness for a prediction and records the resolved report", async () => {
