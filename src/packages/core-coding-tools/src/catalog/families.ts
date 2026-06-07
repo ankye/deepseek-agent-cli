@@ -46,6 +46,7 @@ const familyCapabilityIds = {
   hookListRun: asId<"capability">("hook-system.list-run"),
   pluginInstallVerify: asId<"capability">("skill-system.plugin-install-verify"),
   commandPaletteSlash: asId<"capability">("command-system.palette-slash"),
+  envPrepare: asId<"capability">("core.env.prepare"),
   imageGenerate: asId<"capability">("model-gateway.image-generate"),
   imageEdit: asId<"capability">("model-gateway.image-edit"),
   imageSearchStock: asId<"capability">("model-gateway.image-search-stock"),
@@ -147,6 +148,7 @@ const families = [
     implementedTool("core.test.run", "Core test run", coreToolIds.testRun, "test.run")
   ]),
   family("git-build", "package.manager", "Package manager", "process", ["process", "write"], ["package-manager"], "built-in", [
+    implementedTool("core.env.prepare", "Core environment prepare", familyCapabilityIds.envPrepare, "env.prepare"),
     implementedTool("core.package.manager", "Core package manager", coreToolIds.packageManager, "package.manager")
   ]),
 

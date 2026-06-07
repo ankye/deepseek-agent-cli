@@ -12,6 +12,9 @@ import { createDefaultRuntimeKernel, loadUserHooks, registerRuntimeCoreTools } f
 import { PersistentFilesystemSessionStore, userSessionsDirectory } from "@deepseek/session-store";
 import { createDeterministicRuntimeDependencies, createLiveCliDependencies } from "@deepseek/testing-regression";
 import type { CliRunOptions, CliRuntimeFactoryOptions } from "../types.js";
+import { registerCliEnvironmentCapabilities } from "./environment-capabilities.js";
+
+export { registerCliEnvironmentCapabilities } from "./environment-capabilities.js";
 
 export async function createCliAgentRuntime(options: CliRuntimeFactoryOptions, runOptions: CliRunOptions): Promise<{ readonly deps: RuntimeDependencies; readonly kernel: RuntimeKernel }> {
   if (runOptions.createRuntime) return runOptions.createRuntime(options);
@@ -24,6 +27,7 @@ export async function createCliAgentRuntime(options: CliRuntimeFactoryOptions, r
     console.warn(`deepseek: user hook loading failed: ${error instanceof Error ? error.message : String(error)}`);
   });
   await registerRuntimeCoreTools(deps, options.workspaceRoot);
+  await registerCliEnvironmentCapabilities(deps, options.workspaceRoot);
   return { deps, kernel: await createDefaultRuntimeKernel(deps) };
 }
 
@@ -72,6 +76,7 @@ export async function resolveSessionDependencies(runOptions: CliRunOptions, work
 async function createCliSessionDependencies(workspaceRoot = process.cwd()): Promise<RuntimeDependencies> {
   const deps = createCliSessionDependenciesBase();
   await registerRuntimeCoreTools(deps, workspaceRoot);
+  await registerCliEnvironmentCapabilities(deps, workspaceRoot);
   return deps;
 }
 

@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { AGENT_MODE_COMPATIBILITY, AGENT_MODE_SCHEMA_VERSION, APPROVAL_SCHEMA_VERSION, INTERACTION_MODE_COMPATIBILITY, INTERACTION_MODE_SCHEMA_VERSION, asId } from "@deepseek/platform-contracts";
-import type { ApprovalId, ApprovalRequest, JsonObject, ModelGateway, ModelRequest, ModelStreamEvent, PlatformRuntime, PolicyDecision, PolicyEngine, PolicyRequest, ProcessResult, ProcessRunObserver, ProcessRunOptions, RuntimeEvent, SessionEvent, SessionId, WorkspaceEditTransaction } from "@deepseek/platform-contracts";
+import type { ApprovalId, ApprovalRequest, CapabilityExecutionContext, JsonObject, ModelGateway, ModelRequest, ModelStreamEvent, PlatformRuntime, PolicyDecision, PolicyEngine, PolicyRequest, ProcessResult, ProcessRunObserver, ProcessRunOptions, RuntimeEvent, SessionEvent, SessionId, WorkspaceEditTransaction } from "@deepseek/platform-contracts";
 import { FakePlatformRuntime, NodePlatformRuntime } from "@deepseek/platform-abstraction";
 import { createDefaultRuntimeKernel, registerRuntimeCoreTools } from "@deepseek/runtime";
 import { createDeterministicRuntimeDependencies } from "@deepseek/testing-regression";
@@ -24,6 +24,7 @@ import {
   parseCliArgs,
   runCli
 } from "../src/index.js";
+import { registerCliEnvironmentCapabilities } from "../src/host/runtime.js";
 
 describe("cli host adapter", () => {
   it("recognizes npm bin symlink entrypoints", async (t) => {
@@ -97,6 +98,38 @@ describe("cli host adapter", () => {
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }
+  });
+
+  it("registers agent-visible CLI environment preparation without host-side execution", async () => {
+    const platform = new FakePlatformRuntime("fake");
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerRuntimeCoreTools(deps, "/workspace");
+    await registerCliEnvironmentCapabilities(deps, "/workspace", { env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" } });
+
+    const manifest = await deps.capabilities.get(asId<"capability">("core.env.prepare"));
+    const visibleTools = await deps.capabilities.listModelVisible();
+    assert.equal(manifest?.projection?.modelVisible, true);
+    assert.equal(visibleTools.some((tool) => tool.id === "core.env.prepare"), true);
+    assert.equal(String(manifest?.description ?? "").includes("SWE-bench Lite"), true);
+    assert.equal(String(manifest?.description ?? "").includes("run this first"), false);
+
+    const result = await deps.capabilities.execute(asId<"capability">("core.env.prepare"), {
+      profile: "swe-bench-lite"
+    }, capabilityContext());
+
+    assert.equal(result.ok, true);
+    const value = result.value as { evidence?: { preview?: { text?: string }; metadata?: JsonObject } };
+    const preview = value.evidence?.preview?.text ?? "";
+    const metadata = value.evidence?.metadata as { profileId?: string; dryRun?: boolean; execute?: boolean; dependencyCounts?: JsonObject } | undefined;
+    assert.equal(preview.includes("swe-bench-lite"), true);
+    assert.equal(preview.includes("dependencies"), true);
+    assert.equal(preview.includes("fixture-secret-value"), false);
+    assert.equal(preview.includes("brew install"), false);
+    assert.equal(preview.includes("deepseek diagnostics"), false);
+    assert.equal(metadata?.profileId, "swe-bench-lite");
+    assert.equal(metadata?.dryRun, true);
+    assert.equal(metadata?.execute, false);
+    assert.equal(typeof metadata?.dependencyCounts === "object", true);
   });
 
   it("parses the new run and chat commands without legacy prompt compatibility", () => {
@@ -3088,6 +3121,50 @@ describe("cli host adapter", () => {
     assert.equal(events.at(-1)?.kind, "agent.loop.completed");
   });
 
+  it("lets a one-shot agent prepare the SWE-bench environment through its own tool call", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    const gateway = new EnvironmentPrepareModelGateway();
+    const toolDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
+    await registerRuntimeCoreTools(toolDeps, "/workspace");
+    await registerCliEnvironmentCapabilities(toolDeps, "/workspace", { env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" } });
+    const kernel = await createDefaultRuntimeKernel(toolDeps);
+    const lines: string[] = [];
+
+    await runCli(
+      ["run", "给我完成 SWE-bench Lite 第 2 题测试，跑通并告诉我结果。", "--output", "jsonl", "--tool-projection", "all"],
+      (line: string) => {
+        lines.push(line);
+      },
+      [],
+      { stdinIsTTY: false, stdoutIsTTY: false },
+      {
+        createRuntime: async () => ({ deps: toolDeps, kernel })
+      }
+    );
+    const events = lines.map((line) => JSON.parse(line) as { kind: string; data?: JsonObject });
+    const projectedTool = gateway.requests[0]?.tools?.find((tool) => {
+      const fn = tool.function;
+      return isJsonObject(fn) && fn.name === "core_env_prepare";
+    });
+    const toolResultMessage = gateway.requests[1]?.messages?.find((message) => message.role === "tool" && message.toolName === "core.env.prepare");
+
+    assert.equal(Boolean(projectedTool), true);
+    assert.equal(isJsonObject(projectedTool?.metadata) ? projectedTool.metadata.capabilityId : "", "core.env.prepare");
+    assert.equal(gateway.firstPromptText.includes("给我完成 SWE-bench Lite 第 2 题测试，跑通并告诉我结果。"), true);
+    assert.equal(gateway.firstPromptText.includes("run this first"), false);
+    assert.equal(gateway.firstPromptText.includes("brew install"), false);
+    assert.equal(gateway.firstPromptText.includes("deepseek diagnostics env prepare"), false);
+    assert.equal(events.some((event) => event.kind === "model.tool.intent" && event.data?.name === "core.env.prepare"), true);
+    assert.equal(events.some((event) => event.kind === "model.tool.repaired" && event.data?.capabilityId === "core.env.prepare"), true);
+    assert.equal(events.some((event) => event.kind === "capability.completed" && isJsonObject(event.data?.output) && isJsonObject(event.data.output.evidence) && event.data.output.evidence.tool === "env.prepare"), true);
+    assert.equal(events.some((event) => event.kind === "model.tool.result" && String(event.data?.result ?? "").includes("dependencies")), true);
+    assert.equal(toolResultMessage?.content.includes("dependencies"), true);
+    assert.equal(toolResultMessage?.content.includes("deepseek diagnostics"), false);
+    assert.equal(lines.join("\n").includes("fixture-secret-value"), false);
+    assert.equal(events.at(-1)?.kind, "agent.loop.completed");
+    await kernel.shutdown("cli-test-swe-env-prepare-tool-call");
+  });
+
   it("runs scriptable session commands with typed failures for unknown sessions", async () => {
     const resumeLines: string[] = [];
     await runCli(["session", "resume", "session-missing", "--output", "json"], (line: string) => {
@@ -4774,6 +4851,39 @@ class ToolCallingModelGateway implements ModelGateway {
   }
 }
 
+class EnvironmentPrepareModelGateway implements ModelGateway {
+  readonly requests: ModelRequest[] = [];
+  firstPromptText = "";
+
+  async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    this.requests.push(request);
+    if (this.requests.length === 1) this.firstPromptText = request.messages?.map((message) => message.content).join("\n") ?? request.prompt;
+    if (request.messages?.some((message) => message.role === "tool" && message.toolName === "core.env.prepare")) {
+      yield { kind: "delta", text: "Environment preparation evidence received." };
+      yield { kind: "finish", reason: "stop" };
+      yield { kind: "done" };
+      return;
+    }
+    const hasPrepareTool = request.tools?.some((tool) => {
+      const fn = tool.function;
+      return isJsonObject(fn) && fn.name === "core_env_prepare";
+    }) ?? false;
+    if (!hasPrepareTool) {
+      yield { kind: "delta", text: "Missing environment preparation tool." };
+      yield { kind: "finish", reason: "stop" };
+      yield { kind: "done" };
+      return;
+    }
+    yield { kind: "tool-call", id: "call-env-prepare", name: "core_env_prepare", input: { profile: "swe-bench-lite" } };
+    yield { kind: "finish", reason: "tool-call" };
+    yield { kind: "done" };
+  }
+
+  async countTokens(text: string): Promise<number> {
+    return text.trim() ? text.trim().split(/\s+/).length : 0;
+  }
+}
+
 class WritingToolModelGateway implements ModelGateway {
   async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
     if (request.messages?.some((message) => message.role === "tool")) {
@@ -5217,6 +5327,26 @@ async function runWithSeededWorkspace(args: readonly string[], input: readonly s
 
 function isJsonObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function capabilityContext(): CapabilityExecutionContext {
+  const trace = {
+    traceId: asId<"trace">("trace-cli-env-prepare-test"),
+    spanId: asId<"span">("span-cli-env-prepare-test"),
+    correlationId: asId<"correlation">("corr-cli-env-prepare-test")
+  };
+  return {
+    envelope: {
+      invocationId: "invocation-cli-env-prepare-test",
+      capabilityId: asId<"capability">("core.env.prepare"),
+      capabilityVersion: "1.0.0",
+      kind: "tool",
+      caller: "cli-test"
+    } as unknown as CapabilityExecutionContext["envelope"],
+    trace,
+    signal: new AbortController().signal,
+    metadata: {}
+  };
 }
 
 async function withTempCwd<T>(prefix: string, run: () => Promise<T>): Promise<T> {

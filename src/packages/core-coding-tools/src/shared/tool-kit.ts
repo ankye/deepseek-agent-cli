@@ -32,14 +32,16 @@ export function defineToolManifest(
   permissions: readonly string[],
   inputSchema: JsonObject,
   outputSchema: JsonObject,
-  execute: (input: JsonObject, context: CapabilityExecutionContext) => Promise<SerializableResult<CoreToolResult>>
+  execute: (input: JsonObject, context: CapabilityExecutionContext) => Promise<SerializableResult<CoreToolResult>>,
+  options: { readonly timeoutMs?: number; readonly replayPolicy?: JsonObject } = {}
 ): ToolDefinition {
   const resourceScope = analyzeResourceScope({}, sideEffect);
   const toolFamily = capabilityToolFamilyMetadata(id);
+  const timeoutMs = options.timeoutMs ?? (sideEffect === "process" ? 30_000 : 10_000);
   const sandboxRequirements = createSandboxRequirement({
     sideEffect,
     resourceScope,
-    timeoutMs: sideEffect === "process" ? 30_000 : 10_000,
+    timeoutMs,
     permissions
   });
   return {
@@ -56,8 +58,8 @@ export function defineToolManifest(
       inputSchema,
       outputSchema,
       enabled: true,
-      timeoutMs: sideEffect === "process" ? 30_000 : 10_000,
-      replayPolicy: { replayable: true, snapshot: "core-tool-evidence", deterministic: true },
+      timeoutMs,
+      replayPolicy: options.replayPolicy ?? { replayable: true, snapshot: "core-tool-evidence", deterministic: true },
       projection: {
         modelVisible: true,
         hostVisible: true,

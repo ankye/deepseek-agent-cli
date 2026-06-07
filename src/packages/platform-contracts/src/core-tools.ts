@@ -16,6 +16,7 @@ export type CoreCodingToolName =
   | "git.status"
   | "git.diff"
   | "test.run"
+  | "env.prepare"
   | "todo.plan"
   | "web.fetch"
   | "web.search"

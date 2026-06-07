@@ -41,6 +41,7 @@ export {
 export type { ToolFamilyCoverageEvidence } from "./catalog/index.js";
 export type { CoreCodingToolsDependencies } from "./shared/workspace.js";
 export type { ToolDefinition } from "./shared/tool-kit.js";
+export { boundedText, defineToolManifest, objectSchema, replay } from "./shared/tool-kit.js";
 
 export interface ExtendedCoreCodingToolsDependencies extends CoreCodingToolsDependencies {
   readonly webFetch?: WebFetchProvider;
