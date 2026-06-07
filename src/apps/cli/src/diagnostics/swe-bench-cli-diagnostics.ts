@@ -18,6 +18,8 @@ export async function collectSweBenchCliDiagnostics(options: CliOptions): Promis
     ...(typeof options.diagnosticsInput?.datasetName === "string" ? { datasetName: options.diagnosticsInput.datasetName } : {}),
     ...(typeof options.diagnosticsInput?.split === "string" ? { split: options.diagnosticsInput.split } : {}),
     ...(typeof options.diagnosticsInput?.harnessPython === "string" ? { harnessPython: options.diagnosticsInput.harnessPython } : {}),
+    ...(typeof options.diagnosticsInput?.cacheTracePath === "string" ? { cacheTracePath: options.diagnosticsInput.cacheTracePath } : {}),
+    ...(typeof options.diagnosticsInput?.cacheHitTarget === "number" ? { cacheHitTarget: options.diagnosticsInput.cacheHitTarget } : {}),
     ...(typeof options.diagnosticsInput?.timeoutMs === "number" ? { timeoutMs: options.diagnosticsInput.timeoutMs } : {}),
     ...(options.modelProvider ? { modelProvider: options.modelProvider } : {}),
     ...(options.model ? { model: options.model } : {}),
@@ -32,6 +34,6 @@ export async function collectSweBenchCliDiagnostics(options: CliOptions): Promis
     command: "swe-bench",
     sweBench,
     referencePitFixtureIds: [...diagnosticPitIds],
-    redaction: { class: "internal", fields: ["sweBench.repoDir", "sweBench.outputPath", "sweBench.predictions.model_patch", "sweBench.commandPlan.args", "sweBench.executedCommands.args", "sweBench.diagnostics.metadata"] }
+    redaction: { class: "internal", fields: ["sweBench.repoDir", "sweBench.outputPath", "sweBench.evaluation.cache.tracePath", "sweBench.predictions.model_patch", "sweBench.commandPlan.args", "sweBench.executedCommands.args", "sweBench.diagnostics.metadata"] }
   };
 }

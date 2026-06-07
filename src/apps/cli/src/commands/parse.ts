@@ -254,7 +254,7 @@ export function cliUsageLines(): readonly string[] {
     "  deepseek palette action <action> <target-id> [--output text|json|jsonl]",
     "  deepseek revert preview --request <id>|--turn <id>|--session <id> [--path <path>] [--output text|json|jsonl]",
     "  deepseek revert apply --request <id>|--turn <id>|--session <id> [--path <path>] [--output text|json|jsonl]",
-    "  deepseek diagnostics bundle|release|doctor|verify|refresh|evaluate|env|flow|swe-bench [prepare|inspect|predict|evaluate] [--prompt <text>] [--profile <id>] [--execute] [--baseline <id>] [--instance-file <path>] [--repo-dir <path>] [--output-path <path>] [--predictions-path <path>] [--report-dir <path>] [--run-id <id>] [--instance-id <id>] [--full] [--dry-run] [--live] [--output text|json|jsonl]",
+    "  deepseek diagnostics bundle|release|doctor|verify|refresh|evaluate|env|flow|swe-bench [prepare|inspect|predict|evaluate] [--prompt <text>] [--profile <id>] [--execute] [--baseline <id>] [--instance-file <path>] [--repo-dir <path>] [--output-path <path>] [--predictions-path <path>] [--report-dir <path>] [--run-id <id>] [--instance-id <id>] [--cache-trace-path <jsonl>] [--cache-hit-target <rate>] [--full] [--dry-run] [--live] [--output text|json|jsonl]",
     "  deepseek tools-smoke [--output text|jsonl]",
     "  deepseek <init|config|auth|doctor|privacy|verify-install> [--output text|json]",
     "Notes:",
@@ -567,6 +567,8 @@ function parseDiagnosticsInput(command: DiagnosticsCommandName, args: readonly s
     const datasetName = readFlagValue(args, "--dataset-name");
     const split = readFlagValue(args, "--split");
     const harnessPython = readFlagValue(args, "--harness-python");
+    const cacheTracePath = readFlagValue(args, "--cache-trace-path");
+    const cacheHitTarget = parseNumberFlag(args, "--cache-hit-target");
     const instanceIds = readRepeatedFlagValues(args, "--instance-id");
     if (instanceFile) input.instanceFile = instanceFile;
     if (repoDir) input.repoDir = repoDir;
@@ -577,6 +579,8 @@ function parseDiagnosticsInput(command: DiagnosticsCommandName, args: readonly s
     if (datasetName) input.datasetName = datasetName;
     if (split) input.split = split;
     if (harnessPython) input.harnessPython = harnessPython;
+    if (cacheTracePath) input.cacheTracePath = cacheTracePath;
+    if (cacheHitTarget !== undefined) input.cacheHitTarget = cacheHitTarget;
     if (instanceIds.length > 0) input.instanceIds = instanceIds;
     const timeoutMs = parsePositiveNumberFlag(args, "--timeout-ms");
     if (timeoutMs) input.timeoutMs = timeoutMs;
@@ -617,6 +621,8 @@ function extraDiagnosticsArgs(args: readonly string[], knownBooleanFlags: Readon
       value === "--dataset-name" ||
       value === "--split" ||
       value === "--harness-python" ||
+      value === "--cache-trace-path" ||
+      value === "--cache-hit-target" ||
       value === "--timeout-ms" ||
       value === "--severity" ||
       value === "--package" ||
@@ -723,6 +729,13 @@ function parsePositiveNumberFlag(args: readonly string[], name: string): number 
   if (index < 0) return undefined;
   const value = Number(args[index + 1]);
   return Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+function parseNumberFlag(args: readonly string[], name: string): number | undefined {
+  const index = args.indexOf(name);
+  if (index < 0) return undefined;
+  const value = Number(args[index + 1]);
+  return Number.isFinite(value) ? value : undefined;
 }
 
 function readFlagValue(args: readonly string[], name: string): string | undefined {

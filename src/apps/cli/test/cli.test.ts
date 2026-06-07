@@ -379,6 +379,12 @@ describe("cli host adapter", () => {
       "glm-run",
       "--instance-id",
       "astropy__astropy-12907",
+      "--instance-id",
+      "django__django-11099",
+      "--cache-trace-path",
+      ".deepseek/swe-lite-runs/glm-trace.jsonl",
+      "--cache-hit-target",
+      "0.9",
       "--harness-python",
       ".deepseek/swebench-venv/bin/python",
       "--output",
@@ -393,14 +399,36 @@ describe("cli host adapter", () => {
         command: "swe-bench",
         action: "evaluate",
         dryRun: false,
-        instanceIds: ["astropy__astropy-12907"],
+        instanceIds: ["astropy__astropy-12907", "django__django-11099"],
         predictionsPath: ".deepseek/swe-lite-runs/glm.jsonl",
         reportDir: ".deepseek/swe-lite-runs/harness",
         runId: "glm-run",
+        cacheTracePath: ".deepseek/swe-lite-runs/glm-trace.jsonl",
+        cacheHitTarget: 0.9,
         harnessPython: ".deepseek/swebench-venv/bin/python",
         extraArgs: []
       }
     });
+    assert.equal(
+      parseCliArgs([
+        "diagnostics",
+        "swe-bench",
+        "evaluate",
+        "--predictions-path",
+        "predictions.jsonl",
+        "--report-dir",
+        "reports",
+        "--run-id",
+        "glm-run",
+        "--cache-trace-path",
+        "trace.jsonl",
+        "--cache-hit-target",
+        "0",
+        "--output",
+        "json"
+      ]).diagnosticsInput?.cacheHitTarget,
+      0
+    );
     assert.deepEqual(parseCliArgs(["diagnostics", "refresh", "--full", "--dry-run", "--output", "jsonl"]), {
       command: "diagnostics",
       diagnosticsCommand: "refresh",

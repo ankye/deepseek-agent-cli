@@ -30,6 +30,38 @@ export interface SweBenchEvaluationSummary extends JsonObject {
     readonly failToPass: { readonly success: number; readonly failure: number };
     readonly passToPass: { readonly success: number; readonly failure: number };
   };
+  readonly instances: readonly SweBenchEvaluationInstanceSummary[];
+  readonly batch: {
+    readonly totalInstances: number;
+    readonly resolvedInstances: number;
+    readonly unresolvedInstanceIds: readonly string[];
+    readonly resolvedRate: number;
+  };
+  readonly cache?: SweBenchEvaluationCacheSummary;
+}
+
+export interface SweBenchEvaluationInstanceSummary extends JsonObject {
+  readonly completed: boolean;
+  readonly resolved: boolean;
+  readonly reportPath: string;
+  readonly modelName: string;
+  readonly instanceId: string;
+  readonly tests: {
+    readonly failToPass: { readonly success: number; readonly failure: number };
+    readonly passToPass: { readonly success: number; readonly failure: number };
+  };
+}
+
+export interface SweBenchEvaluationCacheSummary extends JsonObject {
+  readonly tracePath: string;
+  readonly targetHitRate?: number;
+  readonly hitTokens: number;
+  readonly missTokens: number;
+  readonly hitRate: number;
+  readonly requestCount: number;
+  readonly lowHitRequestCount: number;
+  readonly passed?: boolean;
+  readonly redaction: { readonly class: "internal"; readonly fields?: readonly string[] };
 }
 
 export interface SweBenchPredictionSummary extends JsonObject {
@@ -64,6 +96,8 @@ export interface CollectSweBenchPredictionOptions {
   readonly datasetName?: string;
   readonly split?: string;
   readonly harnessPython?: string;
+  readonly cacheTracePath?: string;
+  readonly cacheHitTarget?: number;
   readonly modelProvider?: "deepseek" | "glm";
   readonly model?: string;
   readonly timeoutMs?: number;
@@ -89,6 +123,12 @@ export async function collectSweBenchPrediction(options: CollectSweBenchPredicti
   }
   if (options.action === "evaluate" && (!nonEmpty(options.outputPath) || !nonEmpty(options.reportDir) || !nonEmpty(options.runId) || options.extraArgs.length > 0)) {
     diagnostics.push(diagnostic("SWE_BENCH_EVALUATION_INVALID_INPUT", "error", "SWE-bench evaluation requires --predictions-path, --report-dir, --run-id, and no unsupported extra arguments.", { extraArgCount: options.extraArgs.length }));
+  }
+  if (options.action === "evaluate" && options.cacheHitTarget !== undefined && (!Number.isFinite(options.cacheHitTarget) || options.cacheHitTarget <= 0 || options.cacheHitTarget > 1)) {
+    diagnostics.push(diagnostic("SWE_BENCH_CACHE_TARGET_INVALID", "error", "SWE-bench cache hit target must be a number greater than 0 and less than or equal to 1."));
+  }
+  if (options.action === "evaluate" && options.cacheHitTarget !== undefined && !nonEmpty(options.cacheTracePath)) {
+    diagnostics.push(diagnostic("SWE_BENCH_CACHE_TRACE_REQUIRED", "error", "SWE-bench cache hit target requires --cache-trace-path."));
   }
   if (diagnostics.some((entry) => entry.severity === "error")) return summary(options, diagnostics, [], [], [], undefined, undefined);
 
@@ -151,6 +191,20 @@ export function sweBenchPredictionJsonLines(summary: SweBenchPredictionSummary):
       prediction,
       redaction: { class: "internal", fields: ["prediction.model_patch"] }
     })),
+    ...(summary.evaluation ? [
+      {
+        schemaVersion: summary.schemaVersion,
+        kind: "diagnostics.swe-bench.evaluation",
+        evaluation: summary.evaluation,
+        redaction: { class: "internal", fields: ["evaluation.predictionsPath", "evaluation.reportDir", "evaluation.reportPath", "evaluation.cache.tracePath"] }
+      },
+      ...summary.evaluation.instances.map((instance) => ({
+        schemaVersion: summary.schemaVersion,
+        kind: "diagnostics.swe-bench.evaluation.instance",
+        instance,
+        redaction: { class: "internal", fields: ["instance.reportPath"] }
+      }))
+    ] : []),
     ...summary.diagnostics.map((item) => ({
       schemaVersion: summary.schemaVersion,
       kind: "diagnostics.swe-bench.diagnostic",
@@ -173,8 +227,13 @@ export function renderSweBenchPredictionText(summary: SweBenchPredictionSummary)
   }
   if (summary.evaluation) {
     lines.push(`- evaluation: completed=${String(summary.evaluation.completed)} resolved=${String(summary.evaluation.resolved)} report=${summary.evaluation.reportPath}`);
+    lines.push(`- evaluation batch: resolved=${summary.evaluation.batch.resolvedInstances}/${summary.evaluation.batch.totalInstances} rate=${formatRate(summary.evaluation.batch.resolvedRate)} unresolved=${summary.evaluation.batch.unresolvedInstanceIds.join(", ") || "none"}`);
     lines.push(`- FAIL_TO_PASS: success=${summary.evaluation.tests.failToPass.success} failure=${summary.evaluation.tests.failToPass.failure}`);
     lines.push(`- PASS_TO_PASS: success=${summary.evaluation.tests.passToPass.success} failure=${summary.evaluation.tests.passToPass.failure}`);
+    if (summary.evaluation.cache) {
+      const cache = summary.evaluation.cache;
+      lines.push(`- cache SLO: hitRate=${formatRate(cache.hitRate)}${typeof cache.targetHitRate === "number" ? ` target=${formatRate(cache.targetHitRate)} gate=${cache.passed === true ? "pass" : "fail"}` : ""} requests=${cache.requestCount} lowHit=${cache.lowHitRequestCount} hit=${cache.hitTokens} miss=${cache.missTokens}`);
+    }
   }
   for (const diagnostic of summary.diagnostics) {
     lines.push(`- ${diagnostic.code}: ${diagnostic.severity} - ${diagnostic.message}`);
@@ -216,7 +275,7 @@ function summary(
     executedCommands,
     ...(evaluation ? { evaluation } : {}),
     diagnostics,
-    redaction: { class: "internal", fields: ["repoDir", "outputPath", "evaluation.predictionsPath", "evaluation.reportDir", "evaluation.reportPath", "predictions.model_patch", "diagnostics.metadata", "commandPlan.args", "executedCommands.args"] }
+    redaction: { class: "internal", fields: ["repoDir", "outputPath", "evaluation.predictionsPath", "evaluation.reportDir", "evaluation.reportPath", "evaluation.cache.tracePath", "predictions.model_patch", "diagnostics.metadata", "commandPlan.args", "executedCommands.args"] }
   };
 }
 
@@ -228,16 +287,20 @@ async function collectSweBenchEvaluation(
   const predictionsPath = absolutePath(platform, options.outputPath as string);
   const reportDir = absolutePath(platform, options.reportDir as string);
   const runId = options.runId as string;
-  const prediction = await readFirstPrediction(platform, predictionsPath).catch((error: unknown) => {
+  const predictions = await readPredictions(platform, predictionsPath).catch((error: unknown) => {
     diagnostics.push(diagnostic("SWE_BENCH_PREDICTION_READ_FAILED", "error", error instanceof Error ? error.message : String(error)));
     return undefined;
   });
+  if (!predictions || predictions.length === 0) return summary(options, diagnostics, [], [], [], undefined, undefined);
+  const predictionsByInstanceId = new Map(predictions.map((prediction) => [prediction.instanceId, prediction]));
   const instanceIds = options.instanceIds && options.instanceIds.length > 0
     ? options.instanceIds
-    : prediction?.instanceId
-      ? [prediction.instanceId]
-      : [];
-  if (!prediction || instanceIds.length === 0) return summary(options, diagnostics, [], [], [], undefined, undefined);
+    : predictions.map((prediction) => prediction.instanceId);
+  const missingPredictionIds = instanceIds.filter((instanceId) => !predictionsByInstanceId.has(instanceId));
+  if (instanceIds.length === 0 || missingPredictionIds.length > 0) {
+    diagnostics.push(diagnostic("SWE_BENCH_PREDICTION_INSTANCE_MISSING", "error", "SWE-bench prediction JSONL must include every requested instance id.", { missingPredictionIds }));
+    return summary(options, diagnostics, [], [], [], undefined, undefined);
+  }
 
   const command = options.harnessPython ? absolutePath(platform, options.harnessPython) : defaultHarnessPython(platform);
   const args = [
@@ -286,33 +349,61 @@ async function collectSweBenchEvaluation(
     }
   }
 
-  const reportPath = platform.resolvePath(reportDir, "logs", "run_evaluation", runId, sanitizeHarnessModelName(prediction.modelName), prediction.instanceId, "report.json");
-  const evaluation = await readHarnessReport(platform, reportPath, predictionsPath, reportDir, runId, prediction).catch((error: unknown) => {
-    diagnostics.push(diagnostic("SWE_BENCH_REPORT_READ_FAILED", "error", error instanceof Error ? error.message : String(error), { reportPath }));
-    return undefined;
-  });
+  const instances: SweBenchEvaluationInstanceSummary[] = [];
+  for (const instanceId of instanceIds) {
+    const prediction = predictionsByInstanceId.get(instanceId);
+    if (!prediction) continue;
+    const reportPath = platform.resolvePath(reportDir, "logs", "run_evaluation", runId, sanitizeHarnessModelName(prediction.modelName), instanceId, "report.json");
+    const instance = await readHarnessInstanceReport(platform, reportPath, prediction).catch((error: unknown) => {
+      diagnostics.push(diagnostic("SWE_BENCH_REPORT_READ_FAILED", "error", error instanceof Error ? error.message : String(error), { reportPath, instanceId }));
+      return undefined;
+    });
+    if (instance) instances.push(instance);
+  }
+  if (instances.length === 0) return summary(options, diagnostics, [], commandPlan, executedCommands, undefined, undefined);
+
+  const cache = options.cacheTracePath
+    ? await readCacheTrace(platform, absolutePath(platform, options.cacheTracePath), options.cacheHitTarget).catch((error: unknown) => {
+        diagnostics.push(diagnostic("SWE_BENCH_CACHE_TRACE_READ_FAILED", "error", error instanceof Error ? error.message : String(error), { cacheTracePath: options.cacheTracePath }));
+        return undefined;
+      })
+    : undefined;
+  if (cache && options.cacheHitTarget !== undefined) {
+    if (cache.requestCount === 0) {
+      diagnostics.push(diagnostic("SWE_BENCH_CACHE_TRACE_UNAVAILABLE", "error", "SWE-bench cache trace did not include measurable provider cache usage."));
+    } else if (cache.passed === false) {
+      diagnostics.push(diagnostic("SWE_BENCH_CACHE_HIT_TARGET_MISSED", "error", "SWE-bench cache hit rate is below the requested engineering target.", {
+        targetHitRate: cache.targetHitRate,
+        hitRate: cache.hitRate,
+        hitTokens: cache.hitTokens,
+        missTokens: cache.missTokens,
+        requestCount: cache.requestCount,
+        lowHitRequestCount: cache.lowHitRequestCount
+      }));
+    }
+  }
+  const evaluation = evaluationSummary(predictionsPath, reportDir, runId, instances, cache);
   return summary(options, diagnostics, [], commandPlan, executedCommands, undefined, evaluation);
 }
 
-async function readFirstPrediction(platform: PlatformRuntime, predictionsPath: string): Promise<{ readonly instanceId: string; readonly modelName: string }> {
+async function readPredictions(platform: PlatformRuntime, predictionsPath: string): Promise<readonly { readonly instanceId: string; readonly modelName: string }[]> {
   const content = await platform.readFile(predictionsPath);
-  const firstLine = content.split(/\r?\n/).find((line) => line.trim().length > 0);
-  if (!firstLine) throw new Error("SWE-bench prediction file is empty.");
-  const parsed = JSON.parse(firstLine) as JsonObject;
-  const instanceId = stringField(parsed, "instance_id");
-  const modelName = stringField(parsed, "model_name_or_path");
-  if (!instanceId || !modelName) throw new Error("SWE-bench prediction JSONL must include instance_id and model_name_or_path.");
-  return { instanceId, modelName };
+  const lines = content.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  if (lines.length === 0) throw new Error("SWE-bench prediction file is empty.");
+  return lines.map((line) => {
+    const parsed = JSON.parse(line) as JsonObject;
+    const instanceId = stringField(parsed, "instance_id");
+    const modelName = stringField(parsed, "model_name_or_path");
+    if (!instanceId || !modelName) throw new Error("SWE-bench prediction JSONL records must include instance_id and model_name_or_path.");
+    return { instanceId, modelName };
+  });
 }
 
-async function readHarnessReport(
+async function readHarnessInstanceReport(
   platform: PlatformRuntime,
   reportPath: string,
-  predictionsPath: string,
-  reportDir: string,
-  runId: string,
   prediction: { readonly instanceId: string; readonly modelName: string }
-): Promise<SweBenchEvaluationSummary> {
+): Promise<SweBenchEvaluationInstanceSummary> {
   const parsed = JSON.parse(await platform.readFile(reportPath)) as JsonObject;
   const instanceReport = parsed[prediction.instanceId];
   if (!isJsonObject(instanceReport)) throw new Error(`SWE-bench report does not include ${prediction.instanceId}.`);
@@ -322,14 +413,99 @@ async function readHarnessReport(
   return {
     completed: true,
     resolved: instanceReport.resolved === true,
-    runId,
-    predictionsPath,
-    reportDir,
     reportPath,
     modelName: prediction.modelName,
     instanceId: prediction.instanceId,
     tests: { failToPass, passToPass }
   };
+}
+
+function evaluationSummary(
+  predictionsPath: string,
+  reportDir: string,
+  runId: string,
+  instances: readonly SweBenchEvaluationInstanceSummary[],
+  cache: SweBenchEvaluationCacheSummary | undefined
+): SweBenchEvaluationSummary {
+  const first = instances[0] as SweBenchEvaluationInstanceSummary;
+  const unresolvedInstanceIds = instances.filter((instance) => !instance.resolved).map((instance) => instance.instanceId);
+  const resolvedInstances = instances.length - unresolvedInstanceIds.length;
+  const batch = {
+    totalInstances: instances.length,
+    resolvedInstances,
+    unresolvedInstanceIds,
+    resolvedRate: instances.length > 0 ? resolvedInstances / instances.length : 0
+  };
+  return {
+    completed: instances.every((instance) => instance.completed),
+    resolved: batch.totalInstances > 0 && batch.resolvedInstances === batch.totalInstances,
+    runId,
+    predictionsPath,
+    reportDir,
+    reportPath: first.reportPath,
+    modelName: first.modelName,
+    instanceId: first.instanceId,
+    tests: first.tests,
+    instances,
+    batch,
+    ...(cache ? { cache } : {})
+  };
+}
+
+async function readCacheTrace(
+  platform: PlatformRuntime,
+  cacheTracePath: string,
+  targetHitRate: number | undefined
+): Promise<SweBenchEvaluationCacheSummary> {
+  const content = await platform.readFile(cacheTracePath);
+  let hitTokens = 0;
+  let missTokens = 0;
+  let requestCount = 0;
+  let lowHitRequestCount = 0;
+  const lowHitThreshold = targetHitRate ?? 0.9;
+  for (const line of content.split(/\r?\n/)) {
+    if (line.trim().length === 0) continue;
+    const parsed = JSON.parse(line) as JsonObject;
+    const data = usageData(parsed);
+    if (!data) continue;
+    const cache = usageCache(data);
+    if (!cache) continue;
+    const hit = numberField(cache, "hitTokens") ?? 0;
+    const miss = numberField(cache, "missTokens") ?? numberField(data, "inputTokens") ?? numberField(data, "input_tokens") ?? 0;
+    const total = hit + miss;
+    if (total <= 0) continue;
+    const rate = hit / total;
+    requestCount += 1;
+    hitTokens += hit;
+    missTokens += miss;
+    if (rate < lowHitThreshold) lowHitRequestCount += 1;
+  }
+  const totalTokens = hitTokens + missTokens;
+  const hitRate = totalTokens > 0 ? hitTokens / totalTokens : 0;
+  return {
+    tracePath: cacheTracePath,
+    ...(targetHitRate !== undefined ? { targetHitRate } : {}),
+    hitTokens,
+    missTokens,
+    hitRate,
+    requestCount,
+    lowHitRequestCount,
+    ...(targetHitRate !== undefined ? { passed: requestCount > 0 && hitRate >= targetHitRate } : {}),
+    redaction: { class: "internal", fields: ["tracePath"] }
+  };
+}
+
+function usageData(record: JsonObject): JsonObject | undefined {
+  if (record.kind === "usage.updated" && isJsonObject(record.data)) return record.data;
+  const event = record.event;
+  if (isJsonObject(event) && event.kind === "usage.updated" && isJsonObject(event.data)) return event.data;
+  return undefined;
+}
+
+function usageCache(data: JsonObject): JsonObject | undefined {
+  const metadata = data.metadata;
+  if (isJsonObject(metadata) && isJsonObject(metadata.cache)) return metadata.cache;
+  return isJsonObject(data.cache) ? data.cache : undefined;
 }
 
 function countHarnessStatus(value: unknown): { readonly success: number; readonly failure: number } {
@@ -539,6 +715,15 @@ function diagnostic(code: string, severity: SweBenchPredictionDiagnostic["severi
 function stringField(value: JsonObject, key: string): string {
   const field = value[key];
   return typeof field === "string" ? field : "";
+}
+
+function numberField(value: JsonObject, key: string): number | undefined {
+  const field = value[key];
+  return typeof field === "number" && Number.isFinite(field) ? field : undefined;
+}
+
+function formatRate(value: number): string {
+  return `${(value * 100).toFixed(2)}%`;
 }
 
 function nonEmpty(value: string | undefined): boolean {

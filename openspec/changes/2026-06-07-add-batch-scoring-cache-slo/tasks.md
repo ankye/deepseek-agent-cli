@@ -1,0 +1,17 @@
+- [x] Add OpenSpec scenarios for SWE-bench batch scoring and cache SLO gating.
+- [x] Add failing CLI parser coverage for `--cache-trace-path` and `--cache-hit-target`.
+- [x] Add failing SWE-bench adapter coverage for multi-instance aggregate scoring.
+- [x] Add failing SWE-bench adapter coverage for cache trace aggregation and 90% target failure.
+- [x] Implement batch prediction/report reading and aggregate scoring.
+- [x] Implement cache trace summary extraction from runtime JSONL usage records.
+- [x] Render aggregate score and cache SLO in text/JSON/JSONL diagnostics with internal redaction.
+- [x] Run focused tests, OpenSpec validation, typecheck, lint, full tests, boundaries, and commit.
+
+- [x] 增加 SWE-bench batch scoring 与 cache SLO gating 的 OpenSpec 场景。
+- [x] 增加 `--cache-trace-path` 与 `--cache-hit-target` 的 CLI parser 红测。
+- [x] 增加多实例 aggregate scoring 的 SWE-bench adapter 红测。
+- [x] 增加 cache trace 聚合与 90% target failure 的 SWE-bench adapter 红测。
+- [x] 实现 batch prediction/report 读取与 aggregate scoring。
+- [x] 实现从 runtime JSONL usage records 提取 cache trace summary。
+- [x] 在 text/JSON/JSONL diagnostics 中渲染 aggregate score 与 cache SLO，并保持 internal redaction。
+- [x] 运行 focused tests、OpenSpec validation、typecheck、lint、全量 tests、boundaries，并提交。

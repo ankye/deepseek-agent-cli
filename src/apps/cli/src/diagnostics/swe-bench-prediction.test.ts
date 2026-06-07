@@ -41,25 +41,31 @@ class FakeSweBenchPlatform extends FakePlatformRuntime {
     if (args.includes("swebench.harness.run_evaluation")) {
       const cwd = typeof options.cwd === "string" ? options.cwd : "/workspace/harness";
       const runId = argAfter(args, "--run_id") ?? "glm-run";
-      const instanceId = argAfter(args, "--instance_ids") ?? "demo__repo-1";
+      const instanceIds = argsAfterListFlag(args, "--instance_ids");
+      const selectedInstanceIds = instanceIds.length > 0 ? instanceIds : ["demo__repo-1"];
       const predictionPath = argAfter(args, "--predictions_path") ?? "/workspace/predictions/glm.jsonl";
-      const prediction = JSON.parse(await this.readFile(predictionPath)) as JsonObject;
-      const modelName = typeof prediction.model_name_or_path === "string" ? prediction.model_name_or_path : "glm-5.1";
-      await this.writeFile(`${cwd}/logs/run_evaluation/${runId}/${modelName}/${instanceId}/report.json`, JSON.stringify({
-        [instanceId]: {
-          resolved: true,
-          tests_status: {
-            FAIL_TO_PASS: {
-              success: ["tests/test_demo.py::test_fixed"],
-              failure: []
-            },
-            PASS_TO_PASS: {
-              success: ["tests/test_demo.py::test_existing"],
-              failure: []
+      const predictions = (await this.readFile(predictionPath)).split(/\r?\n/)
+        .filter((line) => line.trim().length > 0)
+        .map((line) => JSON.parse(line) as JsonObject);
+      const modelName = typeof predictions[0]?.model_name_or_path === "string" ? predictions[0].model_name_or_path : "glm-5.1";
+      for (const instanceId of selectedInstanceIds) {
+        const resolved = instanceId !== "demo__repo-2";
+        await this.writeFile(`${cwd}/logs/run_evaluation/${runId}/${modelName}/${instanceId}/report.json`, JSON.stringify({
+          [instanceId]: {
+            resolved,
+            tests_status: {
+              FAIL_TO_PASS: {
+                success: resolved ? ["tests/test_demo.py::test_fixed"] : [],
+                failure: resolved ? [] : ["tests/test_demo.py::test_fixed"]
+              },
+              PASS_TO_PASS: {
+                success: ["tests/test_demo.py::test_existing"],
+                failure: []
+              }
             }
           }
-        }
-      }));
+        }));
+      }
       return {
         exitCode: 0,
         stdout: "Evaluation complete\n",
@@ -158,6 +164,99 @@ describe("SWE-bench prediction adapter", () => {
     assert.equal(harness?.args.includes("--instance_ids"), true);
     assert.equal(harness?.args.includes("demo__repo-1"), true);
     assert.equal(harness?.env?.DOCKER_HOST, "unix:///workspace/.colima/default/docker.sock");
+  });
+
+  it("aggregates official harness reports across a SWE-bench batch", async () => {
+    const platform = new FakeSweBenchPlatform("fake");
+    await platform.writeFile("/workspace/predictions/glm.jsonl", [
+      JSON.stringify({
+        instance_id: "demo__repo-1",
+        model_name_or_path: "glm-5.1",
+        model_patch: "diff --git a/src/example.py b/src/example.py\n"
+      }),
+      JSON.stringify({
+        instance_id: "demo__repo-2",
+        model_name_or_path: "glm-5.1",
+        model_patch: "diff --git a/src/example.py b/src/example.py\n"
+      }),
+      ""
+    ].join("\n"));
+
+    const summary = await collectSweBenchPrediction({
+      action: "evaluate",
+      dryRun: false,
+      live: false,
+      outputPath: "/workspace/predictions/glm.jsonl",
+      reportDir: "/workspace/harness",
+      runId: "glm-batch",
+      instanceIds: ["demo__repo-1", "demo__repo-2"],
+      harnessPython: "/workspace/.deepseek/swebench-venv/bin/python",
+      extraArgs: [],
+      platform
+    });
+
+    assert.equal(summary.status, "pass");
+    assert.equal(summary.evaluation?.batch.totalInstances, 2);
+    assert.equal(summary.evaluation?.batch.resolvedInstances, 1);
+    assert.deepEqual(summary.evaluation?.batch.unresolvedInstanceIds, ["demo__repo-2"]);
+    assert.equal(summary.evaluation?.batch.resolvedRate, 0.5);
+    assert.equal(summary.evaluation?.instances.length, 2);
+    assert.equal(summary.evaluation?.instances[1]?.resolved, false);
+    assert.equal(summary.evaluation?.instances[1]?.tests.failToPass.failure, 1);
+  });
+
+  it("fails the engineering gate when cache trace hit rate is below the target", async () => {
+    const platform = new FakeSweBenchPlatform("fake");
+    await platform.writeFile("/workspace/predictions/glm.jsonl", JSON.stringify({
+      instance_id: "demo__repo-1",
+      model_name_or_path: "glm-5.1",
+      model_patch: "diff --git a/src/example.py b/src/example.py\n"
+    }) + "\n");
+    await platform.writeFile("/workspace/traces/glm-run.jsonl", [
+      JSON.stringify({
+        kind: "usage.updated",
+        data: {
+          inputTokens: 200,
+          metadata: {
+            cache: { hitTokens: 800, missTokens: 200, hitRate: 0.8 }
+          }
+        }
+      }),
+      JSON.stringify({
+        kind: "usage.updated",
+        data: {
+          inputTokens: 0,
+          metadata: {
+            cache: { hitTokens: 100, missTokens: 0, hitRate: 1 }
+          }
+        }
+      }),
+      ""
+    ].join("\n"));
+
+    const summary = await collectSweBenchPrediction({
+      action: "evaluate",
+      dryRun: false,
+      live: false,
+      outputPath: "/workspace/predictions/glm.jsonl",
+      reportDir: "/workspace/harness",
+      runId: "glm-run",
+      instanceIds: ["demo__repo-1"],
+      cacheTracePath: "/workspace/traces/glm-run.jsonl",
+      cacheHitTarget: 0.9,
+      harnessPython: "/workspace/.deepseek/swebench-venv/bin/python",
+      extraArgs: [],
+      platform
+    });
+
+    assert.equal(summary.status, "fail");
+    assert.equal(summary.evaluation?.cache?.passed, false);
+    assert.equal(summary.evaluation?.cache?.targetHitRate, 0.9);
+    assert.equal(summary.evaluation?.cache?.hitTokens, 900);
+    assert.equal(summary.evaluation?.cache?.missTokens, 200);
+    assert.equal(summary.evaluation?.cache?.requestCount, 2);
+    assert.equal(summary.evaluation?.cache?.lowHitRequestCount, 1);
+    assert.equal(summary.diagnostics.some((entry) => entry.code === "SWE_BENCH_CACHE_HIT_TARGET_MISSED"), true);
   });
 
   it("normalizes relative harness paths before changing into the report directory", async () => {
@@ -267,4 +366,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function argAfter(args: readonly string[], flag: string): string | undefined {
   const index = args.indexOf(flag);
   return index >= 0 ? args[index + 1] : undefined;
+}
+
+function argsAfterListFlag(args: readonly string[], flag: string): readonly string[] {
+  const index = args.indexOf(flag);
+  if (index < 0) return [];
+  const values: string[] = [];
+  for (let cursor = index + 1; cursor < args.length; cursor += 1) {
+    const value = args[cursor];
+    if (!value || value.startsWith("--")) break;
+    values.push(value);
+  }
+  return values;
 }
