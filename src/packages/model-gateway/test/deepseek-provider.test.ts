@@ -32,6 +32,22 @@ async function collect(iterable: AsyncIterable<ModelStreamEvent>): Promise<reado
   return events;
 }
 
+function hasAnthropicCacheControl(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some((entry) => hasAnthropicCacheControl(entry));
+  if (typeof value !== "object" || value === null) return false;
+  const object = value as { readonly cache_control?: unknown; readonly content?: unknown };
+  if (typeof object.cache_control === "object" && object.cache_control !== null) return true;
+  return hasAnthropicCacheControl(object.content);
+}
+
+function countAnthropicCacheControls(value: unknown): number {
+  if (Array.isArray(value)) return value.reduce((total, entry) => total + countAnthropicCacheControls(entry), 0);
+  if (typeof value !== "object" || value === null) return 0;
+  const object = value as { readonly cache_control?: unknown; readonly content?: unknown };
+  return (typeof object.cache_control === "object" && object.cache_control !== null ? 1 : 0)
+    + countAnthropicCacheControls(object.content);
+}
+
 describe("DeepSeek OpenAI provider", () => {
   it("fails closed when transport is not configured", async () => {
     const provider = new DeepSeekOpenAIProvider({ credentials: new StaticCredentialProvider("sk-test") });
@@ -721,6 +737,701 @@ describe("GLM Anthropic-compatible provider", () => {
     assert.equal(result?.provider.model, "glm-5.1");
   });
 
+  it("projects GLM Anthropic system cache hints only when capability metadata supports them", async () => {
+    const metadata = {
+      contextPipeline: {
+        pipelineFingerprint: "pipeline:test",
+        cacheHintSummary: {
+          stable: 2,
+          ephemeral: 1,
+          noStore: 0,
+          ttlBound: 0
+        }
+      }
+    };
+    const unsupported = new GlmAnthropicProvider({
+      transport: new FixtureModelProviderTransport([]),
+      credentials: new StaticCredentialProvider("glm-test", glmAnthropicProviderConfig.credentialRef),
+      config: {
+        ...glmAnthropicProviderConfig,
+        cacheHints: {
+          explicitPrefixCacheHints: false
+        }
+      }
+    });
+    const unsupportedRequest = unsupported.buildProviderRequest({
+      profile: defaultGlmAnthropicProfile,
+      prompt: "hello",
+      messages: [
+        { role: "system", content: "stable system prefix", cacheHint: { policy: "stable" } },
+        { role: "user", content: "hello" }
+      ],
+      metadata
+    }, "glm-test");
+
+    assert.equal(typeof unsupportedRequest.body.system, "string");
+
+    const supported = new GlmAnthropicProvider({
+      transport: new FixtureModelProviderTransport([]),
+      credentials: new StaticCredentialProvider("glm-test", glmAnthropicProviderConfig.credentialRef),
+      config: {
+        ...glmAnthropicProviderConfig,
+        cacheHints: {
+          explicitPrefixCacheHints: true,
+          supportedPolicies: ["stable"],
+          maxCacheHintBlocks: 4
+        }
+      }
+    });
+    const supportedRequest = supported.buildProviderRequest({
+      profile: defaultGlmAnthropicProfile,
+      prompt: "hello",
+      messages: [
+        { role: "system", content: "stable system prefix", cacheHint: { policy: "stable" } },
+        { role: "user", content: "hello" }
+      ],
+      metadata
+    }, "glm-test");
+
+    assert.deepEqual(supportedRequest.body.system, [
+      {
+        type: "text",
+        text: "stable system prefix",
+        cache_control: {
+          type: "ephemeral"
+        }
+      }
+    ]);
+  });
+
+  it("does not merge volatile system tails into the GLM Anthropic cached prefix block", () => {
+    const metadata = {
+      contextPipeline: {
+        pipelineFingerprint: "pipeline:test",
+        cacheHintSummary: {
+          stable: 2,
+          ephemeral: 1,
+          noStore: 0,
+          ttlBound: 0
+        }
+      }
+    };
+    const provider = new GlmAnthropicProvider({
+      transport: new FixtureModelProviderTransport([]),
+      credentials: new StaticCredentialProvider("glm-test", glmAnthropicProviderConfig.credentialRef),
+      config: {
+        ...glmAnthropicProviderConfig,
+        cacheHints: {
+          explicitPrefixCacheHints: true,
+          supportedPolicies: ["stable"],
+          maxCacheHintBlocks: 4
+        }
+      }
+    });
+    const request = provider.buildProviderRequest({
+      profile: defaultGlmAnthropicProfile,
+      prompt: "hello",
+      messages: [
+        { role: "system", content: "stable system prefix", cacheHint: { policy: "stable" } },
+        { role: "system", content: "SWE_BENCH_POST_EDIT_VERIFICATION_GATE\nObserved iteration=9", cacheHint: { policy: "no-store" } },
+        { role: "user", content: "hello" }
+      ],
+      metadata
+    }, "glm-test");
+
+    assert.deepEqual(request.body.system, [
+      {
+        type: "text",
+        text: "stable system prefix",
+        cache_control: {
+          type: "ephemeral"
+        }
+      },
+      {
+        type: "text",
+        text: "SWE_BENCH_POST_EDIT_VERIFICATION_GATE\nObserved iteration=9"
+      }
+    ]);
+  });
+
+  it("requires explicit stable cache hints before including GLM Anthropic system messages in the cached prefix", () => {
+    const metadata = {
+      contextPipeline: {
+        pipelineFingerprint: "pipeline:test",
+        cacheHintSummary: {
+          stable: 2,
+          ephemeral: 1,
+          noStore: 0,
+          ttlBound: 0
+        }
+      }
+    };
+    const provider = new GlmAnthropicProvider({
+      transport: new FixtureModelProviderTransport([]),
+      credentials: new StaticCredentialProvider("glm-test", glmAnthropicProviderConfig.credentialRef),
+      config: {
+        ...glmAnthropicProviderConfig,
+        cacheHints: {
+          explicitPrefixCacheHints: true,
+          supportedPolicies: ["stable"],
+          maxCacheHintBlocks: 4
+        }
+      }
+    });
+    const request = provider.buildProviderRequest({
+      profile: defaultGlmAnthropicProfile,
+      prompt: "hello",
+      messages: [
+        { role: "system", content: "stable system prefix", cacheHint: { policy: "stable" } },
+        { role: "system", content: "unmarked dynamic system tail" },
+        { role: "user", content: "hello" }
+      ],
+      metadata
+    }, "glm-test");
+
+    assert.deepEqual(request.body.system, [
+      {
+        type: "text",
+        text: "stable system prefix",
+        cache_control: {
+          type: "ephemeral"
+        }
+      },
+      {
+        type: "text",
+        text: "unmarked dynamic system tail"
+      }
+    ]);
+  });
+
+  it("adds a GLM Anthropic cache breakpoint to the growing message tail", () => {
+    const metadata = {
+      contextPipeline: {
+        pipelineFingerprint: "pipeline:test",
+        cacheHintSummary: {
+          stable: 2,
+          ephemeral: 1,
+          noStore: 0,
+          ttlBound: 0
+        }
+      }
+    };
+    const provider = new GlmAnthropicProvider({
+      transport: new FixtureModelProviderTransport([]),
+      credentials: new StaticCredentialProvider("glm-test", glmAnthropicProviderConfig.credentialRef)
+    });
+    const request = provider.buildProviderRequest({
+      profile: defaultGlmAnthropicProfile,
+      prompt: "hello",
+      messages: [
+        { role: "system", content: "stable system prefix" },
+        { role: "user", content: "hello" },
+        { role: "assistant", content: "", toolCalls: [{ id: "tool-1", name: "core_search_text", input: { query: "alpha" } }] },
+        { role: "tool", toolCallId: "tool-1", toolName: "core.search.text", content: "search result" }
+      ],
+      metadata
+    }, "glm-test");
+
+    assert.deepEqual(request.body.messages, [
+      { role: "user", content: "hello" },
+      { role: "assistant", content: [{ type: "tool_use", id: "tool-1", name: "core_search_text", input: { query: "alpha" } }] },
+      {
+        role: "user",
+        content: [{
+          type: "text",
+          text: "Internal tool feedback (core.search.text):\nsearch result",
+          cache_control: {
+            type: "ephemeral"
+          }
+        }]
+      }
+    ]);
+  });
+
+  it("places the GLM Anthropic cache breakpoint on the stable task prompt before dynamic history", () => {
+    const metadata = {
+      contextPipeline: {
+        pipelineFingerprint: "pipeline:test",
+        cacheHintSummary: {
+          stable: 3,
+          ephemeral: 1,
+          noStore: 0,
+          ttlBound: 0
+        }
+      }
+    };
+    const provider = new GlmAnthropicProvider({
+      transport: new FixtureModelProviderTransport([]),
+      credentials: new StaticCredentialProvider("glm-test", glmAnthropicProviderConfig.credentialRef)
+    });
+    const request = provider.buildProviderRequest({
+      profile: defaultGlmAnthropicProfile,
+      prompt: "SWE task",
+      messages: [
+        { role: "system", content: "stable system prefix", cacheHint: { policy: "stable" } },
+        { role: "user", content: "SWE task", cacheHint: { policy: "stable" } },
+        { role: "assistant", content: "", toolCalls: [{ id: "tool-1", name: "core_search_text", input: { query: "alpha" } }] },
+        { role: "tool", toolCallId: "tool-1", toolName: "core.search.text", content: "dynamic search result" }
+      ],
+      metadata
+    }, "glm-test");
+
+    assert.deepEqual(request.body.system, [
+      {
+        type: "text",
+        text: "stable system prefix"
+      }
+    ]);
+    assert.deepEqual(request.body.messages, [
+      {
+        role: "user",
+        content: [{
+          type: "text",
+          text: "SWE task",
+          cache_control: {
+            type: "ephemeral"
+          }
+        }]
+      },
+      { role: "assistant", content: [{ type: "tool_use", id: "tool-1", name: "core_search_text", input: { query: "alpha" } }] },
+      {
+        role: "user",
+        content: "Internal tool feedback (core.search.text):\ndynamic search result"
+      }
+    ]);
+  });
+
+  it("keeps a bounded GLM Anthropic history-tail breakpoint when no stable user task prompt is cacheable", () => {
+    const metadata = {
+      contextPipeline: {
+        pipelineFingerprint: "pipeline:test",
+        cacheHintSummary: {
+          stable: 3,
+          ephemeral: 1,
+          noStore: 0,
+          ttlBound: 0
+        }
+      }
+    };
+    const provider = new GlmAnthropicProvider({
+      transport: new FixtureModelProviderTransport([]),
+      credentials: new StaticCredentialProvider("glm-test", glmAnthropicProviderConfig.credentialRef)
+    });
+    const request = provider.buildProviderRequest({
+      profile: defaultGlmAnthropicProfile,
+      prompt: "SWE task",
+      messages: [
+        { role: "system", content: "stable system prefix", cacheHint: { policy: "stable" } },
+        { role: "user", content: "SWE task" },
+        { role: "assistant", content: "", toolCalls: [{ id: "tool-1", name: "core_search_text", input: { query: "alpha" } }] },
+        { role: "tool", toolCallId: "tool-1", toolName: "core.search.text", content: "first dynamic result" },
+        { role: "assistant", content: "I inspected the file." },
+        { role: "user", content: "SWE_BENCH_POST_EDIT_VERIFICATION_GATE\nRun a standard test next.", cacheHint: { policy: "no-store" } }
+      ],
+      metadata
+    }, "glm-test");
+
+    const messages = request.body.messages as readonly { readonly content?: unknown }[];
+    assert.equal(hasAnthropicCacheControl(messages[0]?.content), false);
+    assert.equal(hasAnthropicCacheControl(messages.at(-1)?.content), true);
+  });
+
+  it("keeps a single GLM Anthropic message cache breakpoint when the stable task prompt is cacheable", () => {
+    const metadata = {
+      contextPipeline: {
+        pipelineFingerprint: "pipeline:test",
+        cacheHintSummary: {
+          stable: 3,
+          ephemeral: 1,
+          noStore: 0,
+          ttlBound: 0
+        }
+      }
+    };
+    const provider = new GlmAnthropicProvider({
+      transport: new FixtureModelProviderTransport([]),
+      credentials: new StaticCredentialProvider("glm-test", glmAnthropicProviderConfig.credentialRef)
+    });
+    const request = provider.buildProviderRequest({
+      profile: defaultGlmAnthropicProfile,
+      prompt: "SWE task",
+      messages: [
+        { role: "system", content: "stable system prefix", cacheHint: { policy: "stable" } },
+        { role: "user", content: "SWE task", cacheHint: { policy: "stable" } },
+        { role: "assistant", content: "", toolCalls: [{ id: "tool-1", name: "core_search_text", input: { query: "alpha" } }] },
+        { role: "tool", toolCallId: "tool-1", toolName: "core.search.text", content: "first dynamic result" },
+        { role: "assistant", content: "I inspected the file." },
+        { role: "user", content: "SWE_BENCH_POST_EDIT_VERIFICATION_GATE\nRun a standard test next.", cacheHint: { policy: "no-store" } }
+      ],
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "core_file_read",
+            description: "Read files.",
+            parameters: { type: "object", properties: { path: { type: "string" } } }
+          }
+        }
+      ],
+      metadata
+    }, "glm-test");
+
+    const messages = request.body.messages as readonly { readonly content?: unknown }[];
+    assert.equal(hasAnthropicCacheControl(request.body.system), false);
+    assert.equal(hasAnthropicCacheControl(request.body.tools), false);
+    assert.equal(countAnthropicCacheControls(messages), 1);
+    assert.equal(hasAnthropicCacheControl(messages[0]?.content), true);
+    assert.equal(hasAnthropicCacheControl(messages.at(-1)?.content), false);
+  });
+
+  it("uses the stable task prompt as the only GLM Anthropic cache breakpoint", () => {
+    const metadata = {
+      contextPipeline: {
+        pipelineFingerprint: "pipeline:test",
+        cacheHintSummary: {
+          stable: 3,
+          ephemeral: 1,
+          noStore: 0,
+          ttlBound: 0
+        }
+      }
+    };
+    const provider = new GlmAnthropicProvider({
+      transport: new FixtureModelProviderTransport([]),
+      credentials: new StaticCredentialProvider("glm-test", glmAnthropicProviderConfig.credentialRef)
+    });
+    const request = provider.buildProviderRequest({
+      profile: defaultGlmAnthropicProfile,
+      prompt: "SWE task",
+      messages: [
+        { role: "system", content: "stable system prefix", cacheHint: { policy: "stable" } },
+        { role: "user", content: "SWE task", cacheHint: { policy: "stable" } },
+        { role: "assistant", content: "", toolCalls: [{ id: "tool-1", name: "core_search_text", input: { query: "alpha" } }] },
+        { role: "tool", toolCallId: "tool-1", toolName: "core.search.text", content: "first dynamic result" }
+      ],
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "core_file_read",
+            description: "Read files.",
+            parameters: { type: "object", properties: { path: { type: "string" } } }
+          }
+        }
+      ],
+      metadata
+    }, "glm-test");
+
+    const messages = request.body.messages as readonly { readonly content?: unknown }[];
+    assert.equal(hasAnthropicCacheControl(request.body.system), false);
+    assert.equal(hasAnthropicCacheControl(request.body.tools), false);
+    assert.equal(countAnthropicCacheControls(messages), 1);
+    assert.equal(hasAnthropicCacheControl(messages[0]?.content), true);
+  });
+
+  it("keeps the GLM Anthropic stable task prompt breakpoint when volatile system state is present", () => {
+    const metadata = {
+      contextPipeline: {
+        pipelineFingerprint: "pipeline:test",
+        cacheHintSummary: {
+          stable: 3,
+          ephemeral: 1,
+          noStore: 0,
+          ttlBound: 0
+        }
+      }
+    };
+    const provider = new GlmAnthropicProvider({
+      transport: new FixtureModelProviderTransport([]),
+      credentials: new StaticCredentialProvider("glm-test", glmAnthropicProviderConfig.credentialRef)
+    });
+    const request = provider.buildProviderRequest({
+      profile: defaultGlmAnthropicProfile,
+      prompt: "SWE task",
+      messages: [
+        { role: "system", content: "stable system prefix", cacheHint: { policy: "stable" } },
+        { role: "system", content: "Agent profile workflow state: verify ready", cacheHint: { policy: "ephemeral" } },
+        { role: "user", content: "SWE task", cacheHint: { policy: "stable" } },
+        { role: "assistant", content: "", toolCalls: [{ id: "tool-1", name: "core_search_text", input: { query: "alpha" } }] },
+        { role: "tool", toolCallId: "tool-1", toolName: "core.search.text", content: "first dynamic result" },
+        { role: "assistant", content: "I inspected the file." },
+        { role: "user", content: "SWE_BENCH_POST_EDIT_VERIFICATION_GATE\nRun a standard test next.", cacheHint: { policy: "no-store" } }
+      ],
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "core_file_read",
+            description: "Read files.",
+            parameters: { type: "object", properties: { path: { type: "string" } } }
+          }
+        }
+      ],
+      metadata
+    }, "glm-test");
+
+    const messages = request.body.messages as readonly { readonly content?: unknown }[];
+    assert.equal(hasAnthropicCacheControl(request.body.system), false);
+    assert.equal(hasAnthropicCacheControl(request.body.tools), false);
+    assert.equal(countAnthropicCacheControls(messages), 1);
+    assert.equal(hasAnthropicCacheControl(messages[0]?.content), true);
+    assert.equal(hasAnthropicCacheControl(messages.at(-1)?.content), false);
+  });
+
+  it("attaches GLM Anthropic cache breakpoint shape evidence to usage metadata", async () => {
+    const metadata = {
+      contextPipeline: {
+        pipelineFingerprint: "pipeline:test",
+        cacheHintSummary: {
+          stable: 3,
+          ephemeral: 1,
+          noStore: 0,
+          ttlBound: 0
+        }
+      }
+    };
+    const transport = new FixtureModelProviderTransport([
+      { data: { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 8 } } },
+      { data: { type: "message_stop" } }
+    ]);
+    const provider = new GlmAnthropicProvider({
+      transport,
+      credentials: new StaticCredentialProvider("glm-test", glmAnthropicProviderConfig.credentialRef)
+    });
+    const events = await collect(provider.stream({
+      profile: defaultGlmAnthropicProfile,
+      prompt: "SWE task",
+      messages: [
+        { role: "system", content: "stable system prefix", cacheHint: { policy: "stable" } },
+        { role: "user", content: "SWE task", cacheHint: { policy: "stable" } },
+        { role: "assistant", content: "", toolCalls: [{ id: "tool-1", name: "core_search_text", input: { query: "alpha" } }] },
+        { role: "tool", toolCallId: "tool-1", toolName: "core.search.text", content: "dynamic search result" }
+      ],
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "core_file_read",
+            description: "Read files.",
+            parameters: { type: "object", properties: { path: { type: "string" } } }
+          }
+        }
+      ],
+      metadata
+    }));
+    const usage = events.find((event) => event.kind === "usage");
+
+    assert.deepEqual(usage?.kind === "usage" ? usage.metadata?.cache?.breakpointShape : undefined, {
+      systemCacheControlCount: 0,
+      messageCacheControlCount: 1,
+      toolCacheControlCount: 0,
+      totalCacheControlCount: 1,
+      messageCacheControlPositions: ["first-message"],
+      redaction: { class: "internal" }
+    });
+  });
+
+  it("keeps GLM Anthropic tool schemas inside an explicit cache breakpoint when no stable task prompt exists", () => {
+    const metadata = {
+      contextPipeline: {
+        pipelineFingerprint: "pipeline:test",
+        cacheHintSummary: {
+          stable: 3,
+          ephemeral: 1,
+          noStore: 0,
+          ttlBound: 0
+        }
+      }
+    };
+    const provider = new GlmAnthropicProvider({
+      transport: new FixtureModelProviderTransport([]),
+      credentials: new StaticCredentialProvider("glm-test", glmAnthropicProviderConfig.credentialRef)
+    });
+    const request = provider.buildProviderRequest({
+      profile: defaultGlmAnthropicProfile,
+      prompt: "SWE task",
+      messages: [
+        { role: "system", content: "stable system prefix", cacheHint: { policy: "stable" } },
+        { role: "user", content: "SWE task" }
+      ],
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "core_file_read",
+            description: "Read files.",
+            parameters: { type: "object", properties: { path: { type: "string" } } }
+          }
+        },
+        {
+          type: "function",
+          function: {
+            name: "core_test_run",
+            description: "Run tests.",
+            parameters: { type: "object", properties: { command: { type: "string" } } }
+          }
+        }
+      ],
+      metadata
+    }, "glm-test");
+
+    const tools = request.body.tools as readonly { readonly cache_control?: unknown }[];
+    assert.equal(tools.length, 2);
+    assert.equal(hasAnthropicCacheControl(tools[0]), false);
+    assert.equal(hasAnthropicCacheControl(tools[1]), true);
+  });
+
+  it("does not send GLM Anthropic cache hints when the context pipeline has no stable prefix blocks", async () => {
+    const metadata = {
+      contextPipeline: {
+        pipelineFingerprint: "pipeline:test",
+        cacheHintSummary: {
+          stable: 0,
+          ephemeral: 1,
+          noStore: 0,
+          ttlBound: 0
+        }
+      }
+    };
+    const transport = new FixtureModelProviderTransport([
+      { data: { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 0 } } },
+      { data: { type: "message_stop" } }
+    ]);
+    const provider = new GlmAnthropicProvider({
+      transport,
+      credentials: new StaticCredentialProvider("glm-test", glmAnthropicProviderConfig.credentialRef)
+    });
+    const events = await collect(provider.stream({
+      profile: defaultGlmAnthropicProfile,
+      prompt: "hello",
+      messages: [
+        { role: "system", content: "runtime instructions" },
+        { role: "user", content: "hello" },
+        { role: "assistant", content: "", toolCalls: [{ id: "tool-1", name: "core_search_text", input: { query: "alpha" } }] },
+        { role: "tool", toolCallId: "tool-1", toolName: "core.search.text", content: "search result" }
+      ],
+      metadata
+    }));
+    const usage = events.find((event) => event.kind === "usage");
+
+    assert.deepEqual(transport.requests[0]?.body.system, "runtime instructions");
+    assert.deepEqual(transport.requests[0]?.body.messages, [
+      { role: "user", content: "hello" },
+      { role: "assistant", content: [{ type: "tool_use", id: "tool-1", name: "core_search_text", input: { query: "alpha" } }] },
+      { role: "user", content: "Internal tool feedback (core.search.text):\nsearch result" }
+    ]);
+    assert.equal(usage?.kind === "usage" ? usage.metadata?.cache?.explicitPrefixCacheHint?.status : undefined, "missing");
+  });
+
+  it("attaches GLM explicit prefix cache hint support status to usage evidence", async () => {
+    const metadata = {
+      contextPipeline: {
+        pipelineFingerprint: "pipeline:test",
+        cacheHintSummary: {
+          stable: 2,
+          ephemeral: 1,
+          noStore: 0,
+          ttlBound: 0
+        }
+      }
+    };
+    const unsupportedTransport = new FixtureModelProviderTransport([
+      { data: { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 0 } } },
+      { data: { type: "message_stop" } }
+    ]);
+    const unsupported = new GlmAnthropicProvider({
+      transport: unsupportedTransport,
+      credentials: new StaticCredentialProvider("glm-test", glmAnthropicProviderConfig.credentialRef),
+      config: {
+        ...glmAnthropicProviderConfig,
+        cacheHints: {
+          explicitPrefixCacheHints: false
+        }
+      }
+    });
+    const unsupportedEvents = await collect(unsupported.stream({
+      profile: defaultGlmAnthropicProfile,
+      prompt: "hello",
+      metadata
+    }));
+    const unsupportedUsage = unsupportedEvents.find((event) => event.kind === "usage");
+
+    assert.equal(unsupportedUsage?.kind === "usage" ? unsupportedUsage.metadata?.cache?.explicitPrefixCacheHint?.status : undefined, "unsupported");
+    assert.equal(unsupportedUsage?.kind === "usage" ? unsupportedUsage.metadata?.cache?.explicitPrefixCacheHint?.reasonCode : undefined, "PROVIDER_EXPLICIT_PREFIX_CACHE_HINT_UNSUPPORTED");
+
+    const supportedTransport = new FixtureModelProviderTransport([
+      { data: { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 0 } } },
+      { data: { type: "message_stop" } }
+    ]);
+    const supported = new GlmAnthropicProvider({
+      transport: supportedTransport,
+      credentials: new StaticCredentialProvider("glm-test", glmAnthropicProviderConfig.credentialRef),
+      config: {
+        ...glmAnthropicProviderConfig,
+        cacheHints: {
+          explicitPrefixCacheHints: true,
+          supportedPolicies: ["stable"]
+        }
+      }
+    });
+    const supportedEvents = await collect(supported.stream({
+      profile: defaultGlmAnthropicProfile,
+      prompt: "hello",
+      messages: [
+        { role: "system", content: "stable system prefix", cacheHint: { policy: "stable" } },
+        { role: "user", content: "hello" }
+      ],
+      metadata
+    }));
+    const supportedUsage = supportedEvents.find((event) => event.kind === "usage");
+
+    assert.equal(supportedUsage?.kind === "usage" ? supportedUsage.metadata?.cache?.explicitPrefixCacheHint?.status : undefined, "sent");
+    assert.equal(supportedUsage?.kind === "usage" ? supportedUsage.metadata?.cache?.explicitPrefixCacheHint?.reasonCode : undefined, "PROVIDER_EXPLICIT_PREFIX_CACHE_HINT_SENT");
+  });
+
+  it("enables GLM Anthropic cache hints by default for context-pipeline requests", async () => {
+    const metadata = {
+      contextPipeline: {
+        pipelineFingerprint: "pipeline:test",
+        cacheHintSummary: {
+          stable: 2,
+          ephemeral: 1,
+          noStore: 0,
+          ttlBound: 0
+        }
+      }
+    };
+    const transport = new FixtureModelProviderTransport([
+      { data: { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 0 } } },
+      { data: { type: "message_stop" } }
+    ]);
+    const provider = new GlmAnthropicProvider({
+      transport,
+      credentials: new StaticCredentialProvider("glm-test", glmAnthropicProviderConfig.credentialRef)
+    });
+    const events = await collect(provider.stream({
+      profile: defaultGlmAnthropicProfile,
+      prompt: "hello",
+      messages: [
+        { role: "system", content: "stable system prefix", cacheHint: { policy: "stable" } },
+        { role: "user", content: "hello" }
+      ],
+      metadata
+    }));
+    const usage = events.find((event) => event.kind === "usage");
+
+    assert.deepEqual(transport.requests[0]?.body.system, [
+      {
+        type: "text",
+        text: "stable system prefix",
+        cache_control: {
+          type: "ephemeral"
+        }
+      }
+    ]);
+    assert.equal(usage?.kind === "usage" ? usage.metadata?.cache?.explicitPrefixCacheHint?.status : undefined, "sent");
+  });
+
   it("normalizes Anthropic text, tool-use, usage, finish, and done events", () => {
     const provider = { provider: "glm", protocol: "anthropic-messages" as const, model: "glm-5.1" };
     const events = [
@@ -787,5 +1498,47 @@ describe("GLM Anthropic-compatible provider", () => {
     assert.equal(usageEvents[0]?.kind === "usage" ? usageEvents[0].inputTokens : 0, 183);
     assert.equal(usageEvents[0]?.kind === "usage" ? usageEvents[0].outputTokens : 0, 13);
     assert.deepEqual(usageEvents[0]?.kind === "usage" ? usageEvents[0].metadata?.cache : undefined, { hitTokens: 0, missTokens: 183, hitRate: 0 });
+  });
+
+  it("counts GLM Anthropic cache creation tokens as provider cache misses", () => {
+    const normalize = createGlmAnthropicChunkNormalizer();
+    const provider = { provider: "glm", protocol: "anthropic-messages" as const, model: "glm-5.1" };
+    const events = [
+      ...normalize({
+        data: {
+          type: "message_start",
+          message: {
+            id: "msg-1",
+            usage: {
+              input_tokens: 125,
+              output_tokens: 0,
+              cache_creation_input_tokens: 875,
+              cache_read_input_tokens: 3000
+            }
+          }
+        }
+      }, provider),
+      ...normalize({
+        data: {
+          type: "message_delta",
+          delta: { stop_reason: "end_turn" },
+          usage: {
+            output_tokens: 11
+          }
+        }
+      }, provider),
+      ...normalize({ data: { type: "message_stop" } }, provider)
+    ];
+
+    const usage = events.find((event) => event.kind === "usage");
+
+    assert.equal(usage?.kind === "usage" ? usage.inputTokens : 0, 1000);
+    assert.equal(usage?.kind === "usage" ? usage.outputTokens : 0, 11);
+    assert.deepEqual(usage?.kind === "usage" ? usage.metadata?.cache : undefined, {
+      hitTokens: 3000,
+      missTokens: 1000,
+      writeTokens: 875,
+      hitRate: 0.75
+    });
   });
 });

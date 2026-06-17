@@ -144,6 +144,31 @@ describe("secret and sandbox policy helpers", () => {
     assert.equal(decision.reasonCodes.includes("filesystem.read-only"), true);
   });
 
+  it("allows governed long-running process timeouts within the platform maximum", () => {
+    const resourceScope = analyzeResourceScope({ cwd: "/workspace", workspaceRoot: "/workspace" }, "process");
+    const decision = selectSandboxDecision({
+      subject: "unit",
+      action: "execute:core.swe.bench.run",
+      resource: "core.swe.bench.run",
+      metadata: {
+        sideEffect: "process",
+        timeoutMs: 7_200_000,
+        permissions: ["process:run", "evaluation:swe-bench"]
+      },
+      secret: createSecretRedactionDecision("", { class: "public" }),
+      resourceScope,
+      sandbox: createSandboxRequirement({
+        sideEffect: "process",
+        resourceScope,
+        timeoutMs: 7_200_000,
+        permissions: ["process:run", "evaluation:swe-bench"]
+      })
+    });
+
+    assert.equal(decision.reasonCodes.includes("timeout.invalid"), false);
+    assert.equal(decision.action, "allow");
+  });
+
   it("rewrites raw secret exposure before execution", () => {
     const resourceScope = analyzeResourceScope({ prompt: "sk-live-1234567890" }, "none");
     const decision = selectSandboxDecision({

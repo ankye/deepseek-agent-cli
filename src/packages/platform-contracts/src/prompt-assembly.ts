@@ -3,7 +3,7 @@ import type { CompatibilityMetadata, JsonObject, RedactedError, RedactionMetadat
 import type { ContextPipelineManifest, ContextProjectionResult } from "./context.js";
 import type { EvidenceFirstRuntimeContext } from "./evidence-first.js";
 import type { SelfRepairOutcomeSummary } from "./self-repair.js";
-import type { AgentLoopOutputContract, AgentLoopProjectRuleEvidence, AgentLoopReferenceContext, AgentLoopToolProjection } from "./runtime.js";
+import type { AgentLoopOutputContract, AgentLoopProfilePolicyMetadata, AgentLoopProjectRuleEvidence, AgentLoopReferenceContext, AgentLoopToolProjection } from "./runtime.js";
 import type { AgentModeName, AgentPhasePlan, AgentReasoningEffortMapping, AgentVerifierResult, AgentWorkOrder } from "./agent-mode.js";
 import type { InteractionModeName } from "./interaction-mode.js";
 import type { ModelChatMessage, ModelProfile, ModelReasoningOptions, ModelToolChoice } from "./model.js";
@@ -106,6 +106,7 @@ export interface PromptSectionTrace extends JsonObject {
   readonly evidenceFingerprint: string;
   readonly included: boolean;
   readonly exclusionReason?: PromptSectionExclusionReason;
+  readonly provenance?: JsonObject;
   readonly preview?: string;
   readonly redaction: RedactionMetadata;
   readonly compatibility: CompatibilityMetadata;
@@ -159,6 +160,11 @@ export interface PromptAssemblyPipelineEvidence extends JsonObject {
   readonly layerPrefixHashes: readonly string[];
   readonly includedBlockIds: readonly string[];
   readonly excludedBlockIds: readonly string[];
+  readonly contextCacheHintSummary?: JsonObject;
+  readonly providerPrefixFingerprint?: string;
+  readonly providerPrefixMessageCount?: number;
+  readonly providerPrefixTokenEstimate?: number;
+  readonly providerPrefixCacheHintSummary?: JsonObject;
   readonly cacheHintSummary: JsonObject;
   readonly redaction: RedactionMetadata;
 }
@@ -192,6 +198,7 @@ export interface PromptAssemblyInput {
   readonly contextProjection?: ContextProjectionResult;
   readonly contextPipelineManifest?: ContextPipelineManifest;
   readonly taskDecision?: TaskDecisionRequest;
+  readonly profilePolicy?: AgentLoopProfilePolicyMetadata;
   readonly evidenceFirst?: EvidenceFirstRuntimeContext;
   readonly selfRepair?: SelfRepairOutcomeSummary;
   readonly projectRules?: readonly AgentLoopProjectRuleEvidence[];

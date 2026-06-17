@@ -213,6 +213,58 @@ describe("agent loop typed tool feedback", () => {
     await kernel.shutdown();
   });
 
+  it("uses manifest-declared long tool budgets when the model omits timeoutMs", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await deps.capabilities.register({
+      ...runtimeEchoCapability,
+      id: "runtime.long-timeout-observer" as typeof runtimeEchoCapability.id,
+      name: "Runtime Long Timeout Observer",
+      sideEffect: "process",
+      permissions: ["process:run"],
+      timeoutMs: 7_200_000
+    }, async (_input: JsonObject, context: CapabilityExecutionContext) => ({
+      ok: true,
+      value: {
+        evidence: {
+          tool: "timeout.observer",
+          status: "completed",
+          affectedPaths: [],
+          preview: {
+            text: `observed timeout ${context.envelope.timeoutMs}`,
+            byteLength: 22,
+            lineCount: 1,
+            truncated: false,
+            limitBytes: 8000,
+            redaction: { class: "internal" }
+          },
+          diagnostics: [],
+          metadata: { observedTimeoutMs: context.envelope.timeoutMs },
+          replay: {},
+          redaction: { class: "internal", fields: ["preview.text"] }
+        }
+      }
+    }));
+    const loopDeps = {
+      ...deps,
+      models: new OneToolThenFinishModelGateway("runtime.long-timeout-observer", {}),
+      policy: new AllowAllPolicyEngine()
+    };
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "run a governed long tool",
+      caller: "runtime.feedback.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      limits: { toolTimeoutMs: 30_000 }
+    }));
+
+    const completed = events.find((event) => event.kind === "capability.completed");
+    const output = completed?.data.output as { evidence?: { metadata?: { observedTimeoutMs?: number } } } | undefined;
+    assert.equal(output?.evidence?.metadata?.observedTimeoutMs, 7_200_000);
+    await kernel.shutdown();
+  });
+
   it("emits a terminal failed event when a repairable tool error happens on the final model iteration", async () => {
     const deps = createDeterministicRuntimeDependencies();
     await deps.capabilities.register({

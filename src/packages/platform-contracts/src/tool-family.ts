@@ -45,6 +45,7 @@ export const TOOL_FAMILY_IDS = [
   "git.history-branch",
   "build.test-lint-typecheck",
   "package.manager",
+  "benchmark.run",
   "plan.todo",
   "mode.plan-auto-review",
   "user.input",

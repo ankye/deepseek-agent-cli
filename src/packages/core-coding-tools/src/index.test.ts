@@ -23,6 +23,7 @@ import {
   coreCapabilityFamilyMappings,
   coreToolIds,
   coreToolManifests,
+  isStandardTestCommand,
   registerCoreCodingTools,
   toolFamilyCatalog,
   validateToolFamilyCatalog
@@ -32,6 +33,8 @@ const workspaceRoot = "/workspace";
 
 class ShellCapableFakePlatform extends FakePlatformRuntime {
   readonly executedCommands: { readonly command: string; readonly args: readonly string[]; readonly cwd?: string }[] = [];
+  readonly commandTimeouts: number[] = [];
+  nextProcessResult: ProcessResult | undefined;
 
   override async resolveShell(profile: ShellProfile = "bash"): Promise<SerializableResult<ShellProviderDescriptor>> {
     return super.resolveShell(profile);
@@ -43,7 +46,13 @@ class ShellCapableFakePlatform extends FakePlatformRuntime {
     options: ProcessRunOptions = {},
     observer?: ProcessRunObserver
   ): Promise<ProcessResult> {
+    this.commandTimeouts.push(options.timeoutMs ?? 0);
     this.executedCommands.push({ command, args: [...args], ...(options.cwd ? { cwd: options.cwd } : {}) });
+    if (this.nextProcessResult) {
+      const result = this.nextProcessResult;
+      this.nextProcessResult = undefined;
+      return result;
+    }
     return super.runProcess(command, args, options, observer);
   }
 }
@@ -150,6 +159,14 @@ describe("core coding tool executors", () => {
     }
   });
 
+  it("declares REPL governance fields used by process sandbox preflight", () => {
+    const manifest = coreToolManifests().find((candidate) => candidate.id === coreToolIds.replExecute);
+
+    assert.ok(manifest);
+    assert.equal(((manifest.inputSchema.properties as JsonObject).cwd as JsonObject | undefined)?.type, "string");
+    assert.equal(((manifest.inputSchema.properties as JsonObject).workspaceRoot as JsonObject | undefined)?.type, "string");
+  });
+
   it("scores planned or unassessed families as zero instead of giving catalog credit", () => {
     const matrix = buildToolFamilyParityMatrix();
     const implemented = toolFamilyCatalog.families.filter((family) => family.implementationState === "implemented").length;
@@ -163,7 +180,7 @@ describe("core coding tool executors", () => {
     assert.equal(matrix.objectiveScore, 0);
     assert.equal(matrix.deliveryCapabilityScore, 0);
     assert.equal(matrix.deliveryCapabilityTargetScore, 0.9);
-    assert.equal(matrix.deliveryCapabilityTargetFamilyCount, 58);
+    assert.equal(matrix.deliveryCapabilityTargetFamilyCount, Math.ceil(matrix.totalFamilyCount * matrix.deliveryCapabilityTargetScore));
     assert.equal(matrix.deliveryCapabilityPassed, false);
 
     const patch = matrix.scorecards.find((scorecard) => scorecard.familyId === "patch.apply");
@@ -177,9 +194,9 @@ describe("core coding tool executors", () => {
       safetyCoveredFamilyIds: ["file.read"]
     });
     assert.equal(withEvidence.passedFamilyCount, 1);
-    assert.equal(withEvidence.objectiveScore, 0.016);
+    assert.equal(withEvidence.objectiveScore, Math.round((1 / withEvidence.totalFamilyCount) * 1000) / 1000);
     assert.equal(withEvidence.deliveryCapabilityPassedFamilyCount, 1);
-    assert.equal(withEvidence.deliveryCapabilityScore, 0.016);
+    assert.equal(withEvidence.deliveryCapabilityScore, Math.round((1 / withEvidence.totalFamilyCount) * 1000) / 1000);
     assert.equal(withEvidence.scorecards.find((scorecard) => scorecard.familyId === "file.read")?.objectiveScore, 1);
 
     const fakeEvidence = buildToolFamilyParityMatrix({
@@ -188,7 +205,7 @@ describe("core coding tool executors", () => {
       safetyCoveredFamilyIds: ["file.read"]
     });
     assert.equal(fakeEvidence.passedFamilyCount, 1);
-    assert.equal(fakeEvidence.objectiveScore, 0.016);
+    assert.equal(fakeEvidence.objectiveScore, Math.round((1 / fakeEvidence.totalFamilyCount) * 1000) / 1000);
     assert.equal(fakeEvidence.deliveryCapabilityPassedFamilyCount, 0);
     assert.equal(fakeEvidence.deliveryCapabilityScore, 0);
     assert.equal(fakeEvidence.deliveryCapabilityBlockingFamilyIds.includes("file.read"), true);
@@ -313,6 +330,34 @@ describe("core coding tool executors", () => {
     assert.equal(result.error?.code, "INTERNAL_ARTIFACT_REJECTED");
   });
 
+  it("allows shell commands inside a governed SWE-bench Lite checkout to reference that checkout", async () => {
+    const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
+    const repoRoot = `${workspaceRoot}/.deepseek/swe-lite-runs/unit-run/repo`;
+    await platform.writeFile(`${repoRoot}/astropy/io/ascii/core.py`, "header_rows = []");
+
+    const outerTraversal = await invoke(coreToolIds.shellRun, {
+      command: `grep -rn "header_rows" ${repoRoot}/astropy/io/ascii/ | head -50`,
+      cwd: ".",
+      workspaceRoot
+    }, { platform });
+
+    assert.equal(outerTraversal.ok, false);
+    assert.equal(outerTraversal.error?.code, "INTERNAL_ARTIFACT_REJECTED");
+
+    const currentCheckout = await invoke(coreToolIds.shellRun, {
+      command: `grep -rn "header_rows" ${repoRoot}/astropy/io/ascii/ | head -50`,
+      cwd: ".",
+      workspaceRoot: repoRoot
+    }, { platform });
+
+    assert.equal(currentCheckout.ok, true);
+    assert.deepEqual(platform.executedCommands.at(-1), {
+      command: "bash",
+      args: ["-lc", `set -o pipefail; PATH=${repoRoot}/.venv/bin:$PATH; export PATH; grep -rn "header_rows" ${repoRoot}/astropy/io/ascii/ | head -50`],
+      cwd: repoRoot
+    });
+  });
+
   it("runs model-authored shell command strings through the host shell", async () => {
     const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
 
@@ -324,7 +369,7 @@ describe("core coding tool executors", () => {
     assert.equal(shellString.ok, true);
     assert.deepEqual(platform.executedCommands[0], {
       command: "bash",
-      args: ["-lc", "echo hello && pwd"],
+      args: ["-lc", "set -o pipefail; echo hello && pwd"],
       cwd: workspaceRoot
     });
     assert.equal(shellString.value?.evidence.metadata.shellSyntax, true);
@@ -365,8 +410,527 @@ describe("core coding tool executors", () => {
     assert.equal(platform.executedCommands.length, 1);
     assert.deepEqual(platform.executedCommands[0], {
       command: "bash",
-      args: ["-lc", "source .venv/bin/activate && pip install numpy"],
+      args: ["-lc", "set -o pipefail; source .venv/bin/activate && pip install numpy"],
       cwd: `${workspaceRoot}/.deepseek/swebench-workspaces/astropy__astropy-12907/repo`
+    });
+  });
+
+  it("binds governed SWE-bench Lite checkout shell commands to the checkout-local virtualenv", async () => {
+    const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
+    const repoRoot = `${workspaceRoot}/.deepseek/swe-lite-runs/unit-run/repo`;
+
+    const result = await invoke(coreToolIds.shellRun, {
+      command: `cd ${repoRoot} && pip install -e . 2>&1 | tail -20`,
+      timeoutMs: 300_000,
+      cwd: ".",
+      workspaceRoot: repoRoot
+    }, { platform });
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(platform.executedCommands[0], {
+      command: "bash",
+      args: ["-lc", `set -o pipefail; PATH=${repoRoot}/.venv/bin:$PATH; export PATH; cd ${repoRoot} && python -m pip install -e . 2>&1 | tail -20`],
+      cwd: repoRoot
+    });
+  });
+
+  it("rewrites common container checkout aliases inside governed SWE-bench Lite shell commands", async () => {
+    const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
+    const repoRoot = `${workspaceRoot}/.deepseek/swe-lite-runs/unit-run/repo`;
+
+    const result = await invoke(coreToolIds.shellRun, {
+      command: "cd /home/user && python -m pytest astropy/io/ascii/tests/test_qdp.py -x -v --no-header -q 2>&1 | head -80",
+      timeoutMs: 120_000,
+      cwd: ".",
+      workspaceRoot: repoRoot
+    }, { platform });
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(platform.executedCommands[0], {
+      command: "bash",
+      args: ["-lc", `set -o pipefail; PATH=${repoRoot}/.venv/bin:$PATH; export PATH; cd ${repoRoot} && python -m pytest astropy/io/ascii/tests/test_qdp.py -x -v --no-header -q 2>&1 | head -80`],
+      cwd: repoRoot
+    });
+    assert.equal(result.value?.evidence.metadata.sweLiteVenvBound, true);
+  });
+
+  it("binds governed SWE-bench Lite checkout argv pip commands through the checkout python", async () => {
+    const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
+    const repoRoot = `${workspaceRoot}/.deepseek/swe-lite-runs/unit-run/repo`;
+
+    const result = await invoke(coreToolIds.shellRun, {
+      command: "pip",
+      args: ["install", "hypothesis"],
+      cwd: ".",
+      workspaceRoot: repoRoot
+    }, { platform });
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(platform.executedCommands[0], {
+      command: `${repoRoot}/.venv/bin/python`,
+      args: ["-m", "pip", "install", "hypothesis"],
+      cwd: repoRoot
+    });
+  });
+
+  it("allows governed SWE-bench Lite checkout package installs after binding PATH to the checkout-local virtualenv", async () => {
+    const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
+    const repoRoot = `${workspaceRoot}/.deepseek/swe-lite-runs/unit-run/repo`;
+
+    const result = await invoke(coreToolIds.shellRun, {
+      command: `cd ${repoRoot} && pip install setuptools==68.0.0 2>&1 | tail -5`,
+      timeoutMs: 300_000,
+      cwd: ".",
+      workspaceRoot: repoRoot
+    }, { platform });
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(platform.executedCommands[0], {
+      command: "bash",
+      args: ["-lc", `set -o pipefail; PATH=${repoRoot}/.venv/bin:$PATH; export PATH; cd ${repoRoot} && python -m pip install setuptools==68.0.0 2>&1 | tail -5`],
+      cwd: repoRoot
+    });
+  });
+
+  it("gives governed SWE-bench Lite checkout package installs a long default timeout", async () => {
+    const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
+    const repoRoot = `${workspaceRoot}/.deepseek/swe-lite-runs/unit-run/repo`;
+
+    const result = await invoke(coreToolIds.shellRun, {
+      command: "pip install -e . 2>&1 | tail -5",
+      cwd: ".",
+      workspaceRoot: repoRoot
+    }, { platform });
+
+    assert.equal(result.ok, true);
+    assert.equal(platform.commandTimeouts[0], 600_000);
+  });
+
+  it("runs model-authored test command strings through the host shell", async () => {
+    const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
+
+    const result = await invoke(coreToolIds.testRun, {
+      command: "python -m pytest tests/unit -x -v 2>&1 | tail -40",
+      workspaceRoot
+    }, { platform });
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(platform.executedCommands[0], {
+      command: "bash",
+      args: ["-lc", "set -o pipefail; python -m pytest tests/unit -x -v 2>&1 | tail -40"],
+      cwd: workspaceRoot
+    });
+    assert.equal(result.value?.evidence.metadata.shellSyntax, true);
+  });
+
+  it("runs test command strings with args through the host shell", async () => {
+    const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
+
+    const result = await invoke(coreToolIds.testRun, {
+      command: "python -m pytest",
+      args: ["astropy/io/ascii/tests/test_rst.py::test_rst_with_header_rows", "-xvs"],
+      workspaceRoot
+    }, { platform });
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(platform.executedCommands[0], {
+      command: "bash",
+      args: ["-lc", "set -o pipefail; python -m pytest astropy/io/ascii/tests/test_rst.py::test_rst_with_header_rows -xvs"],
+      cwd: workspaceRoot
+    });
+  });
+
+  it("classifies standard test commands through shared ecosystem patterns", () => {
+    assert.equal(isStandardTestCommand("python tests/runtests.py forms_tests.tests.test_media -v 2"), true);
+    assert.equal(isStandardTestCommand("cd repo && python tests/runtests.py forms_tests.tests.test_media -v 2 | head -100"), true);
+    assert.equal(isStandardTestCommand("python", ["-m", "django", "test", "forms_tests.tests.test_media"]), true);
+    assert.equal(isStandardTestCommand("bash", ["-lc", "cd /mnt/c/repo && python tests/runtests.py forms_tests.tests.test_media -v 2 | head -100"]), true);
+    assert.equal(isStandardTestCommand("wsl.exe", ["bash", "-lc", "cd /mnt/c/repo && python tests/runtests.py forms_tests.tests.test_media -v 2"]), true);
+    assert.equal(isStandardTestCommand("wsl", ["-e", "bash", "-lc", "python tests/runtests.py forms_tests.tests.test_media -v 2"]), true);
+    assert.equal(isStandardTestCommand("wsl.exe", ["--shell-type", "standard", "--cd", "/mnt/c/repo", "--", "bash", "-lc", "python -m pytest tests/test_demo.py"]), true);
+    assert.equal(isStandardTestCommand("wsl.exe --cd /mnt/c/repo python -m pytest tests/test_demo.py"), true);
+    assert.equal(isStandardTestCommand("pwsh", ["-NoProfile", "-Command", "cd repo; python .\\tests\\runtests.py forms_tests.tests.test_media -v 2 | Select-Object -First 100"]), true);
+    assert.equal(isStandardTestCommand("cmd.exe", ["/d", "/s", "/c", "python tests\\runtests.py forms_tests.tests.test_media -v 2"]), true);
+    assert.equal(isStandardTestCommand("C:\\Python311\\python.exe .\\tests\\runtests.py forms_tests.tests.test_media -v 2"), true);
+    assert.equal(isStandardTestCommand("npm run test -- --watch=false"), true);
+    assert.equal(isStandardTestCommand("go test ./..."), true);
+    assert.equal(isStandardTestCommand("cargo test --workspace"), true);
+    assert.equal(isStandardTestCommand("python -c \"import django\""), false);
+  });
+
+  it("does not duplicate python -c when the command string already includes it", async () => {
+    const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
+
+    const result = await invoke(coreToolIds.testRun, {
+      command: "python -c",
+      args: ["-c", "print(123)"],
+      workspaceRoot
+    }, { platform });
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(platform.executedCommands[0], {
+      command: "bash",
+      args: ["-lc", "set -o pipefail; python -c 'print(123)'"],
+      cwd: workspaceRoot
+    });
+  });
+
+  it("binds governed SWE-bench Lite checkout test commands to the checkout-local virtualenv", async () => {
+    const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
+    const repoRoot = `${workspaceRoot}/.deepseek/swe-lite-runs/unit-run/repo`;
+
+    const result = await invoke(coreToolIds.testRun, {
+      command: "python -m pytest",
+      args: ["astropy/io/ascii/tests/test_rst.py", "-x", "-v"],
+      cwd: ".",
+      workspaceRoot: repoRoot
+    }, { platform });
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(platform.executedCommands[0], {
+      command: "bash",
+      args: ["-lc", `set -o pipefail; PATH=${repoRoot}/.venv/bin:$PATH; export PATH; python -m pytest astropy/io/ascii/tests/test_rst.py -x -v`],
+      cwd: repoRoot
+    });
+    assert.equal(platform.commandTimeouts[0], 600_000);
+    assert.equal(result.value?.evidence.metadata.sweLiteVenvBound, true);
+  });
+
+  it("classifies missing Python test dependencies instead of returning an opaque pytest failure", async () => {
+    const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
+    platform.nextProcessResult = {
+      exitCode: 4,
+      stdout: "",
+      stderr: [
+        "ImportError while loading conftest '/workspace/conftest.py'.",
+        "conftest.py:9: in <module>",
+        "    import hypothesis",
+        "E   ModuleNotFoundError: No module named 'hypothesis'"
+      ].join("\n")
+    };
+
+    const result = await invoke(coreToolIds.testRun, {
+      command: "python -m pytest",
+      args: ["astropy/io/ascii/tests/test_rst.py", "-x", "-v"],
+      cwd: ".",
+      workspaceRoot
+    }, { platform });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.value?.evidence.status, "failed");
+    assert.match(result.value?.evidence.preview?.text ?? "", /PYTHON_TEST_DEPENDENCY_MISSING/);
+    assert.match(result.value?.evidence.preview?.text ?? "", /python -m pip install hypothesis/);
+    assert.equal((result.value?.evidence.metadata.testFailure as { kind?: string; moduleName?: string } | undefined)?.kind, "python-missing-module");
+    assert.equal((result.value?.evidence.metadata.testFailure as { kind?: string; moduleName?: string } | undefined)?.moduleName, "hypothesis");
+  });
+
+  it("classifies Python interpreter no-module output as a missing test dependency", async () => {
+    const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
+    platform.nextProcessResult = {
+      exitCode: 1,
+      stdout: "",
+      stderr: "/workspace/.deepseek/swe-lite-runs/unit-run/repo/.venv/bin/python: No module named pytest"
+    };
+
+    const result = await invoke(coreToolIds.testRun, {
+      command: "python -m pytest",
+      args: ["astropy/io/ascii/tests/test_rst.py", "-x", "-v"],
+      cwd: ".",
+      workspaceRoot
+    }, { platform });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.value?.evidence.status, "failed");
+    assert.match(result.value?.evidence.preview?.text ?? "", /PYTHON_TEST_DEPENDENCY_MISSING/);
+    assert.match(result.value?.evidence.preview?.text ?? "", /python -m pip install pytest/);
+    assert.equal((result.value?.evidence.metadata.testFailure as { kind?: string; moduleName?: string } | undefined)?.kind, "python-missing-module");
+    assert.equal((result.value?.evidence.metadata.testFailure as { kind?: string; moduleName?: string } | undefined)?.moduleName, "pytest");
+  });
+
+  it("points pytest-missing SWE-bench checks at repo-local Python test runners when present", async () => {
+    const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
+    const repoRoot = `${workspaceRoot}/.deepseek/swe-lite-runs/unit-run/repo`;
+    await platform.writeFile(`${repoRoot}/tests/runtests.py`, "# repo-local test runner\n");
+    platform.nextProcessResult = {
+      exitCode: 1,
+      stdout: "",
+      stderr: `${repoRoot}/.venv/bin/python: No module named pytest`
+    };
+
+    const result = await invoke(coreToolIds.testRun, {
+      command: "python -m pytest",
+      args: ["tests/invalid_models_tests/test_ordinary_fields.py", "-xvs"],
+      cwd: ".",
+      workspaceRoot: repoRoot
+    }, { platform });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.value?.evidence.status, "failed");
+    assert.match(result.value?.evidence.preview?.text ?? "", /PYTHON_TEST_DEPENDENCY_MISSING/);
+    assert.match(result.value?.evidence.preview?.text ?? "", /Repo-local Python test runner is available at 'tests\/runtests.py'/);
+    assert.match(result.value?.evidence.preview?.text ?? "", /python tests\/runtests.py/);
+    assert.doesNotMatch(result.value?.evidence.preview?.text ?? "", /python -m pip install pytest/);
+    const testFailure = result.value?.evidence.metadata.testFailure as { kind?: string; moduleName?: string; suggestedCommand?: string; alternateCommand?: string } | undefined;
+    assert.equal(testFailure?.kind, "python-missing-module");
+    assert.equal(testFailure?.moduleName, "pytest");
+    assert.equal(testFailure?.suggestedCommand, "python tests/runtests.py");
+    assert.equal(testFailure?.alternateCommand, "python tests/runtests.py");
+  });
+
+  it("points missing Python test launchers at repo-local runners without dependency-install advice", async () => {
+    const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
+    const repoRoot = `${workspaceRoot}/.deepseek/swe-lite-runs/unit-run/repo`;
+    await platform.writeFile(`${repoRoot}/tests/runtests.py`, "# repo-local test runner\n");
+    platform.nextProcessResult = {
+      exitCode: 1,
+      stdout: "",
+      stderr: `${repoRoot}/.venv/bin/python: No module named nose`
+    };
+
+    const result = await invoke(coreToolIds.testRun, {
+      command: "python",
+      args: ["-m", "nose", "tests/test_demo.py"],
+      cwd: ".",
+      workspaceRoot: repoRoot
+    }, { platform });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.value?.evidence.status, "failed");
+    assert.match(result.value?.evidence.preview?.text ?? "", /PYTHON_TEST_DEPENDENCY_MISSING/);
+    assert.match(result.value?.evidence.preview?.text ?? "", /Repo-local Python test runner is available at 'tests\/runtests.py'/);
+    assert.match(result.value?.evidence.preview?.text ?? "", /python tests\/runtests.py/);
+    assert.doesNotMatch(result.value?.evidence.preview?.text ?? "", /python -m pip install nose/);
+    const testFailure = result.value?.evidence.metadata.testFailure as { kind?: string; moduleName?: string; suggestedCommand?: string; alternateCommand?: string; suggestedAction?: string } | undefined;
+    assert.equal(testFailure?.kind, "python-missing-module");
+    assert.equal(testFailure?.moduleName, "nose");
+    assert.equal(testFailure?.suggestedAction, "use-repo-local-python-test-runner");
+    assert.equal(testFailure?.suggestedCommand, "python tests/runtests.py");
+    assert.equal(testFailure?.alternateCommand, "python tests/runtests.py");
+  });
+
+  it("adds repo-local runner hints to shell pytest failures inside SWE-bench checkouts", async () => {
+    const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
+    const repoRoot = `${workspaceRoot}/.deepseek/swe-lite-runs/unit-run/repo`;
+    await platform.writeFile(`${repoRoot}/tests/runtests.py`, "# repo-local test runner\n");
+    platform.nextProcessResult = {
+      exitCode: 1,
+      stdout: "",
+      stderr: `${repoRoot}/.venv/bin/python: No module named pytest`
+    };
+
+    const result = await invoke(coreToolIds.shellRun, {
+      command: "python -m pytest tests/invalid_models_tests/test_ordinary_fields.py -xvs 2>&1 | tail -30",
+      cwd: ".",
+      workspaceRoot: repoRoot
+    }, { platform });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.value?.evidence.status, "failed");
+    assert.match(result.value?.evidence.preview?.text ?? "", /Repo-local Python test runner is available at 'tests\/runtests.py'/);
+    assert.doesNotMatch(result.value?.evidence.preview?.text ?? "", /python -m pip install pytest/);
+    assert.equal((result.value?.evidence.metadata.testFailure as { suggestedCommand?: string; alternateCommand?: string } | undefined)?.suggestedCommand, "python tests/runtests.py");
+    assert.equal((result.value?.evidence.metadata.testFailure as { alternateCommand?: string } | undefined)?.alternateCommand, "python tests/runtests.py");
+  });
+
+  it("classifies legacy numpy API pytest crashes as checkout dependency incompatibility", async () => {
+    const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
+    platform.nextProcessResult = {
+      exitCode: 3,
+      stdout: [
+        "INTERNALERROR> Traceback (most recent call last):",
+        "INTERNALERROR>   File \"/workspace/repo/.venv/lib/python3.9/site-packages/_pytest/main.py\", line 285, in wrap_session",
+        "INTERNALERROR>     config._do_configure()",
+        "INTERNALERROR> AttributeError: module 'numpy' has no attribute 'product'"
+      ].join("\n"),
+      stderr: ""
+    };
+
+    const result = await invoke(coreToolIds.testRun, {
+      command: "python -m pytest",
+      args: ["astropy/wcs/tests/test_wcs.py", "-x", "-v"],
+      cwd: ".",
+      workspaceRoot
+    }, { platform });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.value?.evidence.status, "failed");
+    assert.match(result.value?.evidence.preview?.text ?? "", /PYTHON_TEST_DEPENDENCY_INCOMPATIBLE/);
+    assert.match(result.value?.evidence.preview?.text ?? "", /python -m pip install 'numpy<2'/);
+    assert.equal((result.value?.evidence.metadata.testFailure as { kind?: string; dependencyName?: string } | undefined)?.kind, "python-dependency-incompatible");
+    assert.equal((result.value?.evidence.metadata.testFailure as { kind?: string; dependencyName?: string } | undefined)?.dependencyName, "numpy");
+  });
+
+  it("classifies missing Python test runner files as invalid test command feedback", async () => {
+    const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
+    platform.nextProcessResult = {
+      exitCode: 2,
+      stdout: "",
+      stderr: "python: can't open file '/workspace/repo/runtests.py': [Errno 2] No such file or directory"
+    };
+
+    const result = await invoke(coreToolIds.testRun, {
+      command: "python",
+      args: ["runtests.py", "forms_tests.tests.test_media"],
+      cwd: ".",
+      workspaceRoot
+    }, { platform });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.value?.evidence.status, "failed");
+    assert.match(result.value?.evidence.preview?.text ?? "", /PYTHON_TEST_ENTRYPOINT_MISSING/);
+    assert.match(result.value?.evidence.preview?.text ?? "", /Find the repo-local test runner before retrying/);
+    assert.equal((result.value?.evidence.metadata.testFailure as { kind?: string; missingPath?: string } | undefined)?.kind, "python-test-entrypoint-missing");
+    assert.equal((result.value?.evidence.metadata.testFailure as { kind?: string; missingPath?: string } | undefined)?.missingPath, "/workspace/repo/runtests.py");
+  });
+
+  it("classifies unsupported Python test runner flags and suggests the accepted spelling", async () => {
+    const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
+    platform.nextProcessResult = {
+      exitCode: 2,
+      stdout: [
+        "usage: runtests.py [-h] [-v {0,1,2,3}] [--noinput] [--failfast]",
+        "runtests.py: error: unrecognized arguments: --no-input"
+      ].join("\n"),
+      stderr: ""
+    };
+
+    const result = await invoke(coreToolIds.testRun, {
+      command: "python",
+      args: ["tests/runtests.py", "forms_tests.tests.test_media", "--no-input"],
+      cwd: ".",
+      workspaceRoot
+    }, { platform });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.value?.evidence.status, "failed");
+    assert.match(result.value?.evidence.preview?.text ?? "", /PYTHON_TEST_ARGUMENT_UNSUPPORTED/);
+    assert.match(result.value?.evidence.preview?.text ?? "", /Use '--noinput' instead of '--no-input'/);
+    assert.equal((result.value?.evidence.metadata.testFailure as { kind?: string; unsupportedOption?: string; suggestedOption?: string } | undefined)?.kind, "python-test-argument-unsupported");
+    assert.equal((result.value?.evidence.metadata.testFailure as { kind?: string; unsupportedOption?: string; suggestedOption?: string } | undefined)?.unsupportedOption, "--no-input");
+    assert.equal((result.value?.evidence.metadata.testFailure as { kind?: string; unsupportedOption?: string; suggestedOption?: string } | undefined)?.suggestedOption, "--noinput");
+  });
+
+  it("classifies Python test command environment scope failures without suggesting package installs", async () => {
+    const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
+    platform.nextProcessResult = {
+      exitCode: 1,
+      stdout: "",
+      stderr: [
+        "Traceback (most recent call last):",
+        "  File \"<frozen importlib._bootstrap>\", line 1147, in _find_and_load_unlocked",
+        "ModuleNotFoundError: No module named 'test_sqlite'"
+      ].join("\n")
+    };
+
+    const result = await invoke(coreToolIds.shellRun, {
+      command: "python -m django test tests.invalid_models_tests.test_ordinary_fields.FilePathFieldTests --settings=test_sqlite --verbosity=2",
+      cwd: ".",
+      workspaceRoot
+    }, { platform });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.value?.evidence.status, "failed");
+    assert.match(result.value?.evidence.preview?.text ?? "", /PYTHON_TEST_COMMAND_ENV_MISSCOPED/);
+    assert.doesNotMatch(result.value?.evidence.preview?.text ?? "", /pip install test_sqlite/);
+    assert.equal((result.value?.evidence.metadata.testFailure as { kind?: string; moduleName?: string } | undefined)?.kind, "python-test-command-env-misscoped");
+    assert.equal((result.value?.evidence.metadata.testFailure as { kind?: string; moduleName?: string } | undefined)?.moduleName, "test_sqlite");
+  });
+
+  it("classifies dotted Django settings module scope failures without suggesting package installs", async () => {
+    const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
+    platform.nextProcessResult = {
+      exitCode: 1,
+      stdout: "",
+      stderr: [
+        "Traceback (most recent call last):",
+        "  File \"<frozen importlib._bootstrap>\", line 1147, in _find_and_load_unlocked",
+        "ModuleNotFoundError: No module named 'test_sqlite'"
+      ].join("\n")
+    };
+
+    const result = await invoke(coreToolIds.shellRun, {
+      command: "python -m django test tests.invalid_models_tests.test_ordinary_fields.FilePathFieldTests --settings=tests.test_sqlite --verbosity=2",
+      cwd: ".",
+      workspaceRoot
+    }, { platform });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.value?.evidence.status, "failed");
+    assert.match(result.value?.evidence.preview?.text ?? "", /PYTHON_TEST_COMMAND_ENV_MISSCOPED/);
+    assert.doesNotMatch(result.value?.evidence.preview?.text ?? "", /pip install test_sqlite/);
+    assert.equal((result.value?.evidence.metadata.testFailure as { kind?: string; moduleName?: string } | undefined)?.kind, "python-test-command-env-misscoped");
+    assert.equal((result.value?.evidence.metadata.testFailure as { kind?: string; moduleName?: string } | undefined)?.moduleName, "test_sqlite");
+  });
+
+  it("classifies checkout-local Python test module scope failures without suggesting package installs", async () => {
+    const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
+    platform.nextProcessResult = {
+      exitCode: 1,
+      stdout: "",
+      stderr: [
+        "Traceback (most recent call last):",
+        "  File \"<frozen importlib._bootstrap>\", line 1147, in _find_and_load_unlocked",
+        "ModuleNotFoundError: No module named 'invalid_models_tests'"
+      ].join("\n")
+    };
+
+    const result = await invoke(coreToolIds.shellRun, {
+      command: "DJANGO_SETTINGS_MODULE=tests.test_sqlite python -m unittest tests.invalid_models_tests.test_ordinary_fields.FilePathFieldTests",
+      cwd: ".",
+      workspaceRoot
+    }, { platform });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.value?.evidence.status, "failed");
+    assert.match(result.value?.evidence.preview?.text ?? "", /PYTHON_TEST_COMMAND_ENV_MISSCOPED/);
+    assert.doesNotMatch(result.value?.evidence.preview?.text ?? "", /pip install invalid_models_tests/);
+    assert.equal((result.value?.evidence.metadata.testFailure as { kind?: string; moduleName?: string } | undefined)?.kind, "python-test-command-env-misscoped");
+    assert.equal((result.value?.evidence.metadata.testFailure as { kind?: string; moduleName?: string } | undefined)?.moduleName, "invalid_models_tests");
+  });
+
+  it("classifies model-authored shell Python test failures with the same feedback as test.run", async () => {
+    const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
+    platform.nextProcessResult = {
+      exitCode: 4,
+      stdout: "",
+      stderr: [
+        "ImportError while loading conftest '/workspace/conftest.py'.",
+        "conftest.py:9: in <module>",
+        "    import hypothesis",
+        "E   ModuleNotFoundError: No module named 'hypothesis'"
+      ].join("\n")
+    };
+
+    const result = await invoke(coreToolIds.shellRun, {
+      command: "python -m pytest astropy/io/ascii/tests/test_rst.py -x -v 2>&1 | tail -40",
+      cwd: ".",
+      workspaceRoot
+    }, { platform });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.value?.evidence.status, "failed");
+    assert.match(result.value?.evidence.preview?.text ?? "", /PYTHON_TEST_DEPENDENCY_MISSING/);
+    assert.match(result.value?.evidence.preview?.text ?? "", /python -m pip install hypothesis/);
+    assert.equal((result.value?.evidence.metadata.testFailure as { kind?: string; moduleName?: string } | undefined)?.kind, "python-missing-module");
+    assert.equal((result.value?.evidence.metadata.testFailure as { kind?: string; moduleName?: string } | undefined)?.moduleName, "hypothesis");
+  });
+
+  it("allows governed SWE-bench Lite checkout installs through an absolute checkout-local virtualenv", async () => {
+    const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
+    const repoRoot = `${workspaceRoot}/.deepseek/swe-lite-runs/unit-run/repo`;
+
+    const result = await invoke(coreToolIds.shellRun, {
+      command: `python3 -m venv ${repoRoot}/.venv && source ${repoRoot}/.venv/bin/activate && pip install pytest numpy 2>&1 | tail -5`,
+      timeoutMs: 300_000,
+      cwd: ".",
+      workspaceRoot: repoRoot
+    }, { platform });
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(platform.executedCommands[0], {
+      command: "bash",
+      args: ["-lc", `set -o pipefail; PATH=${repoRoot}/.venv/bin:$PATH; export PATH; python3 -m venv ${repoRoot}/.venv && source ${repoRoot}/.venv/bin/activate && python -m pip install pytest numpy 2>&1 | tail -5`],
+      cwd: repoRoot
     });
   });
 
@@ -382,7 +946,7 @@ describe("core coding tool executors", () => {
     assert.equal(result.ok, true);
     assert.deepEqual(platform.executedCommands[0], {
       command: "bash",
-      args: ["-lc", `${workspaceRoot}/.deepseek/swebench-workspaces/astropy__astropy-12907/repo/.venv/bin/python3 test_regression_separability.py`],
+      args: ["-lc", `set -o pipefail; ${workspaceRoot}/.deepseek/swebench-workspaces/astropy__astropy-12907/repo/.venv/bin/python3 test_regression_separability.py`],
       cwd: `${workspaceRoot}/.deepseek/swebench-workspaces/astropy__astropy-12907/repo`
     });
   });
@@ -431,6 +995,20 @@ describe("core coding tool executors", () => {
 
     assert.equal(status.ok, true);
     assert.equal(platform.executedCommands.length, 1);
+  });
+
+  it("rejects direct traversal into historical SWE-bench workspaces from the CLI workspace root", async () => {
+    const platform = new ShellCapableFakePlatform("fake", workspaceRoot);
+
+    const rejected = await invoke(coreToolIds.shellRun, {
+      command: "cd .deepseek/swebench-workspaces/astropy__astropy-12907/repo && source .venv/bin/activate && python -m pytest astropy/modeling/tests/test_separable.py -v",
+      cwd: ".",
+      workspaceRoot
+    }, { platform });
+
+    assert.equal(rejected.ok, false);
+    assert.equal(rejected.error?.code, "SWE_BENCH_BOUNDARY_REJECTED");
+    assert.equal(platform.executedCommands.length, 0);
   });
 
   it("globs workspace files, views local assets, and reads bounded notebooks", async () => {
@@ -508,6 +1086,20 @@ describe("core coding tool executors", () => {
     const undo = await workspaceState.undoLatest({ path: `${workspaceRoot}/app.ts` });
     assert.equal(undo.ok, true);
     assert.equal(await platform.readFile(`${workspaceRoot}/app.ts`), "one two one");
+  });
+
+  it("rejects exact file edits that would leave the file unchanged", async () => {
+    const platform = new FakePlatformRuntime("fake", workspaceRoot);
+    const workspaceState = new InMemoryWorkspaceStateManager(platform);
+    await platform.writeFile(`${workspaceRoot}/app.ts`, "one two");
+
+    const result = await invoke(coreToolIds.fileEdit, { path: "app.ts", expected: "two", replacement: "two", workspaceRoot }, { platform, workspaceState });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.error?.code, "EDIT_NOOP");
+    assert.equal(await platform.readFile(`${workspaceRoot}/app.ts`), "one two");
+    assert.equal(workspaceState.records().length, 0);
+    assert.equal(workspaceState.checkpoints().length, 0);
   });
 
   it("applies multi-hunk patches transactionally and reverts checkpoints safely", async () => {

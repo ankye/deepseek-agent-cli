@@ -1,6 +1,6 @@
 import type { CliOptions, CliRunOptions } from "../types.js";
 import { createCliAgentRuntime } from "../host/runtime.js";
-import { resolveCliAgentLoopLimits, resolveCliModelProfile } from "../host/model-selection.js";
+import { cliAgentProfilePolicyMetadata, resolveCliAgentProfilePolicy, resolveCliModelProfile } from "../host/model-selection.js";
 import { collectCliProjectRuleEvidence } from "../host/project-rules.js";
 import type { CliTerminalCapabilityProfile } from "../host/terminal-profile.js";
 import { emitAgentLoop, finalAgentLoopEvent, renderFinalJsonIfNeeded, resumeHint } from "../renderers/runtime-events.js";
@@ -14,11 +14,16 @@ export async function runOneShotCommand(
   runOptions: CliRunOptions
 ): Promise<void> {
   const workspaceRoot = process.cwd();
-  const runtime = await createCliAgentRuntime({ live: options.live, workspaceRoot, ...(options.toolProjection ? { toolProjection: options.toolProjection } : {}), ...(options.modelProvider ? { modelProvider: options.modelProvider } : {}), ...(options.model ? { model: options.model } : {}) }, runOptions);
+  const profilePolicy = resolveCliAgentProfilePolicy({
+    prompt: options.prompt,
+    ...(options.toolProjection ? { explicitToolProjection: options.toolProjection } : {})
+  });
+  const profilePolicyMetadata = cliAgentProfilePolicyMetadata(profilePolicy);
+  const effectiveToolProjection = profilePolicy.toolProjection;
+  const runtime = await createCliAgentRuntime({ live: options.live, workspaceRoot, ...(effectiveToolProjection ? { toolProjection: effectiveToolProjection } : {}), ...(options.modelProvider ? { modelProvider: options.modelProvider } : {}), ...(options.model ? { model: options.model } : {}) }, runOptions);
   const reasoning = options.reasoning ?? (options.live ? { enabled: false } : undefined);
   const projectRules = await collectCliProjectRuleEvidence(runtime.deps.platform, workspaceRoot);
   const profile = resolveCliModelProfile(options);
-  const limits = resolveCliAgentLoopLimits(options.prompt);
   try {
     const events = await emitAgentLoop(runtime.deps, runtime.kernel, {
       prompt: options.prompt,
@@ -36,9 +41,11 @@ export async function runOneShotCommand(
         requireCheckpointForWrites: true,
         verificationMode: "targeted"
       },
-      ...(options.toolProjection ? { toolProjection: options.toolProjection } : {}),
+      ...(effectiveToolProjection ? { toolProjection: effectiveToolProjection } : {}),
       ...(options.timeoutMs ? { timeoutMs: options.timeoutMs } : {}),
-      ...(limits ? { limits } : {})
+      ...(profilePolicy.contextPipeline ? { contextPipeline: profilePolicy.contextPipeline } : {}),
+      profilePolicy: profilePolicyMetadata,
+      ...(profilePolicy.limits ? { limits: profilePolicy.limits } : {})
     }, write, writeInline, bufferedInline, undefined, terminalProfile);
     await renderFinalJsonIfNeeded(options.output, events, write);
     if (options.output === "text") {

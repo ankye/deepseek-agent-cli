@@ -36,7 +36,7 @@ import type {
   SideEffectLevel,
   TraceContext
 } from "@deepseek/platform-contracts";
-import { APPROVAL_SCHEMA_VERSION, POLICY_GATE_SCHEMA_VERSION, RISKY_OPERATION_TAXONOMY, SECRET_SANDBOX_SCHEMA_VERSION, asId } from "@deepseek/platform-contracts";
+import { APPROVAL_SCHEMA_VERSION, MAX_EXECUTION_TIMEOUT_MS, POLICY_GATE_SCHEMA_VERSION, RISKY_OPERATION_TAXONOMY, SECRET_SANDBOX_SCHEMA_VERSION, asId } from "@deepseek/platform-contracts";
 
 export const SECRET_REDACTION_TOKEN = "[REDACTED:secret]";
 
@@ -621,7 +621,7 @@ function sandboxReasonCodes(
   const secret = request.secret ?? secretDecisionFromMetadata(request.metadata);
   if (secret.classification.exposure === "raw") reasons.push("secret.raw-exposure");
   if (secret.classification.exposure === "unsafe") reasons.push("secret.unsafe-exposure");
-  if (!Number.isFinite(requirements.timeoutMs) || requirements.timeoutMs <= 0 || requirements.timeoutMs > 600_000) reasons.push("timeout.invalid");
+  if (!Number.isFinite(requirements.timeoutMs) || requirements.timeoutMs <= 0 || requirements.timeoutMs > MAX_EXECUTION_TIMEOUT_MS) reasons.push("timeout.invalid");
   if (sideEffect === "write" && !capabilities.filesystem.write) reasons.push(capabilities.filesystem.readOnly ? "filesystem.read-only" : "filesystem.write.unavailable");
   if (sideEffect === "write" && requirements.resourceScope.paths.length === 0) reasons.push("filesystem.path-scope.missing");
   if (requirements.resourceScope.paths.some((path) => path.traversal === "rejected")) reasons.push("filesystem.path-scope.rejected");

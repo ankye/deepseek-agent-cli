@@ -1,5 +1,7 @@
 import type { JsonObject, RedactedError, RedactionMetadata } from "./common.js";
+import type { ContextCacheHint } from "./context.js";
 import type { CredentialRef, ModelProfileId, ModelProviderId } from "./ids.js";
+import type { AgentLoopToolProjection } from "./runtime.js";
 
 export type ModelProviderProtocol = "openai-chat-completions" | "anthropic-messages";
 
@@ -62,6 +64,7 @@ export interface ModelChatMessage extends JsonObject {
   readonly toolCallId?: string;
   readonly toolName?: string;
   readonly toolCalls?: readonly ModelChatToolCall[];
+  readonly cacheHint?: ContextCacheHint;
   readonly reasoningContent?: string;
   readonly reasoningRedaction?: RedactionMetadata;
 }
@@ -80,6 +83,7 @@ export interface ModelRequest {
   readonly timeoutMs?: number;
   readonly tools?: readonly JsonObject[];
   readonly toolChoice?: ModelToolChoice;
+  readonly toolProjection?: AgentLoopToolProjection;
   readonly reasoning?: ModelReasoningOptions;
   readonly output?: ModelOutputOptions;
   readonly metadata?: JsonObject;
@@ -127,8 +131,22 @@ export interface ModelUsageCacheMetadata extends JsonObject {
   readonly status?: "available" | "unavailable";
   readonly hitTokens?: number;
   readonly missTokens?: number;
+  readonly writeTokens?: number;
   readonly hitRate?: number;
   readonly pipelineFingerprint?: string;
+  readonly breakpointShape?: {
+    readonly systemCacheControlCount: number;
+    readonly messageCacheControlCount: number;
+    readonly toolCacheControlCount: number;
+    readonly totalCacheControlCount: number;
+    readonly messageCacheControlPositions?: readonly ("first-message" | "middle-message" | "last-message")[];
+    readonly redaction: RedactionMetadata;
+  };
+  readonly explicitPrefixCacheHint?: {
+    readonly status: "sent" | "unsupported" | "missing";
+    readonly reasonCode: string;
+    readonly redaction: RedactionMetadata;
+  };
 }
 
 export type ModelMetadataCatalogSource = "remote" | "last-known-good" | "pinned" | "user-config";

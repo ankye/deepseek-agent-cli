@@ -1,0 +1,49 @@
+- [x] Add OpenSpec scenario for top-level harness `error_ids` fallback.
+- [x] Add failing regression coverage for top-level harness report without per-instance `report.json`.
+- [x] Implement structured harness error instance summaries and diagnostics.
+- [x] Add cache diagnostic scenario for stable prompt assembly with context projection no-hit.
+- [x] Add failing regression coverage for provider/context cache metric separation.
+- [x] Implement stable cache review reason codes for provider cache, context projection cache, and metric-scope mismatch.
+- [x] Add actionable context projection prompt-dependency sample evidence for cache review.
+- [x] Add batch evidence scenario for preserving cache review codes.
+- [x] Add failing regression coverage for batch-level context projection cache and review-code aggregation.
+- [x] Implement batch-level context projection cache and review-code aggregation.
+- [x] Verify focused SWE-bench diagnostics and governed run capability tests.
+- [x] Add task-level actionable failure attribution in batch state evidence.
+- [x] Add harness log diagnosis for missing SWE-bench Docker images.
+- [x] Add local-build retry for missing default-namespace SWE-bench harness images.
+- [x] Add resume import for recovered local-build harness sidecar evidence.
+- [x] Add resume-only review mode so below-threshold batches can refresh existing evidence without launching pending tasks.
+- [x] Add process metadata for checkout environment warnings so pip failures are directly actionable.
+- [x] Add compatibility profile coverage for old Astropy checkout Python/build constraints.
+- [x] Verify focused attribution, harness-error, and OpenSpec checks.
+- [x] Add context projection cache coverage so stable candidates remain cacheable across volatile prompts.
+- [x] Mark prompt-only context projections as no-store and exclude them from context cache hit-rate accounting.
+- [x] Add provider cache review coverage for stable prompt/history-tail misses and prompt prefix drift.
+- [x] Classify provider cache low-hit requests into cold start, history-tail, and prompt-assembly drift counters.
+- [x] Tighten cache failure actionability so cache-only unresolved tasks are framework-fix work rather than model feedback or soft review.
+
+- [x] 增加 official harness 顶层 `error_ids` fallback 的 OpenSpec 场景。
+- [x] 增加顶层 harness report 存在但单实例 `report.json` 缺失的红测。
+- [x] 实现结构化 harness error instance summary 与 diagnostics。
+- [x] 增加 stable prompt assembly 与 context projection no-hit 的 cache diagnostic 场景。
+- [x] 增加 provider/context cache 指标分离的红测。
+- [x] 实现 provider cache、context projection cache 与 metric-scope mismatch 的稳定复盘 reason codes。
+- [x] 为 cache 复盘增加可执行的 context projection prompt-dependency sample evidence。
+- [x] 增加 batch evidence 保留 cache 复盘 code 的场景。
+- [x] 增加 batch 级 context projection cache 与 review-code 聚合的红测。
+- [x] 实现 batch 级 context projection cache 与 review-code 聚合。
+- [x] 验证聚焦的 SWE-bench diagnostics 与 governed run capability 测试。
+- [x] 在 batch state evidence 中增加 task 级可执行失败归因。
+- [x] 增加 SWE-bench Docker image 缺失的 harness 日志诊断。
+- [x] 增加默认 namespace 的 SWE-bench harness image 缺失时的本地构建重试。
+- [x] 增加 resume 导入已恢复 local-build harness sidecar evidence 的能力。
+- [x] 增加仅复盘 resume 模式，使低于门槛的批次可刷新已有证据而不启动 pending 任务。
+- [x] 为 checkout 环境告警增加进程 metadata，使 pip 失败可直接定位。
+- [x] 增加旧 Astropy checkout Python/build constraints 的兼容 profile 覆盖。
+- [x] 验证聚焦的归因、harness-error 与 OpenSpec 检查。
+- [x] 增加 context projection cache 覆盖，使稳定 candidates 在易变 prompt 之间仍可缓存。
+- [x] 将仅 prompt 的 context projection 标记为 no-store，并从 context cache 命中率统计中排除。
+- [x] 增加 stable prompt/history-tail miss 与 prompt prefix drift 的 provider cache 复盘覆盖。
+- [x] 将 provider cache 低命中请求分类为 cold start、history-tail 与 prompt-assembly drift 计数。
+- [x] 收紧 cache 失败的 actionability，使仅 cache 导致未 resolved 的任务归为 framework-fix，而不是模型反馈或软复核。

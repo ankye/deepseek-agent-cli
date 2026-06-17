@@ -1,0 +1,77 @@
+- [x] Add OpenSpec scenarios for run-scoped SWE-bench short-prompt routing and stale workspace rejection.
+- [x] Add failing runtime task-delivery tests proving short prompts no longer expose `.deepseek/swebench-workspaces`.
+- [x] Add failing shell boundary tests proving direct historical SWE-bench workspace traversal is rejected from the CLI workspace root.
+- [x] Add failing runtime agent-loop tests proving stale SWE-bench workspace tool inputs are rejected before kernel execution.
+- [x] Add failing CLI host tests proving a model-visible governed SWE-bench run capability can execute from only a numbered task input.
+- [x] Add failing tool-intent preflight tests proving governed host process capabilities receive workspace cwd defaults before policy evaluation.
+- [x] Update task delivery guidance so the agent is pointed at governed evaluation/run capabilities instead of historical workspace directories.
+- [x] Add a runtime task-scope guard that enforces stale SWE-bench workspace rejection independently of prompt compliance.
+- [x] Update shell boundary checks to reject stale workspace traversal while preserving commands already scoped to a selected checkout.
+- [x] Add the governed `core.swe.bench.run` capability, tool-family metadata, and bounded redacted evidence path.
+- [x] Repair tool-intent preflight so `core.env.prepare` and `core.swe.bench.run` receive active workspace cwd defaults from the framework.
+- [x] Add official harness evaluation to governed `core.swe.bench.run` so unresolved instances produce warn summaries and failed evidence.
+- [x] Add harness report freshness validation so reused run ids cannot read stale `report.json` files as current evaluation evidence.
+- [x] Ensure evaluation-stage failures with prediction/evaluation structure return bounded failed evidence instead of kernel executor failures.
+- [x] Use per-execution unique official harness run ids so repeated governed runs do not collide with old `logs/run_evaluation` directories.
+- [x] Add bash `pipefail` to shell syntax execution so pipeline failures remain visible to the model and supervisor.
+- [x] Add child-trace verification diagnostics so runs without model-authored SWE test commands are classified separately from harness failures.
+- [x] Treat `core.test.run` as model-authored SWE verification evidence in both child trace summaries and runtime verification gates.
+- [x] Preserve per-attempt child traces for supervised repair runs while keeping `trace.jsonl` as the latest trace pointer.
+- [x] Add a runtime SWE-bench verification gate that feeds back `SWE_BENCH_VERIFICATION_GATE` when a managed child loop shells repeatedly without starting a standard test command.
+- [x] Add a runtime SWE-bench source-inspection gate that feeds back `SWE_BENCH_SOURCE_INSPECTION_GATE` when a managed child loop spends read/search/list budget without edit or test progress.
+- [x] Add a runtime SWE-bench environment blocker gate that feeds back `SWE_BENCH_ENVIRONMENT_BLOCKER_GATE` when a managed child loop keeps spending shell iterations on dependency setup after source edit and test evidence already exist.
+- [x] Enforce `SWE_BENCH_SOURCE_INSPECTION_GATE` before kernel execution by rejecting additional read/search/list tool calls until source edit or test progress exists.
+- [x] Enforce `SWE_BENCH_VERIFICATION_GATE` before kernel execution by rejecting non-test `core.shell.run` calls until the child emits standard test evidence.
+- [x] Enforce `SWE_BENCH_ENVIRONMENT_BLOCKER_GATE` before kernel execution by rejecting dependency setup/probing shell calls after edit and test evidence already exist.
+- [x] Add an executable agentic evaluation blocker catalog with at least 100 real failure modes and connect child trace summaries to blocker findings.
+- [x] Add a supervised same-checkout repair attempt when the first official harness evaluation is unresolved, carrying failing test names into the second child prompt without solution edits.
+- [x] Add long-running tool budget support so governed SWE-bench runs use manifest-declared timeout up to the platform execution maximum instead of the ordinary short tool timeout.
+- [x] Add governed `taskNumbers` batch execution with per-task run roots, `resume` skip, batch summaries, and aggregate resolved/unresolved scoring.
+- [x] Add framework-owned SWE-bench range normalization from the original user prompt into `taskNumbers` when the model emits only the first task number.
+- [x] Use fresh default governed run ids when `runId` is omitted so repeated live probes do not mix new traces with stale summaries.
+- [x] Use stable default campaign run ids when `resume: true` and `runId` is omitted so batch scoring can resume the same task range intentionally.
+- [x] Persist batch progress after each child task and expose per-task states so interrupted 200-instance campaigns remain auditable and resumable.
+- [x] Surface provider cache metrics from child traces in governed run and batch summaries so the 90% cache target is visible at the scoring layer.
+- [x] Allow framework-owned SWE-bench Lite range normalization for 200-instance campaign prompts such as `第 1 到第 200 题`.
+- [x] Split SWE-bench cache evidence into provider token cache SLO metrics and context projection cache observability metrics.
+- [x] Add temporary architecture split-plan baselines for `src/apps/cli/src/diagnostics/swe-bench-prediction.ts` and `src/apps/cli/src/host/swe-bench-run-capabilities.ts`; follow-up extraction should split prediction, harness evaluation, and batch run orchestration into separate modules.
+- [ ] Verify with focused tests, OpenSpec validation, typecheck, lint, boundary checks, and a fresh simple-prompt GLM probe.
+
+- [x] 增加 run-scoped SWE-bench 短 prompt 路由与 stale workspace 拒绝的 OpenSpec 场景。
+- [x] 增加先失败 runtime task-delivery 测试，证明短 prompt 不再暴露 `.deepseek/swebench-workspaces`。
+- [x] 增加先失败 shell boundary 测试，证明从 CLI workspace root 直接进入历史 SWE-bench workspace 会被拒绝。
+- [x] 增加先失败 runtime agent-loop 测试，证明 stale SWE-bench workspace 工具输入会在 kernel 执行前被拒绝。
+- [x] 增加先失败 CLI host 测试，证明模型可见的受管 SWE-bench run capability 可以只凭编号任务输入执行。
+- [x] 增加先失败 tool-intent preflight 测试，证明受管 host process capability 会在 policy evaluation 前获得 workspace cwd 默认值。
+- [x] 更新 task delivery guidance，让 agent 面向受管 evaluation/run capability，而不是历史 workspace 目录。
+- [x] 增加 runtime task-scope guard，使 stale SWE-bench workspace 拒绝独立于模型是否遵守 prompt。
+- [x] 更新 shell boundary check，拒绝 stale workspace traversal，同时保留已被选定 checkout 内的命令能力。
+- [x] 增加受管 `core.swe.bench.run` capability、tool-family metadata 与 bounded redacted evidence 路径。
+- [x] 修复 tool-intent preflight，使 `core.env.prepare` 和 `core.swe.bench.run` 的 active workspace cwd 默认值由框架注入。
+- [x] 在受管 `core.swe.bench.run` 中加入 official harness evaluation，使 unresolved instance 产生 warn summary 与 failed evidence。
+- [x] 增加 harness report freshness validation，防止复用 run id 时把 stale `report.json` 当作当前 evaluation evidence。
+- [x] 确保已经产生 prediction/evaluation 结构的评测阶段失败返回有界 failed evidence，而不是 kernel executor failure。
+- [x] 使用每次执行唯一的 official harness run id，避免重复受管运行撞上旧的 `logs/run_evaluation` 目录。
+- [x] 为 shell syntax 执行加入 bash `pipefail`，确保 pipeline failure 对模型与监督者可见。
+- [x] 增加 child-trace verification diagnostic，使缺少模型自发 SWE test command 的运行能与 harness failure 分开归因。
+- [x] 在 child trace summary 与 runtime verification gate 中都把 `core.test.run` 识别为模型自发 SWE 验证证据。
+- [x] 为 supervised repair run 保留每次 attempt 的独立 child trace，同时让 `trace.jsonl` 继续作为 latest trace 指针。
+- [x] 增加 runtime SWE-bench verification gate，当 managed child loop 重复 shell 但没有启动 standard test command 时反馈 `SWE_BENCH_VERIFICATION_GATE`。
+- [x] 增加 runtime SWE-bench source-inspection gate，当 managed child loop 消耗 read/search/list 预算但没有 edit 或 test 进展时反馈 `SWE_BENCH_SOURCE_INSPECTION_GATE`。
+- [x] 增加 runtime SWE-bench environment blocker gate，当 managed child loop 已有源码修改与测试证据后仍持续把 shell 迭代消耗在依赖准备上时反馈 `SWE_BENCH_ENVIRONMENT_BLOCKER_GATE`。
+- [x] 在 kernel 执行前强制执行 `SWE_BENCH_SOURCE_INSPECTION_GATE`：已有 gate 后，拒绝继续 read/search/list，直到出现源码编辑或测试进展。
+- [x] 在 kernel 执行前强制执行 `SWE_BENCH_VERIFICATION_GATE`：child 给出 standard test evidence 前，拒绝非测试 `core.shell.run`。
+- [x] 在 kernel 执行前强制执行 `SWE_BENCH_ENVIRONMENT_BLOCKER_GATE`：已有编辑与测试证据后，拒绝继续依赖准备/探测类 shell 调用。
+- [x] 增加至少 100 个真实失败模式的可执行 agentic evaluation blocker catalog，并把 child trace summary 接入 blocker findings。
+- [x] 在第一次 official harness unresolved 时增加同一 checkout 的受监督 repair attempt，把失败测试名传给第二次 child prompt，但不提供源码解法。
+- [x] 增加 long-running tool budget 支持，使受管 SWE-bench run 使用 manifest 声明的 timeout，并以平台执行最大值为上限，而不是普通短工具 timeout。
+- [x] 增加受管 `taskNumbers` 批量执行，支持每题独立 run root、`resume` 跳过、batch summary 与 resolved/unresolved 聚合评分。
+- [x] 增加框架层 SWE-bench 范围归一：当模型只发出首个 task number 时，从原始用户 prompt 修复出 `taskNumbers`。
+- [x] 当省略 `runId` 时使用 fresh 默认受管 run id，避免重复 live probe 把新 trace 与 stale summary 混在一起。
+- [x] 当 `resume: true` 且省略 `runId` 时使用稳定的默认 campaign run id，使批量跑分能有意恢复同一任务范围。
+- [x] 每个子任务完成后持久化 batch progress，并暴露 per-task states，使中断的 200-instance campaign 可审计、可恢复。
+- [x] 将 child trace 中的 provider cache 指标暴露到受管 run 与 batch summary，使 90% cache target 在评分层可见。
+- [x] 允许框架层 SWE-bench Lite range normalization 覆盖 `第 1 到第 200 题` 这类 200-instance campaign prompt。
+- [x] 将 SWE-bench cache evidence 拆成 provider token cache SLO 指标与 context projection cache 可观测指标。
+- [x] 为 `src/apps/cli/src/diagnostics/swe-bench-prediction.ts` 与 `src/apps/cli/src/host/swe-bench-run-capabilities.ts` 增加临时 architecture split-plan baseline；后续需要把 prediction、harness evaluation 与 batch run orchestration 拆成独立 modules。
+- [ ] 运行 focused tests、OpenSpec validation、typecheck、lint、boundary checks，并重新用简单 prompt 做 GLM probe。

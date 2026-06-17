@@ -7,7 +7,7 @@ import type {
   SessionId,
   TraceContext
 } from "@deepseek/platform-contracts";
-import { asId } from "@deepseek/platform-contracts";
+import { MAX_EXECUTION_TIMEOUT_MS, asId } from "@deepseek/platform-contracts";
 import type { PlatformExecutionContext } from "@deepseek/platform-contracts";
 import {
   analyzeResourceScope,
@@ -30,7 +30,7 @@ export interface ExecutionEnvelopeBuildInput {
 }
 
 export function buildExecutionEnvelope(input: ExecutionEnvelopeBuildInput): ExecutionEnvelope {
-  const timeoutMs = input.request.timeoutMs ?? 30_000;
+  const timeoutMs = input.request.timeoutMs ?? input.manifest.timeoutMs ?? 30_000;
   const resourceLocks = resourceLocksFor(input.manifest.sideEffect, input.request.input);
   const resourceScope = analyzeResourceScope(input.request.input, input.manifest.sideEffect);
   const secretExposure = createSecretRedactionDecision(input.request.input, { class: "internal" });
@@ -154,8 +154,8 @@ export function validateExecutionEnvelope(envelope: unknown): readonly KernelErr
   if (!["none", "read", "write", "network", "process"].includes(String(candidate.sideEffect))) {
     errors.push(kernelError("KERNEL_ENVELOPE_INVALID", "Execution envelope has unsupported sideEffect", { sideEffect: String(candidate.sideEffect) }));
   }
-  if (typeof candidate.timeoutMs !== "number" || !Number.isFinite(candidate.timeoutMs) || candidate.timeoutMs <= 0 || candidate.timeoutMs > 600_000) {
-    errors.push(kernelError("KERNEL_INVALID_TIMEOUT", "Execution envelope timeoutMs must be between 1 and 600000", {
+  if (typeof candidate.timeoutMs !== "number" || !Number.isFinite(candidate.timeoutMs) || candidate.timeoutMs <= 0 || candidate.timeoutMs > MAX_EXECUTION_TIMEOUT_MS) {
+    errors.push(kernelError("KERNEL_INVALID_TIMEOUT", `Execution envelope timeoutMs must be between 1 and ${MAX_EXECUTION_TIMEOUT_MS}`, {
       timeoutMs: typeof candidate.timeoutMs === "number" ? candidate.timeoutMs : String(candidate.timeoutMs)
     }));
   }

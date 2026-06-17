@@ -30,7 +30,7 @@ function createPipelineManifestProvider(): PromptSectionProviderRegistration {
       const manifest = input.contextPipelineManifest;
       if (!manifest) return [];
       const layerLines = manifest.layers.flatMap((layer) => {
-        const blocks = manifest.blocks.filter((block) => block.layer === layer.id);
+        const blocks = manifest.blocks.filter((block) => block.layer === layer.id && block.cacheHint.policy === "stable");
         if (blocks.length === 0) return [];
         return [
           `Layer ${layer.id}: prefix=${layer.prefixHash} tokens=${layer.estimatedTokens}`,

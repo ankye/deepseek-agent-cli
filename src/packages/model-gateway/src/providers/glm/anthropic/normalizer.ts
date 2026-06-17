@@ -27,6 +27,7 @@ export function createGlmAnthropicChunkNormalizer(): (chunk: ModelProviderRespon
   let inputTokens: number | undefined;
   let outputTokens: number | undefined;
   let cacheReadInputTokens: number | undefined;
+  let cacheCreationInputTokens: number | undefined;
   let usageEmitted = false;
   let requestId: string | undefined;
 
@@ -39,6 +40,7 @@ export function createGlmAnthropicChunkNormalizer(): (chunk: ModelProviderRespon
     inputTokens = undefined;
     outputTokens = undefined;
     cacheReadInputTokens = undefined;
+    cacheCreationInputTokens = undefined;
     usageEmitted = false;
     requestId = undefined;
   }
@@ -48,6 +50,7 @@ export function createGlmAnthropicChunkNormalizer(): (chunk: ModelProviderRespon
     inputTokens = numberValue(value.input_tokens) ?? inputTokens;
     outputTokens = numberValue(value.output_tokens) ?? outputTokens;
     cacheReadInputTokens = numberValue(value.cache_read_input_tokens) ?? cacheReadInputTokens;
+    cacheCreationInputTokens = numberValue(value.cache_creation_input_tokens) ?? cacheCreationInputTokens;
   }
 
   return (chunk: ModelProviderResponseChunk, provider: ModelProviderEventMetadata): readonly ModelStreamEvent[] => {
@@ -126,7 +129,7 @@ export function createGlmAnthropicChunkNormalizer(): (chunk: ModelProviderRespon
 
     if (!usageEmitted && data.type === "message_delta" && inputTokens !== undefined && outputTokens !== undefined) {
       usageEmitted = true;
-      events.push(usageEvent(inputTokens, outputTokens, cacheReadInputTokens, requestProvider(provider)));
+      events.push(usageEvent(inputTokens, outputTokens, cacheReadInputTokens, requestProvider(provider), cacheCreationInputTokens));
     }
 
     if (data.type === "message_stop") {

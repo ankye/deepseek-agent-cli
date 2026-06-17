@@ -69,9 +69,16 @@ describe("task delivery flow runtime controller", () => {
     assert.equal(summary.decisionEnvelope.profileSelection, "evaluation/swe-bench-lite.v1");
     assert.equal(summary.decisionRequest.allowedTools.includes("workspace.write"), true);
     assert.equal(summary.decisionRequest.allowedTools.includes("shell.run"), true);
-    assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("benchmark workspace")), true);
-    assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes(".deepseek/swebench-workspaces")), true);
-    assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("repo/")), true);
+    const modelFacingGuidance = [
+      ...summary.decisionRequest.constraints,
+      ...summary.decisionEnvelope.toolStrategy,
+      ...summary.decisionEnvelope.verificationPlan
+    ].join("\n");
+    assert.equal(modelFacingGuidance.includes(".deepseek/swebench-workspaces"), false);
+    assert.equal(modelFacingGuidance.includes("historical"), false);
+    assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("governed SWE-bench run")), true);
+    assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("run-scoped")), true);
+    assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("runtime guard")), true);
     assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("minimal failing regression")), true);
     assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("full dependency installation")), true);
     assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("project-local virtual environment")), true);
@@ -80,8 +87,8 @@ describe("task delivery flow runtime controller", () => {
     assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("upstream git history")), true);
     assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("After a focused regression fails")), true);
     assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("After focused verification passes")), true);
-    assert.equal(summary.decisionEnvelope.toolStrategy.some((step) => step.includes("benchmark instance")), true);
-    assert.equal(summary.decisionEnvelope.toolStrategy.some((step) => step.includes("repo root")), true);
+    assert.equal(summary.decisionEnvelope.toolStrategy.some((step) => step.includes("governed SWE-bench run")), true);
+    assert.equal(summary.decisionEnvelope.toolStrategy.some((step) => step.includes("run-scoped checkout")), true);
     assert.equal(summary.decisionEnvelope.toolStrategy.some((step) => step.includes("minimal reproduction")), true);
     assert.equal(summary.decisionEnvelope.toolStrategy.some((step) => step.includes("one dependency setup attempt")), true);
     assert.equal(summary.decisionEnvelope.toolStrategy.some((step) => step.includes("patch the checkout directly")), true);

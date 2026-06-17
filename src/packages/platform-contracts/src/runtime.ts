@@ -20,6 +20,7 @@ import type { HookSystem } from "./hook.js";
 import type { McpGateway } from "./mcp.js";
 import type { ModelGateway, ModelProfile, ModelReasoningOptions } from "./model.js";
 import type { PromptAssembler } from "./prompt-assembly.js";
+import type { StagedTaskGraph, StagedTaskRunState } from "./staged-task.js";
 import type { VisibleReasoningProjection } from "./visible-reasoning.js";
 import type { SelfRepairConfig, SelfRepairOutcomeSummary } from "./self-repair.js";
 import type { InteractionModeName, InteractionModeState, InteractionModeTransition } from "./interaction-mode.js";
@@ -384,6 +385,56 @@ export interface AgentLoopReferenceContext extends JsonObject {
   readonly redaction: JsonObject;
 }
 
+export interface AgentLoopProfilePolicyMetadata extends JsonObject {
+  readonly schemaVersion: "1.0.0";
+  readonly profileId: string;
+  readonly role: string;
+  readonly workflowGraphId: string;
+  readonly workflowPriority: "primary" | "advisory";
+  readonly orchestrationMode: "staged-capability-workflow";
+  readonly workflowCapabilityIds: readonly string[];
+  readonly workflowStages?: readonly AgentLoopProfileWorkflowStageMetadata[];
+  readonly stagedTaskWorkflow?: AgentLoopProfileStagedTaskWorkflowMetadata;
+  readonly toolProjection?: AgentLoopToolProjection;
+  readonly toolProjectionSource: string;
+  readonly contextPipelineEnabled?: boolean;
+  readonly loopLimits?: JsonObject;
+  readonly workflowGateOverride?: AgentLoopProfileWorkflowGateOverride;
+  readonly antiTailoring: boolean;
+  readonly executionBoundary: string;
+  readonly redaction: { readonly class: "internal"; readonly fields?: readonly string[] };
+}
+
+export interface AgentLoopProfileWorkflowGateOverride extends JsonObject {
+  readonly gate: string;
+  readonly requiredNextAction: string;
+  readonly rejectedToolName?: string;
+  readonly rejectedCapabilityId?: string;
+  readonly terminalKind: string;
+  readonly toolCallId: string;
+}
+
+export interface AgentLoopProfileStagedTaskWorkflowMetadata extends JsonObject {
+  readonly schemaVersion: "1.0.0";
+  readonly profileId: string;
+  readonly graphId: string;
+  readonly fingerprint: string;
+  readonly stageCount: number;
+  readonly refCount: number;
+  readonly executorKinds: readonly string[];
+  readonly graph: StagedTaskGraph;
+  readonly runState: StagedTaskRunState;
+  readonly redaction: { readonly class: "internal"; readonly fields?: readonly string[] };
+}
+
+export interface AgentLoopProfileWorkflowStageMetadata extends JsonObject {
+  readonly id: string;
+  readonly objective: string;
+  readonly capabilityIds: readonly string[];
+  readonly entryCriteria: readonly string[];
+  readonly exitCriteria: readonly string[];
+}
+
 export interface AgentLoopRequest extends JsonObject {
   readonly prompt: string;
   readonly sessionId?: SessionId;
@@ -410,6 +461,7 @@ export interface AgentLoopRequest extends JsonObject {
   readonly contextPipeline?: {
     readonly enabled?: boolean;
   };
+  readonly profilePolicy?: AgentLoopProfilePolicyMetadata;
 }
 
 export interface AgentLoopControl {

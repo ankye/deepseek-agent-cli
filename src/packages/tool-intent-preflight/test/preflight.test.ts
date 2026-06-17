@@ -175,6 +175,200 @@ describe("tool intent preflight", () => {
     assert.equal(result.repairs.some((repair) => repair.kind === "workspace-root-defaulted"), true);
   });
 
+  it("defaults REPL execution to the active workspace before policy evaluation", async () => {
+    const preflight = new DeterministicToolIntentPreflight();
+    const result = await preflight.check({
+      providerId: deepseek,
+      intent: {
+        name: "core_repl_execute",
+        source: "model",
+        input: { code: "1 + 1" }
+      },
+      workspaceRoot: "/repo",
+      platform: "linux",
+      modelVisibleCapabilities: [asId<"capability">("core.repl.execute")]
+    });
+
+    assert.equal(result.status, "repaired");
+    assert.equal(result.repaired?.name, "core.repl.execute");
+    assert.deepEqual(result.repaired?.input, { code: "1 + 1", cwd: ".", workspaceRoot: "/repo" });
+    assert.equal(result.repairs.some((repair) => repair.kind === "workspace-cwd-defaulted"), true);
+    assert.equal(result.repairs.some((repair) => repair.kind === "workspace-root-defaulted"), true);
+  });
+
+  it("defaults package manager execution to the active workspace before policy evaluation", async () => {
+    const preflight = new DeterministicToolIntentPreflight();
+    const result = await preflight.check({
+      providerId: deepseek,
+      intent: {
+        name: "core_package_manager",
+        source: "model",
+        input: { operation: "install", packages: ["hypothesis"] }
+      },
+      workspaceRoot: "/repo",
+      platform: "linux",
+      modelVisibleCapabilities: [asId<"capability">("core.package.manager")]
+    });
+
+    assert.equal(result.status, "repaired");
+    assert.equal(result.repaired?.name, "core.package.manager");
+    assert.deepEqual(result.repaired?.input, { operation: "install", packages: ["hypothesis"], cwd: ".", workspaceRoot: "/repo" });
+    assert.equal(result.repairs.some((repair) => repair.kind === "workspace-cwd-defaulted"), true);
+    assert.equal(result.repairs.some((repair) => repair.kind === "workspace-root-defaulted"), true);
+  });
+
+  it("defaults governed host process capabilities to the active workspace before policy evaluation", async () => {
+    const preflight = new DeterministicToolIntentPreflight();
+    for (const capabilityId of ["core.swe.bench.run", "core.env.prepare"] as const) {
+      const result = await preflight.check({
+        providerId: deepseek,
+        intent: {
+          name: capabilityId.replace(/[^a-zA-Z0-9_-]/g, "_"),
+          source: "model",
+          input: capabilityId === "core.swe.bench.run" ? { taskNumber: 2 } : { profile: "swe-bench-lite", execute: true }
+        },
+        workspaceRoot: "/repo",
+        platform: "linux",
+        modelVisibleCapabilities: [asId<"capability">(capabilityId)]
+      });
+
+      assert.equal(result.status, "repaired", capabilityId);
+      assert.equal(result.repaired?.name, capabilityId);
+      assert.equal(result.repaired?.input.cwd, ".", capabilityId);
+      assert.equal(result.repaired?.input.workspaceRoot, "/repo", capabilityId);
+      if (capabilityId === "core.swe.bench.run") assert.equal(result.repaired?.input.timeoutMs, 7_200_000, capabilityId);
+      assert.equal(result.repairs.some((repair) => repair.kind === "workspace-cwd-defaulted"), true, capabilityId);
+      assert.equal(result.repairs.some((repair) => repair.kind === "workspace-root-defaulted"), true, capabilityId);
+    }
+  });
+
+  it("normalizes model-supplied low SWE-bench run timeouts to the governed long-running budget", async () => {
+    const preflight = new DeterministicToolIntentPreflight();
+    const result = await preflight.check({
+      providerId: deepseek,
+      intent: {
+        name: "core_swe_bench_run",
+        source: "model",
+        input: { taskNumber: 2, timeoutMs: 600_000 }
+      },
+      workspaceRoot: "/repo",
+      platform: "linux",
+      modelVisibleCapabilities: [asId<"capability">("core.swe.bench.run")]
+    });
+
+    assert.equal(result.status, "repaired");
+    assert.equal(result.repaired?.input.timeoutMs, 7_200_000);
+    assert.equal(result.repairs.some((repair) =>
+      repair.kind === "workspace-tool-timeout-normalized" &&
+      repair.field === "timeoutMs" &&
+      repair.before === "600000" &&
+      repair.after === "7200000"
+    ), true);
+  });
+
+  it("normalizes model-supplied dryRun away from live SWE-bench completion requests", async () => {
+    const preflight = new DeterministicToolIntentPreflight();
+    const result = await preflight.check({
+      providerId: deepseek,
+      intent: {
+        name: "core_swe_bench_run",
+        source: "model",
+        input: { taskNumber: 10, dryRun: true }
+      },
+      workspaceRoot: "/repo",
+      platform: "linux",
+      modelVisibleCapabilities: [asId<"capability">("core.swe.bench.run")],
+      providerHints: {
+        userPrompt: "给我完成 SWE-bench Lite 第 10 题测试，修复后做单题 canary，跑通并告诉我 cache 命中率。"
+      }
+    });
+
+    assert.equal(result.status, "repaired");
+    assert.equal(result.repaired?.input.dryRun, false);
+    assert.equal(result.repaired?.input.execute, true);
+    assert.equal(result.repairs.some((repair) =>
+      repair.kind === "swe-bench-run-execution-normalized" &&
+      repair.field === "dryRun" &&
+      repair.before === "true" &&
+      repair.after === "false"
+    ), true);
+  });
+
+  it("preserves model-supplied dryRun for explicit SWE-bench preview requests", async () => {
+    const preflight = new DeterministicToolIntentPreflight();
+    const result = await preflight.check({
+      providerId: deepseek,
+      intent: {
+        name: "core_swe_bench_run",
+        source: "model",
+        input: { taskNumber: 10, dryRun: true }
+      },
+      workspaceRoot: "/repo",
+      platform: "linux",
+      modelVisibleCapabilities: [asId<"capability">("core.swe.bench.run")],
+      providerHints: {
+        userPrompt: "dry run SWE-bench Lite 第 10 题，只预览不要执行。"
+      }
+    });
+
+    assert.equal(result.status, "repaired");
+    assert.equal(result.repaired?.input.dryRun, true);
+    assert.equal(result.repaired?.input.execute, undefined);
+    assert.equal(result.repairs.some((repair) => repair.kind === "swe-bench-run-execution-normalized"), false);
+  });
+
+  it("repairs a single SWE-bench task call into a prompt-declared task range", async () => {
+    const preflight = new DeterministicToolIntentPreflight();
+    const result = await preflight.check({
+      providerId: deepseek,
+      intent: {
+        name: "core_swe_bench_run",
+        source: "model",
+        input: { taskNumber: 2, execute: true, resume: true }
+      },
+      workspaceRoot: "/repo",
+      platform: "linux",
+      modelVisibleCapabilities: [asId<"capability">("core.swe.bench.run")],
+      providerHints: {
+        userPrompt: "给我完成 SWE-bench Lite 第 2 到第 4 题测试，能继续就 resume，跑通并告诉我总体通过率。"
+      }
+    });
+
+    assert.equal(result.status, "repaired");
+    assert.deepEqual(result.repaired?.input.taskNumbers, [2, 3, 4]);
+    assert.equal(result.repaired?.input.taskNumber, 2);
+    assert.equal(result.repairs.some((repair) =>
+      repair.kind === "swe-bench-task-range-normalized" &&
+      repair.field === "taskNumbers" &&
+      repair.before === "2" &&
+      repair.after === "2,3,4"
+    ), true);
+  });
+
+  it("repairs a SWE-bench Lite 1-200 prompt range for campaign scoring", async () => {
+    const preflight = new DeterministicToolIntentPreflight();
+    const result = await preflight.check({
+      providerId: deepseek,
+      intent: {
+        name: "core_swe_bench_run",
+        source: "model",
+        input: { taskNumber: 1, execute: true, resume: true }
+      },
+      workspaceRoot: "/repo",
+      platform: "linux",
+      modelVisibleCapabilities: [asId<"capability">("core.swe.bench.run")],
+      providerHints: {
+        userPrompt: "用 GLM 跑 SWE-bench Lite 第 1 到第 200 题，resume，目标累计通过 200 个实例。"
+      }
+    });
+
+    assert.equal(result.status, "repaired");
+    assert.equal((result.repaired?.input.taskNumbers as number[]).length, 200);
+    assert.deepEqual((result.repaired?.input.taskNumbers as number[]).slice(0, 3), [1, 2, 3]);
+    assert.deepEqual((result.repaired?.input.taskNumbers as number[]).slice(-3), [198, 199, 200]);
+    assert.equal(result.repairs.some((repair) => repair.kind === "swe-bench-task-range-normalized"), true);
+  });
+
   it("normalizes provider-safe names against model-visible capability ids", async () => {
     const preflight = new DeterministicToolIntentPreflight();
     const result = await preflight.check({
@@ -198,6 +392,8 @@ describe("tool intent preflight", () => {
   it("normalizes DeepSeek aliases for every core tool family", () => {
     const aliases = [
       ["core_shell_run", "core.shell.run"],
+      ["core_repl_execute", "core.repl.execute"],
+      ["core_package_manager", "core.package.manager"],
       ["core_shell_output", "core.shell.output"],
       ["core_shell_kill", "core.shell.kill"],
       ["core_git_status", "core.git.status"],

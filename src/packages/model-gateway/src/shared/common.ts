@@ -5,6 +5,7 @@ import type {
   ModelGateway,
   ModelLiveVerificationRequest,
   ModelLiveVerificationResult,
+  ModelUsageCacheMetadata,
   ModelProviderEventMetadata,
   ModelRequest,
   ModelStreamEvent,
@@ -23,7 +24,12 @@ export function providerError(code: string, message: string, retryable: boolean,
   };
 }
 
-export function attachPipelineCacheEvidence(event: ModelStreamEvent, pipelineFingerprint: string | undefined): ModelStreamEvent {
+export function attachPipelineCacheEvidence(
+  event: ModelStreamEvent,
+  pipelineFingerprint: string | undefined,
+  explicitPrefixCacheHint: ModelUsageCacheMetadata["explicitPrefixCacheHint"] | undefined = undefined,
+  breakpointShape: ModelUsageCacheMetadata["breakpointShape"] | undefined = undefined
+): ModelStreamEvent {
   if (!pipelineFingerprint || event.kind !== "usage") return event;
   const metadata = event.metadata ?? { inputTokens: event.inputTokens, outputTokens: event.outputTokens };
   const cache = metadata.cache;
@@ -38,7 +44,9 @@ export function attachPipelineCacheEvidence(event: ModelStreamEvent, pipelineFin
         ...(cache ?? {}),
         status: hitTokens !== undefined || missTokens !== undefined ? "available" : "unavailable",
         ...(denominator > 0 ? { hitRate: (hitTokens ?? 0) / denominator } : {}),
-        pipelineFingerprint
+        pipelineFingerprint,
+        ...(breakpointShape ? { breakpointShape } : {}),
+        ...(explicitPrefixCacheHint ? { explicitPrefixCacheHint } : {})
       }
     }
   };
@@ -162,23 +170,31 @@ export function formatAnthropicToolChoice(choice: ModelToolChoice): JsonValue {
   return { type: "tool", name: choice.name };
 }
 
-export function usageEvent(inputTokens: number, outputTokens: number, cacheReadInputTokens: number | undefined, provider: ModelProviderEventMetadata): ModelStreamEvent {
+export function usageEvent(
+  inputTokens: number,
+  outputTokens: number,
+  cacheReadInputTokens: number | undefined,
+  provider: ModelProviderEventMetadata,
+  cacheCreationInputTokens = 0
+): ModelStreamEvent {
+  const effectiveInputTokens = inputTokens + cacheCreationInputTokens;
   const cache = cacheReadInputTokens !== undefined
     ? {
         hitTokens: cacheReadInputTokens,
-        missTokens: Math.max(0, inputTokens),
-        hitRate: cacheReadInputTokens + inputTokens > 0 ? cacheReadInputTokens / (cacheReadInputTokens + inputTokens) : 0
+        missTokens: Math.max(0, effectiveInputTokens),
+        ...(cacheCreationInputTokens > 0 ? { writeTokens: cacheCreationInputTokens } : {}),
+        hitRate: cacheReadInputTokens + effectiveInputTokens > 0 ? cacheReadInputTokens / (cacheReadInputTokens + effectiveInputTokens) : 0
       }
     : undefined;
   const metadata: ModelUsageMetadata = {
-    inputTokens,
+    inputTokens: effectiveInputTokens,
     outputTokens,
     ...(cache ? { cache } : {}),
     provider
   };
   return {
     kind: "usage",
-    inputTokens,
+    inputTokens: effectiveInputTokens,
     outputTokens,
     metadata
   };

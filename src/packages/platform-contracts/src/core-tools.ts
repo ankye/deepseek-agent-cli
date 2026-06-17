@@ -17,6 +17,7 @@ export type CoreCodingToolName =
   | "git.diff"
   | "test.run"
   | "env.prepare"
+  | "swe.bench.run"
   | "todo.plan"
   | "web.fetch"
   | "web.search"

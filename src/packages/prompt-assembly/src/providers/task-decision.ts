@@ -43,8 +43,6 @@ export function createTaskDecisionProvider(): PromptSectionProviderRegistration 
 function taskDecisionContent(request: TaskDecisionRequest): string {
   return [
     "Task decision request:",
-    `- Request id: ${request.requestId}`,
-    `- Brief id: ${request.brief.briefId}`,
     `- Raw intent: ${request.brief.rawInput}`,
     `- Normalized intent: ${request.brief.normalizedIntent}`,
     `- Intent kind: ${request.brief.intentKind}`,

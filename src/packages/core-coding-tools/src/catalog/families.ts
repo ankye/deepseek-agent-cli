@@ -47,6 +47,7 @@ const familyCapabilityIds = {
   pluginInstallVerify: asId<"capability">("skill-system.plugin-install-verify"),
   commandPaletteSlash: asId<"capability">("command-system.palette-slash"),
   envPrepare: asId<"capability">("core.env.prepare"),
+  sweBenchRun: asId<"capability">("core.swe.bench.run"),
   imageGenerate: asId<"capability">("model-gateway.image-generate"),
   imageEdit: asId<"capability">("model-gateway.image-edit"),
   imageSearchStock: asId<"capability">("model-gateway.image-search-stock"),
@@ -70,7 +71,7 @@ const domains = [
   domain("search-code-intelligence", "Search and code intelligence", ["search.text", "search.symbol", "code.diagnostics-lsp", "notebook.read"]),
   domain("mutation-patching", "Mutation and patching", ["file.write", "file.edit", "patch.apply", "revert.undo"]),
   domain("shell-process", "Shell and process", ["shell.run", "process.output", "process.kill", "repl.execute"]),
-  domain("git-build", "Git and build", ["git.status-diff", "git.history-branch", "build.test-lint-typecheck", "package.manager"]),
+  domain("git-build", "Git and build", ["git.status-diff", "git.history-branch", "build.test-lint-typecheck", "package.manager", "benchmark.run"]),
   domain("planning-control", "Planning and control", ["plan.todo", "mode.plan-auto-review", "user.input", "approval.permission"]),
   domain("pipeline-composition", "Pipeline and composition", ["pipeline.sequence", "pipeline.parallel", "pipeline.artifact-routing", "pipeline.stream"]),
   domain("agents-tasks", "Agents and tasks", ["agent.spawn", "agent.message-continue", "agent.wait-result", "agent.stop-close"]),
@@ -150,6 +151,9 @@ const families = [
   family("git-build", "package.manager", "Package manager", "process", ["process", "write"], ["package-manager"], "built-in", [
     implementedTool("core.env.prepare", "Core environment prepare", familyCapabilityIds.envPrepare, "env.prepare"),
     implementedTool("core.package.manager", "Core package manager", coreToolIds.packageManager, "package.manager")
+  ]),
+  family("git-build", "benchmark.run", "Benchmark run", "process", ["process", "artifact"], ["process", "git", "benchmark"], "host", [
+    implementedTool("core.swe.bench.run", "Core SWE-bench run", familyCapabilityIds.sweBenchRun, "swe.bench.run", "host")
   ]),
 
   family("planning-control", "plan.todo", "Todo plan", "orchestration", ["model-feedback"], ["session-store"], "built-in", [

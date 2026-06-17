@@ -16,6 +16,8 @@ const TOOL_NAME = "repl.execute" as CoreCodingToolName;
 interface ReplExecuteInput extends JsonObject {
   readonly code: string;
   readonly language?: "javascript" | "typescript";
+  readonly cwd?: string;
+  readonly workspaceRoot?: string;
   readonly timeoutMs?: number;
   readonly limitBytes?: number;
 }
@@ -30,6 +32,8 @@ export function defineReplExecuteTool(deps: CoreCodingToolsDependencies | undefi
     objectSchema(["code"], {
       code: { type: "string" },
       language: { type: "string" },
+      cwd: { type: "string" },
+      workspaceRoot: { type: "string" },
       timeoutMs: { type: "number" },
       limitBytes: { type: "number" }
     }),

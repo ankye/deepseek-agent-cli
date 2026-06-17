@@ -73,4 +73,47 @@ describe("context-engine projection cache", () => {
     assert.notEqual(first.cache.key, second.cache.key);
     assert.equal(second.cache.hit, false);
   });
+
+  it("keeps stable context cacheable across volatile current-turn prompts", async () => {
+    const cache = new InMemoryCacheManager();
+    const engine = new InMemoryContextEngine({ cache });
+    const stableCandidate = graphNode("node-stable", "fp-stable", "stable project context");
+    const first = await engine.projectGraph({
+      ...buildRequest({ candidateNodes: [stableCandidate] }),
+      prompt: "first volatile user prompt"
+    });
+    const second = await engine.projectGraph({
+      ...buildRequest({ candidateNodes: [stableCandidate] }),
+      prompt: "second volatile user prompt"
+    });
+
+    assert.equal(first.cache.hit, false);
+    assert.equal(second.cache.hit, true);
+    assert.equal(second.cache.key, first.cache.key);
+    assert.deepEqual(second.cache.dependencyFingerprints, ["fp-stable"]);
+    assert.equal(second.selectedNodes.some((node) => node.content === "second volatile user prompt"), true);
+    assert.equal(second.selectedNodes.some((node) => node.content === "first volatile user prompt"), false);
+  });
+
+  it("marks prompt-only projections as no-store instead of cacheable context misses", async () => {
+    const cache = new InMemoryCacheManager();
+    const engine = new InMemoryContextEngine({ cache });
+    const first = await engine.projectGraph({
+      ...buildRequest(),
+      prompt: "first volatile only prompt"
+    });
+    const second = await engine.projectGraph({
+      ...buildRequest(),
+      prompt: "second volatile only prompt"
+    });
+
+    assert.equal(first.cache.key, "context.projection:no-store");
+    assert.equal(second.cache.key, "context.projection:no-store");
+    assert.equal(first.cache.hit, false);
+    assert.equal(second.cache.hit, false);
+    assert.deepEqual(first.cache.dependencyFingerprints, []);
+    assert.deepEqual(second.cache.dependencyFingerprints, []);
+    assert.equal(second.selectedNodes.some((node) => node.content === "second volatile only prompt"), true);
+    assert.equal(second.selectedNodes.some((node) => node.content === "first volatile only prompt"), false);
+  });
 });

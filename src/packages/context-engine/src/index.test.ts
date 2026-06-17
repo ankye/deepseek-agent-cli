@@ -70,8 +70,14 @@ describe("InMemoryContextEngine", () => {
       hardLimitTokens: 10
     });
 
-    const first = await engine.projectGraph(request);
-    const second = await engine.projectGraph(request);
+    const first = await engine.projectGraph({
+      ...request,
+      candidateNodes: [graphNode(sessionId, "ctx-cache-stable", "stable context", 100)]
+    });
+    const second = await engine.projectGraph({
+      ...request,
+      candidateNodes: [graphNode(sessionId, "ctx-cache-stable", "stable context", 100)]
+    });
 
     assert.equal(first.cache.hit, false);
     assert.equal(second.cache.hit, true);

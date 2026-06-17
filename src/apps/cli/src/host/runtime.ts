@@ -13,8 +13,10 @@ import { PersistentFilesystemSessionStore, userSessionsDirectory } from "@deepse
 import { createDeterministicRuntimeDependencies, createLiveCliDependencies } from "@deepseek/testing-regression";
 import type { CliRunOptions, CliRuntimeFactoryOptions } from "../types.js";
 import { registerCliEnvironmentCapabilities } from "./environment-capabilities.js";
+import { registerCliSweBenchRunCapabilities } from "./swe-bench-run-capabilities.js";
 
 export { registerCliEnvironmentCapabilities } from "./environment-capabilities.js";
+export { registerCliSweBenchRunCapabilities } from "./swe-bench-run-capabilities.js";
 
 export async function createCliAgentRuntime(options: CliRuntimeFactoryOptions, runOptions: CliRunOptions): Promise<{ readonly deps: RuntimeDependencies; readonly kernel: RuntimeKernel }> {
   if (runOptions.createRuntime) return runOptions.createRuntime(options);
@@ -28,6 +30,7 @@ export async function createCliAgentRuntime(options: CliRuntimeFactoryOptions, r
   });
   await registerRuntimeCoreTools(deps, options.workspaceRoot);
   await registerCliEnvironmentCapabilities(deps, options.workspaceRoot);
+  await registerCliSweBenchRunCapabilities(deps, options.workspaceRoot);
   return { deps, kernel: await createDefaultRuntimeKernel(deps) };
 }
 
@@ -77,6 +80,7 @@ async function createCliSessionDependencies(workspaceRoot = process.cwd()): Prom
   const deps = createCliSessionDependenciesBase();
   await registerRuntimeCoreTools(deps, workspaceRoot);
   await registerCliEnvironmentCapabilities(deps, workspaceRoot);
+  await registerCliSweBenchRunCapabilities(deps, workspaceRoot);
   return deps;
 }
 

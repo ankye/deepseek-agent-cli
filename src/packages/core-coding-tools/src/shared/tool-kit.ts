@@ -190,8 +190,9 @@ export function isDiagnostic(value: unknown): value is CoreToolDiagnostic {
 }
 
 export function replay(context: CapabilityExecutionContext): JsonObject {
+  const envelopeId = context.envelope?.invocationId ?? `trace:${context.trace.traceId}`;
   return {
-    envelopeId: context.envelope.invocationId,
+    envelopeId,
     traceId: context.trace.traceId,
     snapshot: "core-tool-evidence"
   };

@@ -1,6 +1,7 @@
 import type { JsonObject, RedactionClass, RedactionMetadata, TraceContext } from "./common.js";
 
 export const SECRET_SANDBOX_SCHEMA_VERSION = "1.0.0";
+export const MAX_EXECUTION_TIMEOUT_MS = 7_200_000;
 
 export type SecretKind =
   | "none"

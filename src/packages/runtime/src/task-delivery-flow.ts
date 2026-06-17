@@ -573,10 +573,10 @@ function defaultDecisionConstraints(brief: TaskBrief): readonly string[] {
   if (!isSweBenchBrief(brief)) return constraints;
   return [
     ...constraints,
-    "For SWE-bench Lite tasks, treat the configured benchmark workspace as the task workspace.",
-    "Use .deepseek/swebench-workspaces as the visible benchmark workspace root; select the requested task workspace there, read its instance.json, and treat its repo/ directory as the repository root.",
-    "Start from the visible benchmark instance and checkout; do not solve by inspecting CLI diagnostics, fixture tests, historical predictions, or evaluator-side artifacts.",
-    "Keep source inspection, edits, temporary repro scripts, tests, and diffs inside the selected benchmark repo/ unless the user explicitly asks to repair this CLI framework.",
+    "For SWE-bench Lite tasks, use the governed SWE-bench run capability or diagnostics adapter to bind a run-scoped task checkout.",
+    "Historical evaluator artifacts and prior benchmark run directories are outside the model-visible task scope and are rejected by the runtime guard.",
+    "Start from the run-scoped benchmark instance and checkout; do not solve by inspecting CLI diagnostics, fixture tests, prior predictions, or evaluator-side artifacts.",
+    "Keep source inspection, edits, temporary repro scripts, tests, and diffs inside the selected benchmark checkout unless the user explicitly asks to repair this CLI framework.",
     "Modify only the benchmark repository checkout unless the user explicitly asks to change this CLI framework.",
     "Prefer a minimal failing regression or minimal reproduction inside the benchmark repo before broad dependency setup when local source and tests are enough to demonstrate the behavior.",
     "Use only project-local virtual environment or explicit local install target for Python package setup; do not run host/global package installers.",
@@ -626,8 +626,8 @@ function createDeterministicDecisionEnvelope(request: TaskDecisionRequest, goal:
     profileSelection: request.candidateProfiles[0] ?? "coding/general.v1",
     toolStrategy: sweBench
       ? [
-        "Read the benchmark instance and repository checkout before inspecting framework code.",
-        "List .deepseek/swebench-workspaces, choose the requested task workspace, then use that workspace's repo root for relative file, shell, test, and git operations.",
+        "Use the governed SWE-bench run preparation/evaluation capability to obtain the current run-scoped checkout before inspecting source code.",
+        "Use the current run-scoped checkout as the root for relative file, shell, test, and git operations.",
         "Use file/search tools to identify candidate source files inside the benchmark repository.",
         "Create or run a minimal reproduction for the reported behavior before spending multiple turns on full environment installation.",
         "Limit environment work to one dependency setup attempt in a project-local virtual environment before returning to source edits and focused verification.",

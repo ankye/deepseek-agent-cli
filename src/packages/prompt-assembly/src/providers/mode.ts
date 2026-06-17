@@ -1,10 +1,15 @@
 import { PROMPT_ASSEMBLY_SCHEMA_VERSION } from "@deepseek/platform-contracts";
+import type { AgentLoopToolProjection, CapabilityManifest, StagedTaskStageKind } from "@deepseek/platform-contracts";
 import type { PromptSectionProviderRegistration } from "../assembler.js";
-import { createPromptSection } from "../sections.js";
+import { createPromptSection, stableHash } from "../sections.js";
+import { isCapabilityVisibleForProjection } from "../tool-projection.js";
 
 export function createModeProviders(): readonly PromptSectionProviderRegistration[] {
   return [
     createModeContextProvider(),
+    createProfileWorkflowProvider(),
+    createTaskIntentContractProvider(),
+    createProfileWorkflowStateProvider(),
     createPhasePlanProvider(),
     createLoopBudgetProvider(),
     createWorkOrderProvider(),
@@ -53,6 +58,320 @@ function createModeContextProvider(): PromptSectionProviderRegistration {
   };
 }
 
+function createProfileWorkflowProvider(): PromptSectionProviderRegistration {
+  return {
+    id: "core.profile-workflow",
+    version: "1.0.0",
+    kind: "system.mode",
+    source: "runtime",
+    priority: 993,
+    budgetClass: "required",
+    trust: "system",
+    required: false,
+    compatibility: { schemaVersion: PROMPT_ASSEMBLY_SCHEMA_VERSION },
+    provide(input) {
+      const policy = input.profilePolicy;
+      if (!policy) return [];
+      const workflowCapabilities = profileWorkflowCapabilityVisibility(
+        policy.workflowCapabilityIds,
+        input.availableTools,
+        input.toolPolicy
+      );
+      const workflowStageLines = profileWorkflowStageLines(policy.workflowStages ?? []);
+      return [createPromptSection({
+        id: "section.profile-workflow",
+        providerId: "core.profile-workflow",
+        kind: "system.mode",
+        source: "runtime",
+        role: "system",
+        content: [
+          "Agent profile workflow:",
+          `- Profile id: ${policy.profileId}.`,
+          `- Role: ${policy.role}.`,
+          `- Workflow graph: ${policy.workflowGraphId}.`,
+          `- Workflow priority: ${policy.workflowPriority}.`,
+          `- Orchestration mode: ${policy.orchestrationMode}.`,
+          `- Primary orchestration capabilities: ${policy.workflowCapabilityIds.join(", ") || "none"}.`,
+          `- Model-visible workflow capabilities: ${workflowCapabilities.modelVisible.join(", ") || "none"}.`,
+          `- Projection-limited workflow capabilities: ${workflowCapabilities.projectionLimited.join(", ") || "none"}.`,
+          `- Unregistered workflow capabilities: ${workflowCapabilities.unregistered.join(", ") || "none"}.`,
+          ...(workflowStageLines.length > 0 ? [
+            "Workflow stages:",
+            ...workflowStageLines
+          ] : []),
+          `- Tool projection source: ${policy.toolProjectionSource}${policy.toolProjection ? ` (${policy.toolProjection})` : ""}.`,
+          `- Context pipeline: ${policy.contextPipelineEnabled ? "enabled" : "default"}.`,
+          `- Execution boundary: ${policy.executionBoundary}.`,
+          policy.antiTailoring
+            ? "- Use the workflow to compose generic capabilities; do not tailor behavior to a specific benchmark instance."
+            : "- Use the workflow to compose generic capabilities for the current task."
+        ].join("\n"),
+        priority: 993,
+        budgetClass: "required",
+        trust: "system",
+        required: true,
+        provenance: {
+          profileId: policy.profileId,
+          role: policy.role,
+          workflowGraphId: policy.workflowGraphId,
+          workflowPriority: policy.workflowPriority,
+          orchestrationMode: policy.orchestrationMode,
+          workflowCapabilityIds: policy.workflowCapabilityIds,
+          modelVisibleWorkflowCapabilityIds: workflowCapabilities.modelVisible,
+          projectionLimitedWorkflowCapabilityIds: workflowCapabilities.projectionLimited,
+          unregisteredWorkflowCapabilityIds: workflowCapabilities.unregistered,
+          workflowStageIds: (policy.workflowStages ?? []).map((stage) => stage.id),
+          toolProjectionSource: policy.toolProjectionSource,
+          contextPipelineEnabled: policy.contextPipelineEnabled === true,
+          antiTailoring: policy.antiTailoring
+        }
+      })];
+    }
+  };
+}
+
+function createTaskIntentContractProvider(): PromptSectionProviderRegistration {
+  return {
+    id: "core.task-intent-contract",
+    version: "1.0.0",
+    kind: "task.intent",
+    source: "runtime",
+    priority: 991,
+    budgetClass: "required",
+    trust: "system",
+    required: false,
+    compatibility: { schemaVersion: PROMPT_ASSEMBLY_SCHEMA_VERSION },
+    provide(input) {
+      const policy = input.profilePolicy;
+      if (!policy) return [];
+      const workflowCapabilities = profileWorkflowCapabilityVisibility(
+        policy.workflowCapabilityIds,
+        input.availableTools,
+        input.toolPolicy
+      );
+      const workflowStageIds = (policy.workflowStages ?? []).map((stage) => stage.id);
+      return [createPromptSection({
+        id: "section.task-intent-contract",
+        providerId: "core.task-intent-contract",
+        kind: "task.intent",
+        source: "runtime",
+        role: "system",
+        content: [
+          "Task intent contract:",
+          `- Intent family: ${taskIntentFamilyForPolicy(policy.role)}.`,
+          "- Prompt boundary: the final user message is the immutable task input.",
+          `- Selected profile role: ${policy.role}.`,
+          `- Workflow route: ${policy.workflowGraphId} (${policy.orchestrationMode}, ${policy.workflowPriority}).`,
+          `- Workflow stages: ${workflowStageIds.join(", ") || "none"}.`,
+          `- Primary capability route: ${policy.workflowCapabilityIds.join(", ") || "none"}.`,
+          `- Model-visible route capabilities: ${workflowCapabilities.modelVisible.join(", ") || "none"}.`,
+          `- Projection-limited route capabilities: ${workflowCapabilities.projectionLimited.join(", ") || "none"}.`,
+          `- Unregistered route capabilities: ${workflowCapabilities.unregistered.join(", ") || "none"}.`,
+          "- Completion contract: follow the selected workflow's ready stage using completion-grade capability evidence, or report a bounded blocker.",
+          "- Cache contract: this task intent is deterministic for the prompt/profile contract and excludes dynamic stage run state.",
+          policy.antiTailoring
+            ? "- Anti-tailoring: do not branch on benchmark repositories, instance ids, task numbers, expected patches, or known solutions."
+            : "- Use the selected workflow as generic capability composition guidance."
+        ].join("\n"),
+        priority: 991,
+        budgetClass: "required",
+        trust: "system",
+        required: true,
+        provenance: {
+          promptHash: stableHash(input.prompt),
+          profileId: policy.profileId,
+          role: policy.role,
+          workflowGraphId: policy.workflowGraphId,
+          workflowPriority: policy.workflowPriority,
+          orchestrationMode: policy.orchestrationMode,
+          workflowStageIds,
+          workflowCapabilityIds: policy.workflowCapabilityIds,
+          modelVisibleWorkflowCapabilityIds: workflowCapabilities.modelVisible,
+          projectionLimitedWorkflowCapabilityIds: workflowCapabilities.projectionLimited,
+          unregisteredWorkflowCapabilityIds: workflowCapabilities.unregistered,
+          antiTailoring: policy.antiTailoring
+        }
+      })];
+    }
+  };
+}
+
+function createProfileWorkflowStateProvider(): PromptSectionProviderRegistration {
+  return {
+    id: "core.profile-workflow-state",
+    version: "1.0.0",
+    kind: "system.mode",
+    source: "runtime",
+    priority: 992,
+    budgetClass: "required",
+    trust: "system",
+    required: false,
+    compatibility: { schemaVersion: PROMPT_ASSEMBLY_SCHEMA_VERSION },
+    provide(input) {
+      const policy = input.profilePolicy;
+      const workflow = policy?.stagedTaskWorkflow;
+      if (!policy || !workflow) return [];
+      const stageLines = workflow.runState.stageStates
+        .map((stage) => `- ${stage.stageId}:${stage.status} refs=${stage.outputRefs.join(",") || "none"} attempts=${stage.attempts}`);
+      const stagesById = new Map(workflow.graph.stages.map((stage) => [stage.stageId, stage]));
+      const readyStageLines = workflow.runState.stageStates
+        .filter((stage) => stage.status === "ready")
+        .map((stage) => {
+          const stageContract = stagesById.get(stage.stageId);
+          const allowedTools = gateAdjustedReadyStageTools(stageContract?.kind, stageContract?.allowedTools ?? [], policy.workflowGateOverride?.requiredNextAction);
+          return `- ${stage.stageId} kind=${stageContract?.kind ?? "unknown"} tools=${allowedTools.join(", ") || "none"} primary=${primaryNextActionForStage(stageContract?.kind, allowedTools)}`;
+        });
+      const readyStageGuidanceLines = readyStageGuidanceFor(workflow.runState.stageStates, workflow.graph.stages);
+      return [createPromptSection({
+        id: "section.profile-workflow-state",
+        providerId: "core.profile-workflow-state",
+        kind: "system.mode",
+        source: "runtime",
+        role: "system",
+        content: [
+          "Agent profile workflow state:",
+          `- Profile id: ${policy.profileId}.`,
+          `- Task run: ${workflow.runState.taskRunId}.`,
+          `- Graph: ${workflow.graphId}.`,
+          "Current stage states:",
+          ...stageLines,
+          ...(policy.workflowGateOverride ? [
+            `Gate-enforced next action: ${policy.workflowGateOverride.requiredNextAction}.`,
+            `Gate: ${policy.workflowGateOverride.gate} rejected ${policy.workflowGateOverride.rejectedToolName ?? policy.workflowGateOverride.rejectedCapabilityId ?? "unknown"}; do not choose another tool from that rejected action family until the required next action has progress.`
+          ] : []),
+          ...(readyStageLines.length > 0 ? [
+            "Ready stage capabilities:",
+            ...readyStageLines,
+            ...readyStageGuidanceLines
+          ] : []),
+          "- Treat succeeded stages as evidence-backed progress; choose the next ready stage capability or report a bounded blocker."
+        ].join("\n"),
+        priority: 992,
+        budgetClass: "required",
+        trust: "system",
+        required: true,
+        provenance: {
+          profileId: policy.profileId,
+          graphId: workflow.graphId,
+          taskRunId: workflow.runState.taskRunId,
+          stageStates: workflow.runState.stageStates.map((stage) => `${stage.stageId}:${stage.status}`),
+          readyStageIds: workflow.runState.stageStates.filter((stage) => stage.status === "ready").map((stage) => stage.stageId),
+          ...(policy.workflowGateOverride ? { workflowGateOverride: policy.workflowGateOverride } : {})
+        }
+      })];
+    }
+  };
+}
+
+function taskIntentFamilyForPolicy(role: string): string {
+  if (role.includes("evaluation")) return "governed-evaluation-workflow";
+  if (role.includes("review")) return "governed-review-workflow";
+  if (role.includes("release")) return "governed-release-workflow";
+  return "governed-capability-workflow";
+}
+
+function primaryNextActionForStage(kind: StagedTaskStageKind | undefined, allowedTools: readonly string[]): string {
+  if (kind === "produce" || kind === "repair") {
+    return allowedTools.some(isMutationCapabilityId)
+      ? "mutation-grade edit/patch/write or bounded blocker"
+      : "completion-grade production action or bounded blocker";
+  }
+  if (kind === "verify") return "standard test/diff evidence or bounded blocker";
+  if (kind === "collect-evidence") return "focused bounded evidence collection or bounded blocker";
+  if (kind === "score") return "governed scoring/evaluation action or bounded blocker";
+  if (kind === "materialize") return "materialization action or bounded blocker";
+  return "ready-stage capability or bounded blocker";
+}
+
+function gateAdjustedReadyStageTools(
+  kind: StagedTaskStageKind | undefined,
+  allowedTools: readonly string[],
+  requiredNextAction: string | undefined
+): readonly string[] {
+  if (requiredNextAction !== "source-edit-or-test-or-blocker" && requiredNextAction !== "source-edit-or-test-or-bounded-blocker") return allowedTools;
+  if (kind !== "produce" && kind !== "repair" && kind !== "verify") return allowedTools;
+  const progressTools = allowedTools.filter((capabilityId) => isMutationCapabilityId(capabilityId) || isVerificationCapabilityId(capabilityId));
+  return progressTools.length > 0 ? progressTools : allowedTools;
+}
+
+function readyStageGuidanceFor(
+  stageStates: readonly { readonly stageId: string; readonly status: string }[],
+  stageContracts: readonly { readonly stageId: string; readonly kind: StagedTaskStageKind; readonly allowedTools?: readonly string[] }[]
+): readonly string[] {
+  const succeededKinds = new Set(stageStates
+    .filter((state) => state.status === "succeeded")
+    .map((state) => stageContracts.find((stage) => stage.stageId === state.stageId)?.kind)
+    .filter((kind): kind is StagedTaskStageKind => Boolean(kind)));
+  const readyContracts = stageStates
+    .filter((state) => state.status === "ready")
+    .map((state) => stageContracts.find((stage) => stage.stageId === state.stageId))
+    .filter((stage): stage is { readonly stageId: string; readonly kind: StagedTaskStageKind; readonly allowedTools?: readonly string[] } => Boolean(stage));
+  const hasEvidenceSucceeded = succeededKinds.has("collect-evidence");
+  const hasMutationReady = readyContracts.some((stage) => stage.kind === "produce" || stage.kind === "repair");
+  if (!hasEvidenceSucceeded || !hasMutationReady) return [];
+  return [
+    "- Ready stage rule: read/search/list-only exploration is supporting evidence, not completion-grade progress for produce or repair stages after evidence collection.",
+    "- Use mutation-grade edit/patch/write capability evidence for source-change progress, or report a bounded blocker."
+  ];
+}
+
+function isMutationCapabilityId(capabilityId: string): boolean {
+  return capabilityId.includes(".edit")
+    || capabilityId.includes(".write")
+    || capabilityId.includes(".patch")
+    || capabilityId.includes("patch.apply")
+    || capabilityId.includes("file-edit")
+    || capabilityId.includes("file.write");
+}
+
+function isVerificationCapabilityId(capabilityId: string): boolean {
+  return capabilityId.includes(".test")
+    || capabilityId.includes(".diff")
+    || capabilityId.includes("test.run")
+    || capabilityId.includes("git.diff");
+}
+
+function profileWorkflowStageLines(stages: readonly {
+  readonly id: string;
+  readonly objective: string;
+  readonly capabilityIds: readonly string[];
+  readonly entryCriteria: readonly string[];
+  readonly exitCriteria: readonly string[];
+}[]): readonly string[] {
+  return stages.map((stage, index) => [
+    `${index + 1}. ${stage.id}: ${stage.objective}`,
+    `capabilities=${stage.capabilityIds.join(", ") || "none"}`,
+    `entry=${stage.entryCriteria.join("; ") || "none"}`,
+    `exit=${stage.exitCriteria.join("; ") || "none"}`
+  ].join(" | "));
+}
+
+function profileWorkflowCapabilityVisibility(
+  capabilityIds: readonly string[],
+  availableTools: readonly CapabilityManifest[],
+  toolPolicy: AgentLoopToolProjection
+): {
+  readonly modelVisible: readonly string[];
+  readonly projectionLimited: readonly string[];
+  readonly unregistered: readonly string[];
+} {
+  const availableById = new Map(availableTools.map((capability) => [String(capability.id), capability]));
+  const modelVisible: string[] = [];
+  const projectionLimited: string[] = [];
+  const unregistered: string[] = [];
+  for (const capabilityId of capabilityIds) {
+    const capability = availableById.get(capabilityId);
+    if (!capability) {
+      unregistered.push(capabilityId);
+    } else if (isCapabilityVisibleForProjection(capability, toolPolicy)) {
+      modelVisible.push(capabilityId);
+    } else {
+      projectionLimited.push(capabilityId);
+    }
+  }
+  return { modelVisible, projectionLimited, unregistered };
+}
+
 function createPhasePlanProvider(): PromptSectionProviderRegistration {
   return {
     id: "core.phase-plan",
@@ -75,7 +394,6 @@ function createPhasePlanProvider(): PromptSectionProviderRegistration {
         role: "system",
         content: [
           "Agent phase plan:",
-          `- Plan id: ${plan.planId}.`,
           `- Reason: ${plan.reason}`,
           ...plan.phases.map((phase) => `- ${phase.phase}: ${phase.status}${phase.required ? " required" : ""}${phase.skipReason ? ` skip=${phase.skipReason}` : ""} mode=${phase.mode}`)
         ].join("\n"),

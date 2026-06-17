@@ -77,8 +77,10 @@ describe("prompt assembly", () => {
 
     assert.equal(pipelineText.indexOf("Kernel block") < pipelineText.indexOf("Project block"), true);
     assert.equal(pipelineText.indexOf("Project block") < pipelineText.indexOf("Session block"), true);
-    assert.equal(pipelineText.indexOf("Session block") < pipelineText.indexOf("Current turn block"), true);
-    assert.equal(result.trace.pipeline?.pipelineFingerprint, "pipeline:test");
+    assert.equal(pipelineText.includes("Current turn block"), false);
+    assert.equal(result.trace.pipeline?.pipelineFingerprint.startsWith("pipeline:"), true);
+    assert.equal(result.trace.pipeline?.layerPrefixHashes.includes("project:prefix-project"), true);
+    assert.equal((result.trace.pipeline?.providerPrefixMessageCount ?? 0) > 0, true);
     assert.deepEqual(result.trace.pipeline?.includedBlockIds, ["block-kernel", "block-project", "block-session", "block-current"]);
   });
 
@@ -95,11 +97,322 @@ describe("prompt assembly", () => {
     assert.ok(decisionSection);
     assert.equal(decisionText.includes("Return a TaskDecisionEnvelope"), true);
     assert.equal(decisionText.includes("coding/general.v1"), true);
-    assert.equal(result.trace.pipeline?.pipelineFingerprint, "pipeline:test");
+    assert.equal(result.trace.pipeline?.pipelineFingerprint.startsWith("pipeline:"), true);
     assert.equal(result.trace.pipeline?.layerPrefixHashes.includes("project:prefix-project"), true);
+    assert.equal((result.trace.pipeline?.providerPrefixMessageCount ?? 0) > 0, true);
     assert.equal(typeof decisionSection.evidenceFingerprint, "string");
     assert.equal(decisionSection.evidenceFingerprint.length > 0, true);
     assert.equal(result.messages.at(-1)?.content, "继续");
+  });
+
+  it("keeps stable runtime framework sections in the explicit provider prefix", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const result = await assembler.assemble(input({
+      prompt: "fix issue",
+      contextPipelineManifest: pipelineManifest(),
+      phasePlan: agentPhasePlan(),
+      evidenceFirst: evidenceFirstContext(),
+      reasoningEffortMapping: reasoningMapping(),
+      availableTools: [capability("core.file.read"), capability("core.shell.run", "process")]
+    }));
+    const modeContext = result.messages.find((message) => message.content.includes("Runtime mode context:"));
+    const phasePlan = result.messages.find((message) => message.content.includes("Agent phase plan:"));
+    const toolPolicy = result.messages.find((message) => message.content.includes("Tool visibility policy:"));
+
+    assert.equal(modeContext?.cacheHint?.policy, "stable");
+    assert.equal(phasePlan?.cacheHint?.policy, "stable");
+    assert.equal(toolPolicy?.cacheHint?.policy, "stable");
+    assert.equal(result.trace.pipeline?.providerPrefixMessageCount, result.messages.filter((message) => message.cacheHint?.policy === "stable").length);
+    assert.equal(result.trace.pipeline?.cacheHintSummary.stable, result.trace.pipeline?.providerPrefixMessageCount);
+    assert.equal((result.trace.pipeline?.providerPrefixTokenEstimate ?? 0) > 500, true);
+  });
+
+  it("surfaces profile workflow policy as stable orchestration guidance", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const result = await assembler.assemble(input({
+      prompt: "Resolve SWE-bench instance demo__repo-1.",
+      contextPipelineManifest: pipelineManifest(),
+      phasePlan: agentPhasePlan(),
+      profilePolicy: profileWorkflowPolicy()
+    }));
+    const profileSection = result.sections.find((section) => section.providerId === "core.profile-workflow" && section.included);
+    const profileMessage = result.messages.find((message) => message.content.includes("Agent profile workflow:"));
+    const providerIds = result.sections
+      .filter((section) => section.included && section.providerId !== "core.user-prompt")
+      .map((section) => section.providerId);
+
+    assert.ok(profileSection);
+    assert.equal(profileMessage?.cacheHint?.policy, "stable");
+    assert.equal(profileMessage?.content.includes("Role: evaluation-workflow"), true);
+    assert.equal(profileMessage?.content.includes("Workflow priority: primary"), true);
+    assert.equal(profileMessage?.content.includes("Orchestration mode: staged-capability-workflow"), true);
+    assert.equal(profileMessage?.content.includes("Primary orchestration capabilities: core.env.prepare, core.swe.bench.run"), true);
+    assert.deepEqual(providerIds.slice(0, 4), [
+      "core.mode-context",
+      "core.profile-workflow",
+      "core.task-intent-contract",
+      "core.phase-plan"
+    ]);
+  });
+
+  it("shows which profile workflow capabilities are actually model-visible", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const result = await assembler.assemble(input({
+      prompt: "Resolve SWE-bench instance demo__repo-1.",
+      phasePlan: agentPhasePlan(),
+      profilePolicy: profileWorkflowPolicy(),
+      toolPolicy: "read-only",
+      availableTools: [
+        capability("core.file.read", "read"),
+        capability("core.swe.bench.run", "process")
+      ]
+    }));
+    const profileMessage = result.messages.find((message) => message.content.includes("Agent profile workflow:"));
+
+    assert.equal(profileMessage?.content.includes("Primary orchestration capabilities: core.env.prepare, core.swe.bench.run, core.file.read"), true);
+    assert.equal(profileMessage?.content.includes("Model-visible workflow capabilities: core.file.read"), true);
+    assert.equal(profileMessage?.content.includes("Projection-limited workflow capabilities: core.swe.bench.run"), true);
+    assert.equal(profileMessage?.content.includes("Unregistered workflow capabilities: core.env.prepare"), true);
+  });
+
+  it("surfaces profile workflow stages as stable orchestration guidance", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const result = await assembler.assemble(input({
+      prompt: "Resolve SWE-bench instance demo__repo-1.",
+      contextPipelineManifest: pipelineManifest(),
+      phasePlan: agentPhasePlan(),
+      profilePolicy: profileWorkflowPolicy()
+    }));
+    const profileMessage = result.messages.find((message) => message.content.includes("Agent profile workflow:"));
+    const profileSection = result.sections.find((section) => section.providerId === "core.profile-workflow" && section.included);
+
+    assert.equal(profileMessage?.cacheHint?.policy, "stable");
+    assert.equal(profileMessage?.content.includes("Workflow stages:"), true);
+    assert.equal(profileMessage?.content.includes("1. understand: Collect repository evidence."), true);
+    assert.equal(profileMessage?.content.includes("capabilities=core.env.prepare, core.file.read"), true);
+    assert.equal(profileMessage?.content.includes("exit=repository evidence collected"), true);
+    assert.deepEqual(profileSection?.provenance?.workflowStageIds, ["understand", "verify"]);
+  });
+
+  it("surfaces dynamic profile workflow run state outside the stable provider prefix", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const result = await assembler.assemble(input({
+      prompt: "Resolve SWE-bench instance demo__repo-1.",
+      contextPipelineManifest: pipelineManifest(),
+      phasePlan: agentPhasePlan(),
+      profilePolicy: profileWorkflowPolicyWithRunState()
+    }));
+    const profileMessage = result.messages.find((message) => message.content.includes("Agent profile workflow:"));
+    const stateMessage = result.messages.find((message) => message.content.includes("Agent profile workflow state:"));
+
+    assert.equal(profileMessage?.cacheHint?.policy, "stable");
+    assert.equal(stateMessage?.cacheHint?.policy, "ephemeral");
+    assert.equal(stateMessage?.content.includes("stage:understand:succeeded refs=ref:workflow-understand-evidence attempts=1"), true);
+    assert.equal(stateMessage?.content.includes("stage:verify:ready refs=none attempts=0"), true);
+    assert.equal(result.trace.pipeline?.providerPrefixMessageCount, result.messages.filter((message) => message.cacheHint?.policy === "stable" && message.role === "system").length);
+  });
+
+  it("surfaces a deterministic task intent contract in the stable provider prefix", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const first = await assembler.assemble(input({
+      prompt: "Resolve SWE-bench instance demo__repo-1.",
+      sessionId: "session-one",
+      turnId: "turn-one",
+      contextPipelineManifest: pipelineManifest({ sessionId: "session-one", turnId: "turn-one" }),
+      phasePlan: agentPhasePlan({ planId: "agent-phase-plan:first", sessionId: "session-one", turnId: "turn-one" }),
+      profilePolicy: profileWorkflowPolicyWithRunState()
+    }));
+    const second = await assembler.assemble(input({
+      prompt: "Resolve SWE-bench instance demo__repo-1.",
+      sessionId: "session-two",
+      turnId: "turn-two",
+      contextPipelineManifest: pipelineManifest({ sessionId: "session-two", turnId: "turn-two" }),
+      phasePlan: agentPhasePlan({ planId: "agent-phase-plan:second", sessionId: "session-two", turnId: "turn-two" }),
+      profilePolicy: profileWorkflowPolicyWithRunState({
+        taskRunId: "staged:workflow:second",
+        verifyAttempts: 2
+      })
+    }));
+    const firstIntent = first.messages.find((message) => message.content.includes("Task intent contract:"));
+    const secondIntent = second.messages.find((message) => message.content.includes("Task intent contract:"));
+    const stateIndex = first.messages.findIndex((message) => message.content.includes("Agent profile workflow state:"));
+    const intentIndex = first.messages.findIndex((message) => message.content.includes("Task intent contract:"));
+
+    assert.ok(firstIntent);
+    assert.ok(secondIntent);
+    assert.equal(firstIntent.cacheHint?.policy, "stable");
+    assert.equal(firstIntent.content, secondIntent.content);
+    assert.equal(firstIntent.content.includes("session-one"), false);
+    assert.equal(firstIntent.content.includes("turn-one"), false);
+    assert.equal(firstIntent.content.includes("staged:workflow"), false);
+    assert.equal(firstIntent.content.includes("stage:verify:ready"), false);
+    assert.equal(intentIndex >= 0 && stateIndex >= 0 && intentIndex < stateIndex, true);
+    assert.equal(first.trace.pipeline?.providerPrefixMessageCount, first.messages.filter((message) => message.cacheHint?.policy === "stable" && message.role === "system").length);
+  });
+
+  it("makes ready produce stages prefer mutation-grade progress over repeated inspection", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const result = await assembler.assemble(input({
+      prompt: "Resolve SWE-bench instance demo__repo-1.",
+      contextPipelineManifest: pipelineManifest(),
+      phasePlan: agentPhasePlan(),
+      profilePolicy: profileWorkflowPolicyWithProduceRunState()
+    }));
+    const stateMessage = result.messages.find((message) => message.content.includes("Agent profile workflow state:"));
+
+    assert.equal(stateMessage?.cacheHint?.policy, "ephemeral");
+    assert.equal(stateMessage?.content.includes("stage:understand:succeeded"), true);
+    assert.equal(stateMessage?.content.includes("stage:change:ready"), true);
+    assert.equal(stateMessage?.content.includes("primary=mutation-grade edit/patch/write or bounded blocker"), true);
+    assert.equal(stateMessage?.content.includes("read/search/list-only exploration is supporting evidence, not completion-grade progress"), true);
+  });
+
+  it("surfaces gate-enforced next actions in workflow state guidance", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const result = await assembler.assemble(input({
+      prompt: "Resolve SWE-bench instance demo__repo-1.",
+      contextPipelineManifest: pipelineManifest(),
+      phasePlan: agentPhasePlan(),
+      profilePolicy: {
+        ...profileWorkflowPolicyWithProduceRunState(),
+        workflowGateOverride: {
+          gate: "SWE_BENCH_SOURCE_INSPECTION_DUPLICATE_GATE",
+          requiredNextAction: "source-edit-or-test-or-bounded-blocker",
+          rejectedToolName: "core.file.read",
+          terminalKind: "swe-bench-source-inspection-duplicate.rejected",
+          toolCallId: "call-guidance-duplicate-read-2"
+        }
+      }
+    }));
+    const stateMessage = result.messages.find((message) => message.content.includes("Agent profile workflow state:"));
+
+    assert.equal(stateMessage?.cacheHint?.policy, "ephemeral");
+    assert.equal(stateMessage?.content.includes("Gate-enforced next action: source-edit-or-test-or-bounded-blocker."), true);
+    assert.equal(stateMessage?.content.includes("tools=core.file.edit, core.patch.apply"), true);
+    assert.equal(stateMessage?.content.includes("tools=core.file.read, core.search.text"), false);
+  });
+
+  it("includes the stable task prompt in provider prefix evidence before growing history", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const stableTaskPrompt = [
+      "Resolve SWE-bench instance astropy__astropy-14365.",
+      "Repository: astropy/astropy",
+      "Base commit: 7269fa3e33e8d02485a647da91a5a2a60a06af61",
+      "",
+      "Managed SWE-bench execution profile:",
+      "- Work on the checked-out repository.",
+      "- Add or update focused regression coverage before implementation.",
+      "- Do not manually bypass the governed harness.",
+      "- Return control when source edit, test evidence, and patch evidence are ready.",
+      "",
+      "Problem statement:",
+      "QDP command parsing should be case-insensitive. Lowercase and mixed-case READ SERR commands should parse the same as uppercase commands."
+    ].join("\n");
+    const result = await assembler.assemble(input({
+      prompt: stableTaskPrompt,
+      contextPipelineManifest: pipelineManifest(),
+      phasePlan: agentPhasePlan(),
+      evidenceFirst: evidenceFirstContext(),
+      reasoningEffortMapping: reasoningMapping(),
+      availableTools: [capability("core.file.read"), capability("core.shell.run", "process")]
+    }));
+
+    assert.equal(result.messages.at(-1)?.role, "user");
+    assert.equal(result.messages.at(-1)?.cacheHint?.policy, "stable");
+    assert.equal(result.trace.pipeline?.providerPrefixMessageCount, result.messages.length);
+    assert.equal(result.trace.pipeline?.cacheHintSummary.stable, result.messages.length);
+    assert.equal(
+      (result.trace.pipeline?.providerPrefixTokenEstimate ?? 0) > stableTaskPrompt.split(/\s+/).length,
+      true
+    );
+  });
+
+  it("keeps volatile self-repair sections from truncating later stable provider-prefix sections", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const result = await assembler.assemble(input({
+      prompt: "fix issue",
+      contextPipelineManifest: pipelineManifest(),
+      phasePlan: agentPhasePlan(),
+      evidenceFirst: evidenceFirstContext(),
+      selfRepair: selfRepairOutcome(),
+      reasoningEffortMapping: reasoningMapping(),
+      availableTools: [capability("core.file.read"), capability("core.shell.run", "process")]
+    }));
+    const firstVolatileSystemIndex = result.messages.findIndex((message) => message.role === "system" && message.cacheHint?.policy !== "stable");
+    const stableSystemAfterVolatile = result.messages
+      .slice(firstVolatileSystemIndex + 1)
+      .find((message) => message.role === "system" && message.cacheHint?.policy === "stable");
+
+    assert.equal(firstVolatileSystemIndex >= 0, true);
+    assert.equal(stableSystemAfterVolatile, undefined);
+    assert.equal(result.messages.some((message) => message.role === "system" && message.content.includes("Self-repair operating rules:")), true);
+    assert.equal(result.trace.pipeline?.providerPrefixMessageCount, result.messages.filter((message) => message.role === "system" && message.cacheHint?.policy === "stable").length);
+  });
+
+  it("keeps provider stable-prefix fingerprints stable across session and turn ids", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const first = await assembler.assemble(input({
+      prompt: "fix issue",
+      sessionId: "session-one",
+      turnId: "turn-one",
+      contextPipelineManifest: pipelineManifest({ sessionId: "session-one", turnId: "turn-one" }),
+      phasePlan: agentPhasePlan({ planId: "agent-phase-plan:first", sessionId: "session-one", turnId: "turn-one" }),
+      taskDecision: taskDecisionRequest({ requestId: "task-decision-request:first", briefId: "task-brief:first" }),
+      profilePolicy: profileWorkflowPolicy(),
+      evidenceFirst: evidenceFirstContext({
+        classificationId: "evidence-classification:first",
+        planId: "evidence-plan:first",
+        summaryId: "evidence-summary:first"
+      }),
+      reasoningEffortMapping: reasoningMapping(),
+      availableTools: [capability("core.file.read"), capability("core.shell.run", "process")]
+    }));
+    const second = await assembler.assemble(input({
+      prompt: "fix issue",
+      sessionId: "session-two",
+      turnId: "turn-two",
+      contextPipelineManifest: pipelineManifest({ sessionId: "session-two", turnId: "turn-two" }),
+      phasePlan: agentPhasePlan({ planId: "agent-phase-plan:second", sessionId: "session-two", turnId: "turn-two" }),
+      taskDecision: taskDecisionRequest({ requestId: "task-decision-request:second", briefId: "task-brief:second" }),
+      profilePolicy: profileWorkflowPolicy(),
+      evidenceFirst: evidenceFirstContext({
+        classificationId: "evidence-classification:second",
+        planId: "evidence-plan:second",
+        summaryId: "evidence-summary:second"
+      }),
+      reasoningEffortMapping: reasoningMapping(),
+      availableTools: [capability("core.file.read"), capability("core.shell.run", "process")]
+    }));
+    const firstProfileWorkflow = first.sections.find((section) => section.providerId === "core.profile-workflow" && section.included);
+    const secondProfileWorkflow = second.sections.find((section) => section.providerId === "core.profile-workflow" && section.included);
+
+    assert.equal(first.trace.pipeline?.providerPrefixFingerprint, second.trace.pipeline?.providerPrefixFingerprint);
+    assert.equal(first.trace.pipeline?.providerPrefixMessageCount, second.trace.pipeline?.providerPrefixMessageCount);
+    assert.equal(first.trace.pipeline?.providerPrefixTokenEstimate, second.trace.pipeline?.providerPrefixTokenEstimate);
+    assert.equal(firstProfileWorkflow?.evidenceFingerprint, secondProfileWorkflow?.evidenceFingerprint);
+    assert.deepEqual(firstProfileWorkflow?.provenance?.workflowStageIds, ["understand", "verify"]);
+    assert.equal(first.messages.some((message) => message.content.includes("task-decision-request:first")), false);
+    assert.equal(first.messages.some((message) => message.content.includes("task-brief:first")), false);
+  });
+
+  it("keeps stable project instructions from truncating the provider prefix", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const result = await assembler.assemble(input({
+      prompt: "fix issue",
+      contextPipelineManifest: pipelineManifest(),
+      projectRules: [projectRule("AGENTS.md", "Keep platform contracts stable.")],
+      phasePlan: agentPhasePlan()
+    }));
+    const projectInstructions = result.messages.find((message) => message.content.includes("Project repository instructions:"));
+    const modeContext = result.messages.find((message) => message.content.includes("Runtime mode context:"));
+    const phasePlan = result.messages.find((message) => message.content.includes("Agent phase plan:"));
+
+    assert.equal(result.messages[0], projectInstructions);
+    assert.equal(projectInstructions?.cacheHint?.policy, "stable");
+    assert.equal(modeContext?.cacheHint?.policy, "stable");
+    assert.equal(phasePlan?.cacheHint?.policy, "stable");
+    assert.equal(result.trace.pipeline?.providerPrefixMessageCount, result.messages.filter((message) => message.cacheHint?.policy === "stable").length);
+    assert.equal(result.trace.pipeline?.cacheHintSummary.stable, result.trace.pipeline?.providerPrefixMessageCount);
   });
 
   it("states lossless context priority below current instructions and policy", async () => {
@@ -334,6 +647,8 @@ function providerRegistration(id: string, priority: number, content: string, req
 
 function input(options: {
   readonly prompt: string;
+  readonly sessionId?: string;
+  readonly turnId?: string;
   readonly contextContent?: string;
   readonly projectionNodes?: readonly NonNullable<PromptAssemblyInput["contextProjection"]>["selectedNodes"][number][];
   readonly hardLimitTokens?: number;
@@ -348,14 +663,17 @@ function input(options: {
   readonly projectRules?: readonly AgentLoopProjectRuleEvidence[];
   readonly contextPipelineManifest?: ContextPipelineManifest;
   readonly taskDecision?: TaskDecisionRequest;
+  readonly profilePolicy?: PromptAssemblyInput["profilePolicy"];
 }): PromptAssemblyInput {
+  const sessionId = asId<"session">(options.sessionId ?? "session-prompt-assembly");
+  const turnId = asId<"turn">(options.turnId ?? "turn-prompt-assembly");
   const selectedNodes = options.projectionNodes ?? (options.contextContent ? [
     projectionNode("context-node-1", "memory-ref", "memory", options.contextContent, { memoryId: "memory-1", scope: "session" })
   ] : []);
   return {
     schemaVersion: "1.0.0",
-    sessionId: asId<"session">("session-prompt-assembly"),
-    turnId: asId<"turn">("turn-prompt-assembly"),
+    sessionId,
+    turnId,
     prompt: options.prompt,
     mode: options.mode ?? "coding",
     caller: "test",
@@ -374,6 +692,7 @@ function input(options: {
     ...(options.projectRules ? { projectRules: options.projectRules } : {}),
     ...(options.contextPipelineManifest ? { contextPipelineManifest: options.contextPipelineManifest } : {}),
     ...(options.taskDecision ? { taskDecision: options.taskDecision } : {}),
+    ...(options.profilePolicy ? { profilePolicy: options.profilePolicy } : {}),
     ...(options.evidenceFirst ? { evidenceFirst: options.evidenceFirst } : {}),
     ...(options.selfRepair ? { selfRepair: options.selfRepair } : {}),
     ...(options.phasePlan ? {
@@ -387,7 +706,7 @@ function input(options: {
       contextProjection: {
         schemaVersion: "1.0.0",
         status: "completed",
-        sessionId: asId<"session">("session-prompt-assembly"),
+        sessionId,
         prompt: options.prompt,
         selectedNodes,
         excludedNodes: [],
@@ -413,13 +732,15 @@ function input(options: {
   };
 }
 
-function taskDecisionRequest(): TaskDecisionRequest {
+function taskDecisionRequest(options: { readonly requestId?: string; readonly briefId?: string } = {}): TaskDecisionRequest {
+  const requestId = options.requestId ?? "task-decision-request:prompt-assembly";
+  const briefId = options.briefId ?? "task-brief:prompt-assembly";
   return {
     schemaVersion: TASK_DELIVERY_FLOW_SCHEMA_VERSION,
-    requestId: "task-decision-request:prompt-assembly",
+    requestId,
     brief: {
       schemaVersion: TASK_DELIVERY_FLOW_SCHEMA_VERSION,
-      briefId: "task-brief:prompt-assembly",
+      briefId,
       rawInput: "继续",
       normalizedIntent: "continue active task",
       intentKind: "coding",
@@ -448,9 +769,254 @@ function taskDecisionRequest(): TaskDecisionRequest {
   };
 }
 
-function pipelineManifest(): ContextPipelineManifest {
-  const sessionId = asId<"session">("session-prompt-assembly");
-  const turnId = asId<"turn">("turn-prompt-assembly");
+function profileWorkflowPolicy(): NonNullable<PromptAssemblyInput["profilePolicy"]> {
+  return {
+    schemaVersion: "1.0.0",
+    profileId: "evaluation/swe-bench-lite.v1",
+    role: "evaluation-workflow",
+    workflowGraphId: "workflow/evaluation.swe-bench-lite.v1",
+    workflowCapabilityIds: [
+      "core.env.prepare",
+      "core.swe.bench.run",
+      "core.file.read"
+    ],
+    workflowPriority: "primary",
+    orchestrationMode: "staged-capability-workflow",
+    toolProjection: "all",
+    toolProjectionSource: "profile",
+    contextPipelineEnabled: true,
+    loopLimits: { maxModelIterations: 48, maxToolCalls: 96 },
+    workflowStages: [
+      {
+        id: "understand",
+        objective: "Collect repository evidence.",
+        capabilityIds: ["core.env.prepare", "core.file.read"],
+        entryCriteria: ["workspace ready"],
+        exitCriteria: ["repository evidence collected"]
+      },
+      {
+        id: "verify",
+        objective: "Verify patch evidence.",
+        capabilityIds: ["core.test.run", "core.git.diff"],
+        entryCriteria: ["patch ready"],
+        exitCriteria: ["test evidence collected", "diff reviewed"]
+      }
+    ],
+    antiTailoring: true,
+    executionBoundary: "governed-capabilities",
+    redaction: { class: "internal" }
+  };
+}
+
+function profileWorkflowPolicyWithRunState(options: {
+  readonly taskRunId?: string;
+  readonly verifyAttempts?: number;
+} = {}): NonNullable<PromptAssemblyInput["profilePolicy"]> {
+  return {
+    ...profileWorkflowPolicy(),
+    stagedTaskWorkflow: {
+      schemaVersion: "1.0.0",
+      profileId: "evaluation/swe-bench-lite.v1",
+      graphId: "workflow/evaluation.swe-bench-lite.v1",
+      fingerprint: "workflow:test",
+      stageCount: 2,
+      refCount: 2,
+      executorKinds: ["agent-loop"],
+      graph: {
+        schemaVersion: "1.0.0",
+        graphId: "workflow/evaluation.swe-bench-lite.v1",
+        profileId: "evaluation/swe-bench-lite.v1",
+        stages: [
+          {
+            schemaVersion: "1.0.0",
+            stageId: "stage:understand",
+            kind: "collect-evidence",
+            executorKind: "agent-loop",
+            dependsOn: [],
+            inputRefs: [],
+            expectedOutputRefs: ["ref:workflow-understand-evidence"],
+            allowedTools: ["core.file.read"],
+            compatibility: { schemaVersion: "1.0.0", minReaderVersion: "1.0.0" },
+            redaction: { class: "internal" }
+          },
+          {
+            schemaVersion: "1.0.0",
+            stageId: "stage:verify",
+            kind: "verify",
+            executorKind: "agent-loop",
+            dependsOn: ["stage:understand"],
+            inputRefs: ["ref:workflow-understand-evidence"],
+            expectedOutputRefs: ["ref:workflow-verify-evidence"],
+            allowedTools: ["core.test.run"],
+            compatibility: { schemaVersion: "1.0.0", minReaderVersion: "1.0.0" },
+            redaction: { class: "internal" }
+          }
+        ],
+        refs: [],
+        compatibility: { schemaVersion: "1.0.0", minReaderVersion: "1.0.0" },
+        redaction: { class: "internal" }
+      },
+      runState: {
+        schemaVersion: "1.0.0",
+        taskRunId: options.taskRunId ?? "staged:workflow:test",
+        graphId: "workflow/evaluation.swe-bench-lite.v1",
+        profileId: "evaluation/swe-bench-lite.v1",
+        stageStates: [
+          {
+            stageId: "stage:understand",
+            status: "succeeded",
+            attempts: 1,
+            inputRefs: [],
+            outputRefs: ["ref:workflow-understand-evidence"],
+            diagnostics: []
+          },
+          {
+            stageId: "stage:verify",
+            status: "ready",
+            attempts: options.verifyAttempts ?? 0,
+            inputRefs: ["ref:workflow-understand-evidence"],
+            outputRefs: [],
+            diagnostics: []
+          }
+        ],
+        refs: [],
+        events: [],
+        compatibility: { schemaVersion: "1.0.0", minReaderVersion: "1.0.0" },
+        redaction: { class: "internal", fields: ["stageStates.diagnostics", "refs.preview"] }
+      },
+      redaction: { class: "internal" }
+    }
+  };
+}
+
+function profileWorkflowPolicyWithProduceRunState(): NonNullable<PromptAssemblyInput["profilePolicy"]> {
+  return {
+    ...profileWorkflowPolicy(),
+    workflowStages: [
+      {
+        id: "understand",
+        objective: "Collect repository evidence.",
+        capabilityIds: ["core.file.read", "core.search.text"],
+        entryCriteria: ["workspace ready"],
+        exitCriteria: ["repository evidence collected"]
+      },
+      {
+        id: "change",
+        objective: "Apply a source change.",
+        capabilityIds: ["core.file.read", "core.search.text", "core.file.edit", "core.patch.apply"],
+        entryCriteria: ["repository evidence collected"],
+        exitCriteria: ["mutation-grade source change produced"]
+      },
+      {
+        id: "verify",
+        objective: "Verify patch evidence.",
+        capabilityIds: ["core.test.run", "core.git.diff"],
+        entryCriteria: ["patch ready"],
+        exitCriteria: ["test evidence collected", "diff reviewed"]
+      }
+    ],
+    stagedTaskWorkflow: {
+      schemaVersion: "1.0.0",
+      profileId: "evaluation/swe-bench-lite.v1",
+      graphId: "workflow/evaluation.swe-bench-lite.v1",
+      fingerprint: "workflow:test-produce",
+      stageCount: 3,
+      refCount: 3,
+      executorKinds: ["agent-loop"],
+      graph: {
+        schemaVersion: "1.0.0",
+        graphId: "workflow/evaluation.swe-bench-lite.v1",
+        profileId: "evaluation/swe-bench-lite.v1",
+        stages: [
+          {
+            schemaVersion: "1.0.0",
+            stageId: "stage:understand",
+            kind: "collect-evidence",
+            executorKind: "agent-loop",
+            dependsOn: [],
+            inputRefs: [],
+            expectedOutputRefs: ["ref:workflow-understand-evidence"],
+            allowedTools: ["core.file.read", "core.search.text"],
+            compatibility: { schemaVersion: "1.0.0", minReaderVersion: "1.0.0" },
+            redaction: { class: "internal" }
+          },
+          {
+            schemaVersion: "1.0.0",
+            stageId: "stage:change",
+            kind: "produce",
+            executorKind: "agent-loop",
+            dependsOn: ["stage:understand"],
+            inputRefs: ["ref:workflow-understand-evidence"],
+            expectedOutputRefs: ["ref:workflow-source-change"],
+            allowedTools: ["core.file.read", "core.search.text", "core.file.edit", "core.patch.apply"],
+            compatibility: { schemaVersion: "1.0.0", minReaderVersion: "1.0.0" },
+            redaction: { class: "internal" }
+          },
+          {
+            schemaVersion: "1.0.0",
+            stageId: "stage:verify",
+            kind: "verify",
+            executorKind: "agent-loop",
+            dependsOn: ["stage:change"],
+            inputRefs: ["ref:workflow-source-change"],
+            expectedOutputRefs: ["ref:workflow-verify-evidence"],
+            allowedTools: ["core.test.run", "core.git.diff"],
+            compatibility: { schemaVersion: "1.0.0", minReaderVersion: "1.0.0" },
+            redaction: { class: "internal" }
+          }
+        ],
+        refs: [],
+        compatibility: { schemaVersion: "1.0.0", minReaderVersion: "1.0.0" },
+        redaction: { class: "internal" }
+      },
+      runState: {
+        schemaVersion: "1.0.0",
+        taskRunId: "staged:workflow:produce",
+        graphId: "workflow/evaluation.swe-bench-lite.v1",
+        profileId: "evaluation/swe-bench-lite.v1",
+        stageStates: [
+          {
+            stageId: "stage:understand",
+            status: "succeeded",
+            attempts: 1,
+            inputRefs: [],
+            outputRefs: ["ref:workflow-understand-evidence"],
+            diagnostics: []
+          },
+          {
+            stageId: "stage:change",
+            status: "ready",
+            attempts: 0,
+            inputRefs: ["ref:workflow-understand-evidence"],
+            outputRefs: [],
+            diagnostics: []
+          },
+          {
+            stageId: "stage:verify",
+            status: "pending",
+            attempts: 0,
+            inputRefs: ["ref:workflow-source-change"],
+            outputRefs: [],
+            diagnostics: []
+          }
+        ],
+        refs: [],
+        events: [],
+        compatibility: { schemaVersion: "1.0.0", minReaderVersion: "1.0.0" },
+        redaction: { class: "internal", fields: ["stageStates.diagnostics", "refs.preview"] }
+      },
+      redaction: { class: "internal" }
+    }
+  };
+}
+
+function pipelineManifest(options: { readonly sessionId?: string; readonly turnId?: string } = {}): ContextPipelineManifest {
+  const sessionId = asId<"session">(options.sessionId ?? "session-prompt-assembly");
+  const turnId = asId<"turn">(options.turnId ?? "turn-prompt-assembly");
+  const dynamicCurrentTurn = options.sessionId !== undefined || options.turnId !== undefined;
+  const currentBlockId = dynamicCurrentTurn ? `context-block:current-turn:${sessionId}:${turnId}` : "block-current";
+  const currentLayerHash = dynamicCurrentTurn ? `layer-current-${sessionId}` : "layer-current";
+  const currentPrefixHash = dynamicCurrentTurn ? `prefix-current-${sessionId}-${turnId}` : "prefix-current";
   return {
     schemaVersion: CONTEXT_PIPELINE_SCHEMA_VERSION,
     manifestId: "context-pipeline:manifest-test",
@@ -460,20 +1026,20 @@ function pipelineManifest(): ContextPipelineManifest {
       { id: "kernel", order: 0, blockIds: ["block-kernel"], blockHashes: ["hash-kernel"], layerHash: "layer-kernel", prefixHash: "prefix-kernel", estimatedTokens: 2 },
       { id: "project", order: 1, blockIds: ["block-project"], blockHashes: ["hash-project"], layerHash: "layer-project", prefixHash: "prefix-project", estimatedTokens: 2 },
       { id: "session", order: 2, blockIds: ["block-session"], blockHashes: ["hash-session"], layerHash: "layer-session", prefixHash: "prefix-session", estimatedTokens: 2 },
-      { id: "current-turn", order: 3, blockIds: ["block-current"], blockHashes: ["hash-current"], layerHash: "layer-current", prefixHash: "prefix-current", estimatedTokens: 3 }
+      { id: "current-turn", order: 3, blockIds: [currentBlockId], blockHashes: [`hash-${currentBlockId}`], layerHash: currentLayerHash, prefixHash: currentPrefixHash, estimatedTokens: 3 }
     ],
     blocks: [
       pipelineBlock("block-kernel", "kernel", 0, "Kernel block"),
       pipelineBlock("block-project", "project", 1, "Project block"),
       pipelineBlock("block-session", "session", 2, "Session block"),
-      pipelineBlock("block-current", "current-turn", 3, "Current turn block")
+      pipelineBlock(currentBlockId, "current-turn", 3, "Current turn block")
     ],
     excludedBlocks: [],
     prefixHashes: [
       { schemaVersion: CONTEXT_PIPELINE_SCHEMA_VERSION, id: "prefix:kernel", layer: "kernel", order: 0, blockIds: ["block-kernel"], blockHashes: ["hash-kernel"], layerHash: "layer-kernel", prefixHash: "prefix-kernel", estimatedTokens: 2, redaction: { class: "internal" }, compatibility: { schemaVersion: CONTEXT_PIPELINE_SCHEMA_VERSION } },
       { schemaVersion: CONTEXT_PIPELINE_SCHEMA_VERSION, id: "prefix:project", layer: "project", order: 1, blockIds: ["block-project"], blockHashes: ["hash-project"], layerHash: "layer-project", prefixHash: "prefix-project", estimatedTokens: 2, redaction: { class: "internal" }, compatibility: { schemaVersion: CONTEXT_PIPELINE_SCHEMA_VERSION } },
       { schemaVersion: CONTEXT_PIPELINE_SCHEMA_VERSION, id: "prefix:session", layer: "session", order: 2, blockIds: ["block-session"], blockHashes: ["hash-session"], layerHash: "layer-session", prefixHash: "prefix-session", estimatedTokens: 2, redaction: { class: "internal" }, compatibility: { schemaVersion: CONTEXT_PIPELINE_SCHEMA_VERSION } },
-      { schemaVersion: CONTEXT_PIPELINE_SCHEMA_VERSION, id: "prefix:current-turn", layer: "current-turn", order: 3, blockIds: ["block-current"], blockHashes: ["hash-current"], layerHash: "layer-current", prefixHash: "prefix-current", estimatedTokens: 3, redaction: { class: "internal" }, compatibility: { schemaVersion: CONTEXT_PIPELINE_SCHEMA_VERSION } }
+      { schemaVersion: CONTEXT_PIPELINE_SCHEMA_VERSION, id: "prefix:current-turn", layer: "current-turn", order: 3, blockIds: [currentBlockId], blockHashes: [`hash-${currentBlockId}`], layerHash: currentLayerHash, prefixHash: currentPrefixHash, estimatedTokens: 3, redaction: { class: "internal" }, compatibility: { schemaVersion: CONTEXT_PIPELINE_SCHEMA_VERSION } }
     ],
     tokenTotals: { selectedTokens: 9, excludedTokens: 0, hardLimitTokens: 128 },
     cacheHintSummary: { stable: 3, ephemeral: 1, noStore: 0, ttlBound: 0 },
@@ -596,7 +1162,9 @@ function selfRepairOutcome(): SelfRepairOutcomeSummary {
   };
 }
 
-function agentPhasePlan(): AgentPhasePlan {
+function agentPhasePlan(options: { readonly planId?: string; readonly sessionId?: string; readonly turnId?: string } = {}): AgentPhasePlan {
+  const sessionId = asId<"session">(options.sessionId ?? "session-prompt-assembly");
+  const turnId = asId<"turn">(options.turnId ?? "turn-prompt-assembly");
   const budget: AgentLoopBudget = {
     schemaVersion: AGENT_MODE_SCHEMA_VERSION,
     kind: "verification",
@@ -610,9 +1178,9 @@ function agentPhasePlan(): AgentPhasePlan {
   };
   return {
     schemaVersion: AGENT_MODE_SCHEMA_VERSION,
-    planId: "agent-phase-plan:test",
-    sessionId: asId<"session">("session-prompt-assembly"),
-    turnId: asId<"turn">("turn-prompt-assembly"),
+    planId: options.planId ?? "agent-phase-plan:test",
+    sessionId,
+    turnId,
     interactionMode: "headless",
     agentMode: "coordinator",
     phases: [
@@ -685,10 +1253,10 @@ function reasoningMapping(): AgentReasoningEffortMapping {
   };
 }
 
-function evidenceFirstContext(): EvidenceFirstRuntimeContext {
+function evidenceFirstContext(options: { readonly classificationId?: string; readonly planId?: string; readonly summaryId?: string } = {}): EvidenceFirstRuntimeContext {
   const classification: EvidenceTaskClassification = {
     schemaVersion: EVIDENCE_FIRST_SCHEMA_VERSION,
-    classificationId: "evidence-classification:test",
+    classificationId: options.classificationId ?? "evidence-classification:test",
     sensitivity: "fact-sensitive" as const,
     intents: ["product", "generated-artifact"] as const,
     factClasses: ["package", "command", "product-copy"] as const,
@@ -700,7 +1268,7 @@ function evidenceFirstContext(): EvidenceFirstRuntimeContext {
   };
   const plan: NonNullable<EvidenceFirstRuntimeContext["plan"]> = {
     schemaVersion: EVIDENCE_FIRST_SCHEMA_VERSION,
-    planId: "evidence-plan:test",
+    planId: options.planId ?? "evidence-plan:test",
     classificationId: classification.classificationId,
     requiredFactClasses: classification.factClasses,
     candidateSourceGroups: [{
@@ -750,7 +1318,7 @@ function evidenceFirstContext(): EvidenceFirstRuntimeContext {
     sourceCoverage: [coverage],
     summary: {
       schemaVersion: EVIDENCE_FIRST_SCHEMA_VERSION,
-      summaryId: "evidence-summary:test",
+      summaryId: options.summaryId ?? "evidence-summary:test",
       classification,
       plan,
       manifestStatus: "missing",

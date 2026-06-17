@@ -10,8 +10,12 @@ export type ToolIntentRepairKind =
   | "provider-arguments-unwrapped"
   | "provider-tool-alias-normalized"
   | "semantic-platform-operation"
+  | "swe-bench-run-execution-normalized"
+  | "swe-bench-task-range-normalized"
   | "workspace-cwd-defaulted"
-  | "workspace-root-defaulted";
+  | "workspace-root-defaulted"
+  | "workspace-tool-timeout-defaulted"
+  | "workspace-tool-timeout-normalized";
 
 export interface ToolIntent extends JsonObject {
   readonly toolCallId?: string;

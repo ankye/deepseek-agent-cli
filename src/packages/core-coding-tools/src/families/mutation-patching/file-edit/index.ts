@@ -36,6 +36,11 @@ async function editFileTool(input: JsonObject, context: CapabilityExecutionConte
     return failure("file.edit", diagnostic.code, diagnostic.message, [path.value.path], { transaction });
   }
   const after = before.replace(parsed.expected, parsed.replacement);
+  if (after === before) {
+    const diagnostic = diag("EDIT_NOOP", "Replacement would leave the file unchanged.");
+    const transaction = editTransaction(context, path.value.path, "exact-match", before, before, false, [diagnostic]);
+    return failure("file.edit", diagnostic.code, diagnostic.message, [path.value.path], { transaction });
+  }
   await deps.platform.writeFile(path.value.path, after);
   const transaction = editTransaction(context, path.value.path, "exact-match", before, after, true, []);
   const workspaceTransaction = await deps.workspaceState.transact(toWorkspaceTransaction(transaction, before));

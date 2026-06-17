@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createProjectionRequest, InMemoryContextEngine } from "@deepseek/context-engine";
-import { asId } from "@deepseek/platform-contracts";
+import { asId, CONTEXT_PROJECTION_SCHEMA_VERSION } from "@deepseek/platform-contracts";
 
 describe("context projection matrix", () => {
   it("covers empty, large, secret, stale-cache, hard-budget, and degraded-memory scenarios", async () => {
@@ -28,7 +28,25 @@ describe("context projection matrix", () => {
 
     const cacheEngine = new InMemoryContextEngine();
     const sessionId = asId<"session">("session-projection-stale-cache");
-    const request = createProjectionRequest({ sessionId, prompt: "stale cache", hardLimitTokens: 10 });
+    const request = {
+      ...createProjectionRequest({ sessionId, prompt: "stale cache", hardLimitTokens: 10 }),
+      candidateNodes: [{
+        schemaVersion: CONTEXT_PROJECTION_SCHEMA_VERSION,
+        id: asId<"contextNode">("ctx-cache-matrix-stable"),
+        kind: "file" as const,
+        source: "workspace" as const,
+        lifecycle: "session" as const,
+        scope: { sessionId },
+        priority: 100,
+        content: "stable matrix context",
+        estimatedTokens: 3,
+        redaction: { class: "internal" as const },
+        provenance: { source: "matrix" },
+        dependencyFingerprints: ["matrix:stable-context"],
+        compatibility: { schemaVersion: CONTEXT_PROJECTION_SCHEMA_VERSION },
+        createdAt: "1970-01-01T00:00:00.000Z"
+      }]
+    };
     const first = await cacheEngine.projectGraph(request);
     const second = await cacheEngine.projectGraph(request);
     assert.equal(first.cache.hit, false);

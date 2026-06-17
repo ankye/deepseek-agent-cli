@@ -120,8 +120,9 @@ export class InProcessRuntimeKernel implements RuntimeKernel {
     await this.recordEvent(workflowOpened);
     yield workflowOpened;
 
+    const effectiveTimeoutMs = request.timeoutMs ?? binding.manifest.timeoutMs ?? 30_000;
     const envelope = buildExecutionEnvelope({
-      request,
+      request: { ...request, timeoutMs: effectiveTimeoutMs },
       manifest: binding.manifest,
       sessionId,
       workflowId: String(workflow.workflowId),
@@ -129,7 +130,7 @@ export class InProcessRuntimeKernel implements RuntimeKernel {
       invocationId,
       trace,
       createdAt: this.deps.clock.now().toISOString(),
-      platformContext: await this.platformExecutionContext(binding.manifest.sideEffect, request.timeoutMs ?? 30_000, request.input)
+      platformContext: await this.platformExecutionContext(binding.manifest.sideEffect, effectiveTimeoutMs, request.input)
     });
     const validationErrors = validateExecutionEnvelope(envelope);
     const envelopeEvent = this.event("execution.envelope.created", sessionId, trace, { envelope }, request.agentId, workflow.taskId);

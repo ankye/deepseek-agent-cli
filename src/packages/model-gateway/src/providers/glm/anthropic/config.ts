@@ -9,7 +9,12 @@ export const glmAnthropicProviderConfig: ModelProviderConfig = {
   provider: "glm",
   protocol: "anthropic-messages",
   baseUrl: "https://open.bigmodel.cn/api/anthropic",
-  credentialRef: glmAnthropicCredentialRef
+  credentialRef: glmAnthropicCredentialRef,
+  cacheHints: {
+    explicitPrefixCacheHints: true,
+    supportedPolicies: ["stable", "ephemeral"],
+    maxCacheHintBlocks: 4
+  }
 };
 
 export const defaultGlmAnthropicProfile: ModelProfile = {

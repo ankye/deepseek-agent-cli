@@ -41,6 +41,7 @@ import type { ProjectionCacheInput } from "@deepseek/memory-cache-management";
 import { createSecretRedactionDecision, redactSecretText } from "@deepseek/policy-sandbox";
 
 export const CONTEXT_PROJECTION_CACHE_NAMESPACE = PROJECTION_CACHE_NAMESPACE;
+const CONTEXT_PROJECTION_NO_STORE_CACHE_KEY = asId<"cacheKey">(`${CONTEXT_PROJECTION_CACHE_NAMESPACE}:no-store`);
 
 export interface InMemoryContextEngineOptions {
   readonly cache?: CacheManager;
@@ -96,104 +97,23 @@ export class InMemoryContextEngine implements ContextEngine {
 
     const baseCandidates = this.candidatesFor(request);
     const candidates = await this.enrichCandidates(request, baseCandidates);
-    const cacheInput = buildProjectionCacheInput(request, candidates);
-    const cacheKey = projectionCacheKey(cacheInput);
-    if (this.cache) {
+    const cacheCandidates = projectionCacheCandidates(candidates);
+    const cacheInput = cacheCandidates.length > 0 ? buildProjectionCacheInput(request, cacheCandidates) : undefined;
+    const cacheKey = cacheInput ? projectionCacheKey(cacheInput) : CONTEXT_PROJECTION_NO_STORE_CACHE_KEY;
+    if (cacheInput && this.cache) {
       const cached = await this.cache.get<ContextProjectionResult>(cacheKey);
       if (cached) {
-        return freezeProjection({
-          ...cached.value,
-          cache: {
-            ...cached.value.cache,
-            hit: true
-          },
-          replayFingerprint: `${cached.value.replayFingerprint}:cache-hit`
-        });
+        return buildProjectionResult(request, candidates, cacheCandidates, cacheKey, true);
       }
-    } else {
+    } else if (cacheInput) {
       const local = this.projectionCache.get(cacheKey);
       if (local) {
-        return freezeProjection({
-          ...local,
-          cache: {
-            ...local.cache,
-            hit: true
-          },
-          replayFingerprint: `${local.replayFingerprint}:cache-hit`
-        });
+        return buildProjectionResult(request, candidates, cacheCandidates, cacheKey, true);
       }
     }
 
-    const filtered = filterCandidates(request, candidates);
-    const ordered = filtered.eligible.sort(compareNodes);
-    const selected: ProjectedContextNode[] = [];
-    const excluded: ExcludedContextNode[] = [...filtered.excluded];
-    let selectedTokens = 0;
-    let excludedTokens = excluded.reduce((total, node) => total + node.estimatedTokens, 0);
-    const hardLimit = Math.max(0, request.budget.hardLimitTokens);
-    const softLimit = request.budget.softLimitTokens;
-
-    for (const node of ordered) {
-      const estimatedTokens = estimateNodeTokens(node);
-      if (selectedTokens + estimatedTokens > hardLimit) {
-        excluded.push(excludedNode(node, "budget-exceeded", estimatedTokens));
-        excludedTokens += estimatedTokens;
-        continue;
-      }
-      selected.push(projectedNode(node, estimatedTokens));
-      selectedTokens += estimatedTokens;
-    }
-
-    const budget = budgetDecision(request, selectedTokens, excludedTokens);
-    const rejectedByBudget = selected.length === 0 && candidates.length > 0 && excluded.some((node) => node.reason === "budget-exceeded");
-    const status = rejectedByBudget ? "rejected" : budget.status === "degraded" || excluded.length > 0 ? "degraded" : "completed";
-    const redaction = redactionSummary(selected, excluded, filtered.secretLikeBlocked);
-    const cache: ContextProjectionCacheMetadata = {
-      namespace: CONTEXT_PROJECTION_CACHE_NAMESPACE,
-      key: cacheKey,
-      hit: false,
-      dependencyFingerprints: dependencyFingerprints(candidates)
-    };
-    const result: ContextProjectionResult = {
-      schemaVersion: CONTEXT_PROJECTION_SCHEMA_VERSION,
-      status,
-      sessionId: request.sessionId,
-      ...(request.turnId ? { turnId: request.turnId } : {}),
-      prompt: selected.map((node) => node.content).join("\n"),
-      selectedNodes: selected,
-      excludedNodes: excluded,
-      estimatedTokens: selectedTokens,
-      budget: rejectedByBudget ? { ...budget, status: "rejected", reason: "hard-budget-exceeded" } : budget,
-      redaction,
-      cache,
-      ordering: {
-        strategy: "priority-recency-stable",
-        tieBreak: ["priority", "createdAt", "id"]
-      },
-      ...(request.pipeline?.enabled ? { pipeline: deriveContextPipelineManifest({
-        schemaVersion: CONTEXT_PROJECTION_SCHEMA_VERSION,
-        status,
-        sessionId: request.sessionId,
-        ...(request.turnId ? { turnId: request.turnId } : {}),
-        prompt: selected.map((node) => node.content).join("\n"),
-        selectedNodes: selected,
-        excludedNodes: excluded,
-        estimatedTokens: selectedTokens,
-        budget: rejectedByBudget ? { ...budget, status: "rejected", reason: "hard-budget-exceeded" } : budget,
-        redaction,
-        cache,
-        ordering: {
-          strategy: "priority-recency-stable",
-          tieBreak: ["priority", "createdAt", "id"]
-        },
-        replayFingerprint: replayFingerprint(request, selected, excluded),
-        ...(rejectedByBudget ? { error: projectionError("CONTEXT_PROJECTION_BUDGET_EXCEEDED", "Context projection exceeded hard budget") } : {})
-      }) } : {}),
-      replayFingerprint: replayFingerprint(request, selected, excluded),
-      ...(rejectedByBudget ? { error: projectionError("CONTEXT_PROJECTION_BUDGET_EXCEEDED", "Context projection exceeded hard budget") } : {})
-    };
-    const frozen = freezeProjection(result);
-    if (frozen.status !== "rejected") {
+    const frozen = buildProjectionResult(request, candidates, cacheCandidates, cacheKey, false);
+    if (frozen.status !== "rejected" && cacheInput) {
       if (this.cache) {
         await this.cache.set(createProjectionCacheEntry(cacheInput, frozen, new Date(0).toISOString()));
       } else {
@@ -943,6 +863,68 @@ function redactionSummary(selected: readonly ProjectedContextNode[], excluded: r
   };
 }
 
+function buildProjectionResult(
+  request: ContextProjectionRequest,
+  candidates: readonly ContextGraphNode[],
+  cacheCandidates: readonly ContextGraphNode[],
+  cacheKey: string,
+  cacheHit: boolean
+): ContextProjectionResult {
+  const filtered = filterCandidates(request, candidates);
+  const ordered = filtered.eligible.sort(compareNodes);
+  const selected: ProjectedContextNode[] = [];
+  const excluded: ExcludedContextNode[] = [...filtered.excluded];
+  let selectedTokens = 0;
+  let excludedTokens = excluded.reduce((total, node) => total + node.estimatedTokens, 0);
+  const hardLimit = Math.max(0, request.budget.hardLimitTokens);
+
+  for (const node of ordered) {
+    const estimatedTokens = estimateNodeTokens(node);
+    if (selectedTokens + estimatedTokens > hardLimit) {
+      excluded.push(excludedNode(node, "budget-exceeded", estimatedTokens));
+      excludedTokens += estimatedTokens;
+      continue;
+    }
+    selected.push(projectedNode(node, estimatedTokens));
+    selectedTokens += estimatedTokens;
+  }
+
+  const budget = budgetDecision(request, selectedTokens, excludedTokens);
+  const rejectedByBudget = selected.length === 0 && candidates.length > 0 && excluded.some((node) => node.reason === "budget-exceeded");
+  const status = rejectedByBudget ? "rejected" : budget.status === "degraded" || excluded.length > 0 ? "degraded" : "completed";
+  const redaction = redactionSummary(selected, excluded, filtered.secretLikeBlocked);
+  const cache: ContextProjectionCacheMetadata = {
+    namespace: CONTEXT_PROJECTION_CACHE_NAMESPACE,
+    key: cacheKey,
+    hit: cacheHit,
+    dependencyFingerprints: dependencyFingerprints(cacheCandidates)
+  };
+  const prompt = selected.map((node) => node.content).join("\n");
+  const resultBase: ContextProjectionResult = {
+    schemaVersion: CONTEXT_PROJECTION_SCHEMA_VERSION,
+    status,
+    sessionId: request.sessionId,
+    ...(request.turnId ? { turnId: request.turnId } : {}),
+    prompt,
+    selectedNodes: selected,
+    excludedNodes: excluded,
+    estimatedTokens: selectedTokens,
+    budget: rejectedByBudget ? { ...budget, status: "rejected", reason: "hard-budget-exceeded" } : budget,
+    redaction,
+    cache,
+    ordering: {
+      strategy: "priority-recency-stable",
+      tieBreak: ["priority", "createdAt", "id"]
+    },
+    replayFingerprint: replayFingerprint(request, selected, excluded) + (cacheHit ? ":cache-hit" : ""),
+    ...(rejectedByBudget ? { error: projectionError("CONTEXT_PROJECTION_BUDGET_EXCEEDED", "Context projection exceeded hard budget") } : {})
+  };
+  return freezeProjection({
+    ...resultBase,
+    ...(request.pipeline?.enabled ? { pipeline: deriveContextPipelineManifest(resultBase) } : {})
+  });
+}
+
 function rejectedProjection(request: ContextProjectionRequest, reason: ContextNodeExclusionReason, message: string): ContextProjectionResult {
   return freezeProjection({
     schemaVersion: CONTEXT_PROJECTION_SCHEMA_VERSION,
@@ -1013,13 +995,22 @@ function dependencyFingerprints(nodes: readonly ContextGraphNode[]): readonly st
   return [...new Set(nodes.flatMap((node) => node.dependencyFingerprints))].sort();
 }
 
+function projectionCacheCandidates(candidates: readonly ContextGraphNode[]): readonly ContextGraphNode[] {
+  return candidates.filter((node) => !isCurrentPromptNode(node));
+}
+
+function isCurrentPromptNode(node: ContextGraphNode): boolean {
+  return node.kind === "user"
+    && node.source === "user"
+    && String(node.id).startsWith("context-current-")
+    && node.dependencyFingerprints.some((fingerprint) => fingerprint.startsWith("prompt:"));
+}
+
 function buildProjectionCacheInput(request: ContextProjectionRequest, candidates: readonly ContextGraphNode[]): ProjectionCacheInput {
   const requestFingerprint = stableHash(JSON.stringify({
     schemaVersion: request.schemaVersion,
     sessionId: request.sessionId,
-    turnId: request.turnId ?? "",
     purpose: request.purpose,
-    prompt: request.prompt,
     budget: request.budget,
     scope: request.scope,
     candidates: candidates.map((node) => ({

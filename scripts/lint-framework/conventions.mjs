@@ -289,7 +289,9 @@ export const lintConventions = {
       "src/packages/model-gateway/src/index.ts",
       "src/packages/context-engine/src/index.ts",
       "src/packages/policy-sandbox/src/index.ts",
-      "src/packages/runtime/src/agent-loop.ts"
+      "src/packages/runtime/src/agent-loop.ts",
+      "src/apps/cli/src/diagnostics/swe-bench-prediction.ts",
+      "src/apps/cli/src/host/swe-bench-run-capabilities.ts"
     ])
   },
   architectureDrift: {

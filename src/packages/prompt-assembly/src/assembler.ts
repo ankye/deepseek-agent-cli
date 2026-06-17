@@ -1,6 +1,7 @@
 import type {
   AgentLoopToolProjection,
   CapabilityManifest,
+  ContextPipelineManifest,
   JsonObject,
   ModelChatMessage,
   PromptAssembler,
@@ -23,7 +24,8 @@ import type {
 } from "@deepseek/platform-contracts";
 import { PROMPT_ASSEMBLY_SCHEMA_VERSION } from "@deepseek/platform-contracts";
 import { defaultPromptSectionProviders } from "./providers.js";
-import { stableHash } from "./sections.js";
+import { estimateTokens, stableHash } from "./sections.js";
+import { isCapabilityVisibleForProjection } from "./tool-projection.js";
 
 export type PromptSectionProvider = (input: PromptAssemblyInput) => readonly PromptSection[] | Promise<readonly PromptSection[]>;
 
@@ -72,7 +74,7 @@ export class DefaultPromptAssembler implements PromptAssembler {
     const rawSections = await collectProviderSections(input, this.providers, diagnostics);
     const ordered = orderSections(rawSections);
     const budgeted = applyBudget(ordered, input, this.previewChars);
-    const messages = weaveMessages(budgeted.included, input.history);
+    const messages = weaveMessages(budgeted.included, input.history, input.prompt);
     const toolPlan = projectTools(input.availableTools, input.toolPolicy);
     const promptText = messages.map((message) => `${message.role}: ${message.content}`).join("\n");
     const registryFingerprint = stableHash(this.providers.map((provider) => providerFingerprint(provider)).join("|"));
@@ -85,6 +87,9 @@ export class DefaultPromptAssembler implements PromptAssembler {
       toolPlan,
       messages
     });
+    const pipeline = input.contextPipelineManifest
+      ? promptPipelineEvidence(input.contextPipelineManifest, messages)
+      : undefined;
     const trace = {
       schemaVersion: PROMPT_ASSEMBLY_SCHEMA_VERSION,
       stageOrder: STAGES,
@@ -93,7 +98,7 @@ export class DefaultPromptAssembler implements PromptAssembler {
       projectRules: input.projectRules ?? [],
       diagnostics,
       replay,
-      ...(input.contextPipelineManifest ? { pipeline: promptPipelineEvidence(input.contextPipelineManifest) } : {}),
+      ...(pipeline ? { pipeline } : {}),
       redaction: { class: "internal", fields: ["sections.preview", "diagnostics.details"] },
       compatibility: { schemaVersion: PROMPT_ASSEMBLY_SCHEMA_VERSION }
     } as const;
@@ -263,14 +268,71 @@ function applyBudget(
   };
 }
 
-function weaveMessages(sections: readonly PromptSection[], history: readonly ModelChatMessage[]): readonly ModelChatMessage[] {
+function weaveMessages(sections: readonly PromptSection[], history: readonly ModelChatMessage[], prompt: string): readonly ModelChatMessage[] {
   const messages: ModelChatMessage[] = [];
-  for (const section of sections) {
+  for (const section of orderedSystemSectionsForProviderPrefix(sections)) {
     if (section.role === "user") continue;
-    messages.push({ role: section.role, content: section.content });
+    messages.push({
+      role: section.role,
+      content: section.content,
+      cacheHint: cacheHintForSection(section)
+    });
   }
-  messages.push(...history);
+  messages.push(...historyWithStableTaskPrompt(history, prompt));
   return messages;
+}
+
+function historyWithStableTaskPrompt(history: readonly ModelChatMessage[], prompt: string): readonly ModelChatMessage[] {
+  let marked = false;
+  return history.map((message) => {
+    if (marked || message.role !== "user" || message.content !== prompt || message.cacheHint) return message;
+    marked = true;
+    return {
+      ...message,
+      cacheHint: { policy: "stable", freshness: "turn" }
+    };
+  });
+}
+
+function orderedSystemSectionsForProviderPrefix(sections: readonly PromptSection[]): readonly PromptSection[] {
+  const stableSystem: PromptSection[] = [];
+  const volatileSystem: PromptSection[] = [];
+  for (const section of sections) {
+    if (section.role !== "system") {
+      volatileSystem.push(section);
+      continue;
+    }
+    if (isStablePrefixSection(section)) stableSystem.push(section);
+    else volatileSystem.push(section);
+  }
+  return [...stableSystem, ...volatileSystem];
+}
+
+function cacheHintForSection(section: PromptSection): NonNullable<ModelChatMessage["cacheHint"]> {
+  return {
+    policy: isStablePrefixSection(section) ? "stable" : "ephemeral",
+    freshness: isStablePrefixSection(section) ? "static" : "turn"
+  };
+}
+
+function isStablePrefixSection(section: PromptSection): boolean {
+  if (section.source === "self-repair") return false;
+  if (section.providerId === "core.profile-workflow-state") return false;
+  if (section.providerId === "core.project-instructions") {
+    return section.source === "project"
+      && section.kind === "project.instructions";
+  }
+  if (section.providerId === "core.task-decision-request") {
+    return section.kind === "task.decision-request"
+      && section.trust === "system";
+  }
+  return section.role === "system"
+    && (section.trust === "system" || section.trust === "trusted" || section.trust === "workspace")
+    && (
+      section.source === "runtime" ||
+      section.source === "capability-registry" ||
+      section.source === "context-engine"
+    );
 }
 
 function projectTools(tools: readonly CapabilityManifest[], policy: AgentLoopToolProjection): PromptToolPlan {
@@ -278,7 +340,7 @@ function projectTools(tools: readonly CapabilityManifest[], policy: AgentLoopToo
   const excludedTools: JsonObject[] = [];
   for (const tool of tools) {
     const schema = modelToolSchema(tool);
-    if (isToolVisible(tool, policy)) {
+    if (isCapabilityVisibleForProjection(tool, policy)) {
       visibleTools.push(schema);
     } else {
       excludedTools.push({
@@ -296,13 +358,6 @@ function projectTools(tools: readonly CapabilityManifest[], policy: AgentLoopToo
     excludedTools,
     redaction: { class: "internal", fields: ["visibleTools.function.parameters", "excludedTools"] }
   };
-}
-
-function isToolVisible(tool: CapabilityManifest, policy: AgentLoopToolProjection): boolean {
-  if (policy === "none") return false;
-  if (policy === "all") return true;
-  if (policy === "read-write") return tool.sideEffect === "none" || tool.sideEffect === "read" || tool.sideEffect === "write";
-  return tool.sideEffect === "none" || tool.sideEffect === "read";
 }
 
 function modelToolSchema(manifest: CapabilityManifest): JsonObject {
@@ -348,6 +403,7 @@ function sectionTrace(
     evidenceFingerprint: section.evidenceFingerprint,
     included,
     ...(exclusionReason ? { exclusionReason } : {}),
+    provenance: section.provenance,
     preview: preview(section.content, previewChars),
     redaction: { class: "internal", fields: ["preview"] },
     compatibility: section.compatibility
@@ -421,16 +477,62 @@ function createReplayEvidence(input: {
   };
 }
 
-function promptPipelineEvidence(manifest: NonNullable<PromptAssemblyInput["contextPipelineManifest"]>): PromptAssemblyPipelineEvidence {
+function promptPipelineEvidence(manifest: ContextPipelineManifest, messages: readonly ModelChatMessage[]): PromptAssemblyPipelineEvidence {
+  const providerPrefix = providerStablePrefixEvidence(messages);
   return {
     schemaVersion: PROMPT_ASSEMBLY_SCHEMA_VERSION,
-    pipelineFingerprint: manifest.pipelineFingerprint,
+    pipelineFingerprint: providerPrefix.providerPrefixFingerprint
+      ? `pipeline:${stableHash(JSON.stringify({
+          context: manifest.pipelineFingerprint,
+          providerPrefix: providerPrefix.providerPrefixFingerprint
+        }))}`
+      : manifest.pipelineFingerprint,
     layerPrefixHashes: manifest.prefixHashes.map((entry) => `${entry.layer}:${entry.prefixHash}`),
     includedBlockIds: manifest.blocks.map((block) => block.id),
     excludedBlockIds: manifest.excludedBlocks.map((block) => block.id),
-    cacheHintSummary: manifest.cacheHintSummary,
-    redaction: { class: "internal", fields: ["layerPrefixHashes", "includedBlockIds", "excludedBlockIds"] }
+    contextCacheHintSummary: manifest.cacheHintSummary,
+    ...providerPrefix,
+    cacheHintSummary: providerPrefix.providerPrefixCacheHintSummary ?? manifest.cacheHintSummary,
+    redaction: { class: "internal", fields: ["layerPrefixHashes", "includedBlockIds", "excludedBlockIds", "providerPrefixFingerprint"] }
   };
+}
+
+function providerStablePrefixEvidence(messages: readonly ModelChatMessage[]): {
+  readonly providerPrefixFingerprint?: string;
+  readonly providerPrefixMessageCount: number;
+  readonly providerPrefixTokenEstimate: number;
+  readonly providerPrefixCacheHintSummary: JsonObject;
+} {
+  const prefix: ModelChatMessage[] = [];
+  for (const message of messages) {
+    if (!isProviderStablePrefixMessage(message)) break;
+    prefix.push(message);
+  }
+  return {
+    ...(prefix.length > 0
+      ? {
+          providerPrefixFingerprint: `provider-prefix:${stableHash(JSON.stringify(prefix.map((message) => ({
+            role: message.role,
+            content: message.content,
+            policy: message.cacheHint?.policy,
+            freshness: message.cacheHint?.freshness
+          }))))}`
+        }
+      : {}),
+    providerPrefixMessageCount: prefix.length,
+    providerPrefixTokenEstimate: prefix.reduce((total, message) => total + estimateTokens(message.content), 0),
+    providerPrefixCacheHintSummary: {
+      stable: prefix.length,
+      ephemeral: 0,
+      noStore: 0,
+      ttlBound: 0
+    }
+  };
+}
+
+function isProviderStablePrefixMessage(message: ModelChatMessage): boolean {
+  return (message.role === "system" || message.role === "user")
+    && message.cacheHint?.policy === "stable";
 }
 
 function firstReplayDrift(

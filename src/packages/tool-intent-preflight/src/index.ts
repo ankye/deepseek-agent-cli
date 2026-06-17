@@ -9,11 +9,12 @@ import type {
   ToolIntentProviderProfile,
   ToolIntentRepairAction
 } from "@deepseek/platform-contracts";
-import { asId } from "@deepseek/platform-contracts";
+import { MAX_EXECUTION_TIMEOUT_MS, asId } from "@deepseek/platform-contracts";
 
 const defaultPathFields = ["path", "file", "filePath", "target", "cwd"];
 const deepSeekProviderId = asId<"modelProvider">("provider-deepseek");
-const workspaceExecutionTools = new Set(["core.shell.run", "core.test.run"]);
+const workspaceExecutionTools = new Set(["core.shell.run", "core.test.run", "core.repl.execute", "core.package.manager", "core.env.prepare", "core.swe.bench.run"]);
+const maxAutoRepairedSweBenchRangeSize = 300;
 
 export const deepSeekToolIntentProfile: ToolIntentProviderProfile = {
   providerId: deepSeekProviderId,
@@ -37,6 +38,10 @@ export const deepSeekToolIntentProfile: ToolIntentProviderProfile = {
     core_shell_run: "core.shell.run",
     shell_run: "core.shell.run",
     run_shell: "core.shell.run",
+    core_repl_execute: "core.repl.execute",
+    repl_execute: "core.repl.execute",
+    core_package_manager: "core.package.manager",
+    package_manager: "core.package.manager",
     core_shell_output: "core.shell.output",
     shell_output: "core.shell.output",
     core_shell_kill: "core.shell.kill",
@@ -113,6 +118,30 @@ export class DeterministicToolIntentPreflight implements ToolIntentPreflightServ
       if (workspaceRoot !== request.workspaceRoot) {
         repairedInput.workspaceRoot = request.workspaceRoot;
         repairs.push(repair("workspace-root-defaulted", "workspaceRoot", typeof workspaceRoot === "string" ? workspaceRoot : "", request.workspaceRoot));
+      }
+    }
+    if (String(capabilityId) === "core.swe.bench.run") {
+      const timeoutMs = repairedInput.timeoutMs;
+      if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs)) {
+        repairedInput.timeoutMs = MAX_EXECUTION_TIMEOUT_MS;
+        repairs.push(repair("workspace-tool-timeout-defaulted", "timeoutMs", typeof timeoutMs === "number" ? String(timeoutMs) : "", String(MAX_EXECUTION_TIMEOUT_MS)));
+      } else if (timeoutMs !== MAX_EXECUTION_TIMEOUT_MS) {
+        repairedInput.timeoutMs = MAX_EXECUTION_TIMEOUT_MS;
+        repairs.push(repair("workspace-tool-timeout-normalized", "timeoutMs", String(timeoutMs), String(MAX_EXECUTION_TIMEOUT_MS)));
+      }
+      const userPrompt = stringFromJsonObject(request.providerHints, "userPrompt");
+      if (shouldNormalizeSweBenchRunExecutionIntent(userPrompt, repairedInput)) {
+        repairedInput.dryRun = false;
+        repairedInput.execute = true;
+        repairs.push(repair("swe-bench-run-execution-normalized", "dryRun", "true", "false"));
+        repairs.push(repair("swe-bench-run-execution-normalized", "execute", String(preparedIntent.input.execute ?? ""), "true"));
+      }
+      const range = sweBenchTaskRangeFromPrompt(userPrompt);
+      const taskNumber = numberFromUnknown(repairedInput.taskNumber);
+      if (range && taskNumber === range.start && !Array.isArray(repairedInput.taskNumbers)) {
+        const taskNumbers = rangeNumbers(range.start, range.end);
+        repairedInput.taskNumbers = taskNumbers;
+        repairs.push(repair("swe-bench-task-range-normalized", "taskNumbers", String(taskNumber), taskNumbers.join(",")));
       }
     }
 
@@ -303,6 +332,44 @@ function repair(kind: ToolIntentRepairAction["kind"], field: string, before: str
 function stringFromJsonObject(value: JsonObject | undefined, key: string): string | undefined {
   const found = value?.[key];
   return typeof found === "string" ? found : undefined;
+}
+
+function numberFromUnknown(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
+function shouldNormalizeSweBenchRunExecutionIntent(prompt: string | undefined, input: Record<string, unknown>): boolean {
+  if (input.dryRun !== true) return false;
+  if (input.resumeOnly === true) return false;
+  if (!prompt || !/swe[- ]?bench\s+lite/i.test(prompt)) return false;
+  if (/\b(?:dry\s*-?\s*run|dryrun)\b/i.test(prompt)) return false;
+  if (/(?:只|仅)?(?:预览|演练|试算)|不要执行|不执行|别执行|无需执行|review[- ]?only|resume[- ]?only/i.test(prompt)) return false;
+  return /(?:完成|跑通|运行|执行|测试|修复|canary|run|complete|execute|solve|test)/i.test(prompt);
+}
+
+function sweBenchTaskRangeFromPrompt(prompt: string | undefined): { readonly start: number; readonly end: number } | undefined {
+  if (!prompt || !/swe[- ]?bench\s+lite/i.test(prompt)) return undefined;
+  const normalized = prompt.replace(/[０-９]/g, (char) => String(char.charCodeAt(0) - 0xff10));
+  const patterns = [
+    /第\s*(\d{1,3})\s*(?:到|至|-|~)\s*第?\s*(\d{1,3})\s*(?:题|个|项|task|tasks|instance|instances)?/i,
+    /\b(?:task|tasks|instance|instances)\s*(\d{1,3})\s*(?:to|-|~)\s*(\d{1,3})\b/i
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(normalized);
+    if (!match) continue;
+    const start = Number(match[1]);
+    const end = Number(match[2]);
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start <= 0 || end < start) continue;
+    if (end - start + 1 > maxAutoRepairedSweBenchRangeSize) continue;
+    return { start, end };
+  }
+  return undefined;
+}
+
+function rangeNumbers(start: number, end: number): readonly number[] {
+  const values: number[] = [];
+  for (let value = start; value <= end; value += 1) values.push(value);
+  return values;
 }
 
 function providerSafeToolName(value: string): string {

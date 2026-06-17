@@ -54,6 +54,7 @@ export async function assemblePromptForIteration(
     ...(contextProjection ? { contextProjection } : {}),
     ...(contextProjection?.pipeline ? { contextPipelineManifest: contextProjection.pipeline } : {}),
     ...(mode?.taskDecision ? { taskDecision: mode.taskDecision } : {}),
+    ...(request.profilePolicy ? { profilePolicy: request.profilePolicy } : {}),
     ...(evidenceFirst ? { evidenceFirst } : {}),
     ...(selfRepair ? { selfRepair } : {}),
     ...(request.projectRules ? { projectRules: request.projectRules } : {}),

@@ -1,0 +1,180 @@
+# Tasks
+
+- [x] Create the OpenSpec governance change for the SWE-bench 200 resolved ramp.
+- [x] Add bilingual design notes for gates, failure taxonomy, cache governance, repair feedback, and anti-tailoring.
+- [x] Add specification scenarios for below-threshold ramp blocking and previous-failure review.
+- [x] Add specification scenarios for generic failure reason taxonomy and model-feedback last classification.
+- [x] Add specification scenarios for problem-statement reproduction synthesis and high-fidelity official harness repair excerpts.
+- [x] Add specification scenarios for cache metric separation, no-store context projection accounting, and provider prefix drift review.
+- [x] Add specification scenarios forbidding repo/instance/task allowlists in production SWE-bench behavior.
+- [x] Validate this OpenSpec change with `npx openspec validate 2026-06-09-govern-swebench-200-ramp --strict`.
+- [x] Validate canonical specs with `npx openspec validate --specs --strict`.
+- [x] Align model-owned failure attribution with `MODEL_PATCH_INSUFFICIENT_AFTER_GOVERNED_REPAIR` so model feedback remains the last governed classification.
+- [x] Separate the 80% official success gate from the 90% provider cache gate in governed batch backpressure.
+- [x] Attribute pending tasks paused by governed backpressure with `BATCH_PENDING_GOVERNANCE_BACKPRESSURE`.
+- [x] Fix GLM Anthropic provider default cache hint capability so context-pipeline requests send provider-native prefix cache hints instead of reporting `unsupported`.
+- [x] Fix GLM Anthropic provider request shaping so cache hints preserve stable system prefix boundaries and add a bounded message-tail breakpoint for growing conversation history.
+- [x] Use the stable user task prompt as the single Anthropic-compatible provider-native cache breakpoint when it is cacheable, with system/tool/history-tail breakpoints reserved for fallback shapes.
+- [x] Normalize Anthropic-compatible provider usage so cache creation/write tokens are counted in provider cache miss/write evidence instead of being dropped from the hit-rate denominator.
+- [x] Add provider-prefix coverage diagnostics so stable-but-small prefixes are reported as `CACHE_PROVIDER_PREFIX_COVERAGE_LOW` rather than hidden behind generic tool-schema cache gaps.
+- [x] Reject no-op exact file edits and count SWE-bench source mutation progress only from successful material tool results.
+- [x] Remove stale post-edit verification-missing attribution after later model-authored standard test evidence satisfies the gate.
+- [x] Normalize duplicate interpreter execution flags in governed shell/test commands so malformed `python -c -c` style invocations do not become false verification or model-capability failures.
+- [x] Record successful SWE-bench test evidence separately from test intents and return ready-for-harness after verified patches instead of letting post-verification probes become primary environment failures.
+- [x] Recover missing single-task summaries from preserved trace/prediction artifacts without rerunning solving work.
+- [x] Persist single-task progress ledgers so interrupted runs can be reviewed and resumed from durable phase evidence.
+- [x] Replace stale cache-shape diagnostics during resume-only trace refresh instead of preserving outdated primary reasons.
+- [x] Bind successful local-test evidence to actual test command intents so non-test shell probes cannot satisfy verification.
+- [x] Normalize visible tool schema count trace fields so provider tool-schema cache gaps stay diagnosable across trace versions.
+- [x] Add a user-level SWE-bench routing gate so numbered task prompts cannot spend repeated outer-loop read/search/memory calls before invoking `core.swe.bench.run`.
+- [x] Promote live user-level SWE-bench numbered task prompts to a tool projection that exposes the governed `core.swe.bench.run` capability unless the user explicitly overrides projection.
+- [x] Classify low provider cache with effective stable hit-token evidence as `CACHE_PROVIDER_DYNAMIC_TAIL_MISS` instead of misattributing it to unstable prompt prefix.
+- [x] Suppress actionable whole-prompt churn attribution when stable-prefix low-cache evidence is already explained by dynamic history-tail diagnostics.
+- [x] Restore newest lossless context nodes first on session resume so recent tool/test feedback is not evicted by older restored history.
+- [x] Add governed checkout alias normalization scenarios so generic `/home/user`-style execution conventions resolve to the active run root without task-specific tailoring.
+- [x] Add Python test setup failure attribution scenarios so missing checkout-local dependencies map to environment-fix before model blame.
+- [x] Add repo-local Python runner hints when an external Python test launcher/framework is missing but a checkout runner such as `tests/runtests.py` is present.
+- [x] Constrain managed SWE-bench provider-facing history to the latest dynamic tool-feedback pair and compact large tool feedback while preserving full lossless evidence.
+- [x] Preserve official `empty_patch_ids` and historical empty prediction artifacts as `PREDICTION_EMPTY_PATCH` while retaining provider cache and request-budget evidence.
+- [x] Limit GLM Anthropic message-level cache breakpoints to the stable task prompt when it is cacheable, while preserving a bounded history-tail breakpoint when no stable user prompt is cacheable.
+- [x] Keep the stable user task-prompt breakpoint even when volatile workflow/system state sits outside the stable provider prefix.
+- [x] Surface message cache-control placement telemetry and aggregate low-hit first/middle/last message breakpoint counts in cache diagnostics.
+- [x] Surface provider cache breakpoint-shape telemetry and classify low-cache requests with multiple message-level breakpoints as `CACHE_PROVIDER_MULTI_MESSAGE_BREAKPOINT`.
+- [x] Split provider request replay total message count from selected dynamic history count so bounded-history telemetry does not overstate dynamic provider tails.
+- [x] Classify low-cache historical traces that lack breakpoint-shape telemetry as `CACHE_PROVIDER_BREAKPOINT_SHAPE_TELEMETRY_MISSING` instead of inferring request shape from incomplete evidence.
+- [x] Classify low-cache historical traces with no context-pipeline telemetry as `CACHE_PROVIDER_PIPELINE_TELEMETRY_ABSENT` instead of treating them as proof of a current provider pipeline failure.
+- [x] Suppress current-remediation history-tail and post-gate-unbounded history diagnostics when low-cache traces lack context-pipeline telemetry.
+- [x] Add a low-cost verification ladder to the governed SWE-bench child prompt so focused tests run before broad suites and focused passes return control to the supervisor harness.
+- [x] Drop recovered Python setup blockers from refreshed child-trace attribution after later model-authored standard test success.
+- [x] Remove stale Python setup diagnostics from persisted resume-only summaries before merging recomputed child-trace diagnostics.
+- [x] Share standard-test command classification across runtime gates, core tool feedback, and child-trace diagnostics instead of keeping divergent local regexes.
+- [x] Add cross-platform shell payload normalization for POSIX/WSL shells, PowerShell, cmd, and Windows-style paths before standard-test classification.
+- [x] Keep batch resume-only task states aligned with child evaluation results while marking reused evidence with `resumedFromSummary`.
+- [x] Represent the SWE-bench CLI profile as a structured workflow role over generic governed capabilities rather than a prompt-string privilege switch.
+- [x] Surface selected CLI profile workflow metadata in runtime model-request and provider-request evidence for trace review.
+- [x] Surface selected CLI profile workflow as stable model-visible orchestration guidance before phase-plan details.
+- [x] Add ordered lightweight profile workflow stages with objectives, generic capability ids, entry criteria, and exit criteria.
+- [x] Surface ordered profile workflow stages in stable prompt guidance and section trace provenance.
+- [x] Distinguish preferred, model-visible, projection-limited, and unregistered workflow capabilities in model-visible orchestration guidance.
+- [x] Keep workflow orchestration as lightweight contract data rather than adding benchmark-specific workflow class hierarchies.
+- [x] Compile CLI profile workflow metadata into a replayable staged-task snapshot with graph/ref/dependency/executor/run-state evidence.
+- [x] Advance staged-task run state from successful governed tool evidence and emit replayable workflow step events.
+- [x] Require completion-grade evidence before a staged-task stage advances so read-only tools cannot complete source-change stages.
+- [x] Surface dynamic staged-task run state outside the stable provider prefix so orchestration progress does not bust provider cache reuse.
+- [x] Split user-level SWE-bench evaluation profile orchestration from managed child source-edit workflow so the outer loop dispatches through `core.swe.bench.run` before repository work.
+- [x] When missing Python test launcher evidence includes structured repo-local alternate runner evidence, select verification-command work as the primary reason while preserving missing-dependency supporting evidence.
+- [x] Route missing test-launcher alternate-runner evidence through a runtime workflow gate before allowing environment-blocker termination.
+- [x] Suppress conflicting dependency-install suggested commands from model-visible missing test-launcher feedback when a repo-local alternate runner is available.
+- [x] Enforce the repo-local runner workflow gate for both shell retries and first-class test tool retries.
+- [x] Reclassify legacy traces that had source mutation and successful tests but missed ready-for-harness return ahead of generic request-budget attribution.
+- [x] Enrich legacy resume-only missing test-launcher traces from run-scoped repo-local runner files without repo/task/instance tailoring.
+- [x] Expose structured ramp-blocked next actions and single-canary candidate task numbers in batch backpressure diagnostics.
+- [x] Block direct single-task expansion calls when the latest relevant batch backpressure evidence lists the task in `blockedExpansionTaskNumbers`.
+- [x] Filter non-cache review codes from resolved child summaries when aggregating batch-level review evidence.
+- [x] Keep request-budget blocker attribution active when successful-test-count telemetry is absent and no ready-for-harness terminal reason is present.
+- [x] Allow only one supplemental focused same-file read after the source-inspection gate and reject repeated or additional focused windows.
+- [x] Reject repeated recently completed source-inspection signatures before the source-inspection budget is spent.
+- [x] Reject bounded same-path source read windows whose content is mostly covered by a very recent completed window before the source-inspection budget is spent.
+- [x] After duplicate source-inspection evidence is rejected, reject further read-location exploration until edit, test, or bounded blocker progress exists.
+- [x] Terminate repeated source-inspection gate defiance with a stable classification before the generic request budget is exhausted.
+- [x] Keep one recent successful source-inspection tool pair visible in bounded provider history after source-inspection gate or duplicate-evidence rejection so the child can reuse evidence instead of rereading it.
+- [x] Treat dynamic workflow state outside the stable provider prefix as non-drift in cache diagnostics when provider-prefix evidence remains stable.
+- [x] Surface a deterministic stable task-intent contract between profile selection and dynamic workflow state.
+- [x] Add ready-stage primary next-action guidance so produce/repair stages stop treating read/search/list-only exploration as completion progress.
+- [x] Normalize accidental model-supplied `dryRun: true` away from live SWE-bench completion prompts while preserving explicit dry-run, preview, review-only, and resume-only requests.
+- [x] Start implementation only after the above specification tasks are complete; each production change must begin with a failing regression test.
+- [x] Revalidate this OpenSpec change after the summary recovery, progress ledger, stale cache refresh, and test-evidence binding scenarios.
+- [x] Revalidate canonical specs after the same update.
+- [x] Revalidate this OpenSpec change and canonical specs after checkout alias and Python test setup attribution scenarios.
+- [x] Revalidate runtime and cache diagnostics after provider-facing dynamic-tail compaction.
+- [ ] Before any task 11/12 or larger batch run, verify latest governed evidence has `success >= 80%` and `providerCache.hitRate >= 90%`.
+
+# 任务
+
+- [x] 创建 SWE-bench 200 resolved 放量 OpenSpec 治理 change。
+- [x] 增加关于门槛、失败分类、缓存治理、repair feedback 与反定制规则的双语 design notes。
+- [x] 增加低于门槛时阻止放量与历史失败复盘的规范场景。
+- [x] 增加通用失败 reason taxonomy 与 model-feedback 最后分类的规范场景。
+- [x] 增加 problem-statement 复现综合与高保真 official harness repair excerpt 的规范场景。
+- [x] 增加 cache 指标分离、no-store context projection 计数与 provider prefix drift 复盘的规范场景。
+- [x] 增加禁止生产 SWE-bench 行为使用 repo/instance/task allowlist 的规范场景。
+- [x] 使用 `npx openspec validate 2026-06-09-govern-swebench-200-ramp --strict` 校验本 OpenSpec change。
+- [x] 使用 `npx openspec validate --specs --strict` 校验 canonical specs。
+- [x] 将模型侧失败归因统一为 `MODEL_PATCH_INSUFFICIENT_AFTER_GOVERNED_REPAIR`，确保 model feedback 仍是最后治理分类。
+- [x] 在治理 batch backpressure 中分离 80% official success 门槛与 90% provider cache 门槛。
+- [x] 将被治理 backpressure 暂停的 pending 任务归因为 `BATCH_PENDING_GOVERNANCE_BACKPRESSURE`。
+- [x] 修复 GLM Anthropic provider 默认 cache hint capability，使 context-pipeline request 发送 provider-native prefix cache hint，而不是报告 `unsupported`。
+- [x] 修复 GLM Anthropic provider request shape，使 cache hint 保留稳定 system prefix 边界，并为增长中的 conversation history 添加有界 message-tail breakpoint。
+- [x] 当稳定 user task prompt 可缓存时，将其作为 Anthropic-compatible provider-native 的单一 cache breakpoint；system/tool/history-tail breakpoint 只保留给 fallback 形态。
+- [x] 规范化 Anthropic-compatible provider usage，使 cache creation/write tokens 被计入 provider cache miss/write 证据，而不是从命中率分母中丢失。
+- [x] 增加 provider-prefix 覆盖率诊断，使稳定但覆盖不足的 prefix 被报告为 `CACHE_PROVIDER_PREFIX_COVERAGE_LOW`，而不是隐藏在泛化的 tool-schema cache gap 之后。
+- [x] 拒绝 no-op exact file edit，并且只从成功产生实际变更的工具结果统计 SWE-bench source mutation progress。
+- [x] 后续模型发起的标准测试证据满足 post-edit gate 后，移除过期的 verification-missing 归因。
+- [x] 规范化治理 shell/test command 中重复的解释器执行开关，避免畸形 `python -c -c` 调用变成虚假的 verification 或模型能力失败。
+- [x] 将 SWE-bench 测试成功证据与测试 intent 分开记录，并在 patch 已验证后返回 ready-for-harness，避免后验证探测被归为主要环境失败。
+- [x] 在不重新解题的前提下，从保留的 trace/prediction 产物恢复缺失的单题 summary。
+- [x] 持久化单题 progress ledger，使中断 run 能从持久阶段证据中复盘和恢复。
+- [x] 在 resume-only trace refresh 中替换过期 cache-shape 诊断，而不是保留旧 primary reason。
+- [x] 将成功本地测试证据绑定到真实测试命令 intent，避免非测试 shell probe 满足 verification。
+- [x] 规范化 visible tool schema count trace 字段，使 provider tool-schema cache gap 在不同 trace 版本中仍可诊断。
+- [x] 增加用户级 SWE-bench routing gate，避免编号题目 prompt 在调用 `core.swe.bench.run` 前反复消耗外层 read/search/memory 调用。
+- [x] 对 live 用户级 SWE-bench 编号任务 prompt，在用户没有显式覆盖 projection 时，提升到能暴露受管 `core.swe.bench.run` capability 的 tool projection。
+- [x] 将带有有效稳定 hit-token 证据的低 provider cache 分类为 `CACHE_PROVIDER_DYNAMIC_TAIL_MISS`，避免误归因为 prompt prefix 不稳定。
+- [x] 当稳定 prefix 的低缓存证据已由动态 history-tail diagnostics 解释时，压制可执行 whole-prompt churn 归因。
+- [x] session resume 时优先恢复最新 lossless context nodes，避免较新的工具/测试反馈被旧恢复历史挤掉。
+- [x] 增加治理 checkout alias normalization 场景，使通用 `/home/user` 类执行约定解析到当前活动 run root，而不做题目定制。
+- [x] 增加 Python test setup failure 归因场景，使缺失 checkout-local 依赖先映射为 environment-fix，再考虑模型归因。
+- [x] 当外部 Python test launcher/framework 缺失但 checkout 中存在 `tests/runtests.py` 等 repo-local runner 时，增加本地 runner 替代提示。
+- [x] 将受管 SWE-bench 的 provider-facing history 收敛到最新动态工具反馈 pair，并压缩大工具反馈，同时保留完整 lossless evidence。
+- [x] 将 official `empty_patch_ids` 与历史空 prediction 产物保留为 `PREDICTION_EMPTY_PATCH`，同时保留 provider cache 与 request-budget 证据。
+- [x] 当稳定任务 prompt 可缓存时，将 GLM Anthropic message-level cache breakpoint 限制在稳定任务 prompt；当没有可缓存稳定 user prompt 时，仍保留有界 history-tail breakpoint。
+- [x] 即使稳定 provider prefix 之外存在易变 workflow/system state，也保持稳定 user 任务 prompt 的 message-level cache breakpoint。
+- [x] 暴露 message cache-control 位置 telemetry，并在 cache diagnostics 中聚合低命中请求的 first/middle/last message breakpoint 计数。
+- [x] 暴露 provider cache breakpoint-shape 遥测，并将多 message-level breakpoint 下的低缓存请求归类为 `CACHE_PROVIDER_MULTI_MESSAGE_BREAKPOINT`。
+- [x] 拆分 provider request replay 的总 message count 与选入动态 history count，避免有界 history telemetry 夸大动态 provider tail。
+- [x] 将缺少 breakpoint-shape 遥测的低缓存历史 trace 归类为 `CACHE_PROVIDER_BREAKPOINT_SHAPE_TELEMETRY_MISSING`，避免基于不完整证据推断 request shape。
+- [x] 将完全没有 context-pipeline telemetry 的低缓存历史 trace 归类为 `CACHE_PROVIDER_PIPELINE_TELEMETRY_ABSENT`，避免把它当成当前 provider pipeline 仍然失败的证据。
+- [x] 当低缓存 trace 缺少 context-pipeline telemetry 时，压制需要当前修复的 history-tail 与 post-gate-unbounded history 诊断。
+- [x] 给治理 SWE-bench child prompt 增加低成本验证阶梯，使 focused test 先于 broad suite，且 focused pass 后把控制权交回 supervisor harness。
+- [x] 在后续模型发起的标准测试成功后，从刷新后的 child-trace 归因中移除已恢复的 Python setup blocker。
+- [x] 在合并重新计算的 child-trace diagnostics 前，从 resume-only 持久 summary 中移除过期 Python setup diagnostics。
+- [x] 在 runtime gate、core tool feedback 与 child-trace diagnostics 之间共享标准测试命令分类器，避免保留分叉的本地 regex。
+- [x] 在标准测试分类前，为 POSIX/WSL shell、PowerShell、cmd 与 Windows 风格路径增加跨平台 shell payload 规范化。
+- [x] 保持 batch resume-only 的任务状态与 child 评测结果一致，并用 `resumedFromSummary` 标记复用旧证据。
+- [x] 将 SWE-bench CLI profile 表示为结构化 workflow role，编排通用受管 capability，而不是 prompt 字符串触发的特权开关。
+- [x] 在 runtime model-request 与 provider-request evidence 中暴露所选 CLI profile 的 workflow metadata，供 trace 复盘。
+- [x] 在 phase-plan 细节之前，将所选 CLI profile workflow 作为稳定且模型可见的编排指导暴露出来。
+- [x] 增加有序的轻量 profile workflow stages，包含 objective、通用 capability ids、entry criteria 与 exit criteria。
+- [x] 在 stable prompt guidance 与 section trace provenance 中暴露有序 profile workflow stages。
+- [x] 在模型可见的编排指导中区分 preferred、model-visible、projection-limited 与 unregistered workflow capabilities。
+- [x] 将 workflow 编排保持为轻量 contract data，而不是增加 benchmark-specific workflow class hierarchy。
+- [x] 将 CLI profile workflow metadata 编译成可 replay 的 staged-task snapshot，包含 graph/ref/dependency/executor/run-state 证据。
+- [x] 从成功的受管工具证据推进 staged-task run state，并发出可 replay 的 workflow step events。
+- [x] 要求 staged-task stage 在推进前具备 completion-grade evidence，避免只读工具完成源码变更阶段。
+- [x] 在稳定 provider prefix 之外暴露动态 staged-task run state，避免编排进展破坏 provider cache 复用。
+- [x] 拆分用户级 SWE-bench evaluation profile 编排与 managed child 源码编辑工作流，使外层 loop 在仓库工作之前先通过 `core.swe.bench.run` 派发。
+- [x] 当缺失 Python test launcher 且存在 repo-local alternate runner 结构化证据时，将 primary reason 调整为 verification-command work，同时保留缺失依赖辅助证据。
+- [x] 将 missing test-launcher alternate-runner 证据通过 runtime workflow gate 路由，再允许 environment-blocker 终止。
+- [x] 当 repo-local alternate runner 可用时，从模型可见的 missing test-launcher feedback 中压制冲突的依赖安装 suggested command。
+- [x] 对 shell 重试与一等测试工具重试都执行 repo-local runner workflow gate。
+- [x] 在 resume-only 中从 run-scoped repo-local runner 文件补全旧 missing test-launcher trace 证据，且不使用 repo/task/instance 定制。
+- [x] 在 batch backpressure diagnostics 中暴露结构化 ramp-blocked next actions 与单题 canary candidate task numbers。
+- [x] 当最新相关 batch backpressure evidence 将任务列入 `blockedExpansionTaskNumbers` 时，阻止直接单题扩批调用。
+- [x] 聚合 batch-level review evidence 时，从已 resolved child summary 中过滤非 cache review code。
+- [x] 当 successful-test-count telemetry 缺失且没有 ready-for-harness terminal reason 时，保持 request-budget blocker 归因生效。
+- [x] 在 source-inspection gate 之后只允许一次补充同文件有界 focused read，并拒绝重复或额外的 focused 窗口。
+- [x] 在 source-inspection 预算耗尽前拒绝最近已完成 source-inspection signature 的重复请求。
+- [x] 在 source-inspection 预算耗尽前拒绝内容主要已被最近完成同路径有界窗口覆盖的源码读取窗口。
+- [x] 在重复 source-inspection 证据被拒绝后，继续拒绝后续读定位探索，直到出现编辑、测试或有界 blocker 进展。
+- [x] 在重复违抗 source-inspection gate 时，先于泛化请求预算耗尽用稳定分类终止。
+- [x] 在 source-inspection gate 或 duplicate-evidence rejection 后，在有界 provider history 中保留一组最近成功的 source-inspection 工具 pair，让 child 能复用证据而不是重新读取。
+- [x] 当 provider-prefix evidence 保持稳定时，将稳定前缀之外的动态 workflow state 视为非 drift cache 证据。
+- [x] 在 profile selection 与动态 workflow state 之间暴露确定性的稳定 task-intent contract。
+- [x] 增加 ready-stage 主下一步提示，避免 produce/repair 阶段继续把 read/search/list-only exploration 当作完成进展。
+- [x] 对 live SWE-bench 完成类 prompt，规范化模型误传的 `dryRun: true`，同时保留用户明确要求的 dry-run、预览、review-only 与 resume-only 行为。
+- [x] 只有上述规范任务完成后才开始实现；每个生产改动都必须先写失败回归测试。
+- [x] 在 summary recovery、progress ledger、stale cache refresh 与 test-evidence binding 场景更新后，重新校验本 OpenSpec change。
+- [x] 在同一更新后，重新校验 canonical specs。
+- [x] 在 checkout alias 与 Python test setup 归因场景更新后，重新校验本 OpenSpec change 与 canonical specs。
+- [x] 在 provider-facing dynamic-tail 压缩后，重新校验 runtime 与 cache diagnostics。
+- [ ] 运行第 11/12 题或更大批次前，确认最新治理证据满足 `success >= 80%` 且 `providerCache.hitRate >= 90%`。

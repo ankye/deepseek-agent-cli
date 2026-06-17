@@ -1,4 +1,4 @@
-import type { JsonObject, ModelProviderRequest, ModelRequest } from "@deepseek/platform-contracts";
+import type { JsonObject, JsonValue, ModelChatMessage, ModelProviderConfig, ModelProviderRequest, ModelRequest } from "@deepseek/platform-contracts";
 import { formatAnthropicToolChoice, isJsonObject, numberValue, stringValue } from "../../../shared/common.js";
 import { glmAnthropicProviderConfig } from "./config.js";
 
@@ -7,6 +7,8 @@ export function buildGlmAnthropicProviderRequest(request: ModelRequest, credenti
   const maxTokens = numberValue(providerOptions.max_tokens) ?? numberValue(providerOptions.maxTokens) ?? 1024;
   const { max_tokens: _maxTokensSnake, maxTokens: _maxTokensCamel, ...passthroughProviderOptions } = providerOptions;
   const effectiveTimeoutMs = request.timeoutMs ?? timeoutMs;
+  const system = glmAnthropicSystemFrom(request, config);
+  const tools = glmAnthropicToolsFrom(request, config);
   return {
     url: `${config.baseUrl.replace(/\/$/, "")}/v1/messages`,
     method: "POST",
@@ -18,11 +20,11 @@ export function buildGlmAnthropicProviderRequest(request: ModelRequest, credenti
     },
     body: {
       model: request.profile.model,
-      messages: glmAnthropicMessagesFrom(request),
+      messages: glmAnthropicMessagesFrom(request, config),
       stream: true,
       ...(request.profile.temperature !== undefined ? { temperature: request.profile.temperature } : {}),
-      ...(glmAnthropicSystemFrom(request) ? { system: glmAnthropicSystemFrom(request) } : {}),
-      ...(request.tools && request.tools.length > 0 ? { tools: request.tools.map(glmAnthropicToolFrom).filter((tool): tool is JsonObject => Boolean(tool)) } : {}),
+      ...(system ? { system } : {}),
+      ...(tools.length > 0 ? { tools } : {}),
       ...(request.toolChoice !== undefined ? { tool_choice: formatAnthropicToolChoice(request.toolChoice) } : {}),
       ...passthroughProviderOptions,
       max_tokens: maxTokens
@@ -31,21 +33,48 @@ export function buildGlmAnthropicProviderRequest(request: ModelRequest, credenti
   };
 }
 
-function glmAnthropicSystemFrom(request: ModelRequest): string | undefined {
+function glmAnthropicSystemFrom(request: ModelRequest, config: ModelProviderConfig): JsonValue | undefined {
   const messages = request.messages ?? [];
-  const system = messages
+  const systemMessages = messages
     .filter((message) => message.role === "system")
-    .map((message) => message.content.trim())
-    .filter((content) => content.length > 0)
-    .join("\n\n");
-  return system.length > 0 ? system : undefined;
+    .map((message) => ({ message, text: message.content.trim() }))
+    .filter((entry) => entry.text.length > 0);
+  if (systemMessages.length === 0) return undefined;
+  if (!supportsExplicitPrefixHints(request, config)) return systemMessages.map((entry) => entry.text).join("\n\n");
+
+  const systemBlocks: JsonObject[] = systemMessages.map((entry) => ({
+    type: "text",
+    text: entry.text
+  }));
+  const breakpoint = cacheableProviderPrefixBreakpoint(request.messages ?? []);
+  if (breakpoint?.role === "system") {
+    const cacheIndex = systemMessages.findIndex((entry) => entry.message === breakpoint.message);
+    if (cacheIndex >= 0) {
+      systemBlocks[cacheIndex] = {
+        ...systemBlocks[cacheIndex]!,
+        cache_control: anthropicEphemeralCacheControl()
+      };
+    }
+  } else if (breakpoint?.role !== "user") {
+    const cacheIndex = lastCacheableSystemPrefixIndex(systemMessages.map((entry) => entry.message));
+    if (cacheIndex >= 0) {
+      systemBlocks[cacheIndex] = {
+        ...systemBlocks[cacheIndex]!,
+        cache_control: anthropicEphemeralCacheControl()
+      };
+    }
+  }
+  return systemBlocks;
 }
 
-function glmAnthropicMessagesFrom(request: ModelRequest): readonly JsonObject[] {
+function glmAnthropicMessagesFrom(request: ModelRequest, config: ModelProviderConfig): readonly JsonObject[] {
   const sourceMessages = request.messages && request.messages.length > 0
     ? request.messages
     : [{ role: "user" as const, content: request.prompt }];
   const messages: JsonObject[] = [];
+  const breakpoint = supportsExplicitPrefixHints(request, config)
+    ? cacheableProviderPrefixBreakpoint(sourceMessages)
+    : undefined;
   for (const message of sourceMessages) {
     if (message.role === "system") continue;
     if (message.role === "tool") {
@@ -71,14 +100,53 @@ function glmAnthropicMessagesFrom(request: ModelRequest): readonly JsonObject[] 
       continue;
     }
     if (message.role === "user" || message.role === "assistant") {
-      messages.push({
+      const providerMessage: JsonObject = {
         role: message.role,
         content: message.content
-      });
+      };
+      if (message === breakpoint?.message) {
+        messages.push(withMessageCacheBreakpoint(providerMessage));
+      } else {
+        messages.push(providerMessage);
+      }
     }
   }
-  if (messages.length === 0) return [{ role: "user", content: request.prompt }];
-  return messages;
+  const providerMessages = messages.length === 0 ? [{ role: "user", content: request.prompt }] : messages;
+  if (!supportsExplicitPrefixHints(request, config)) return providerMessages;
+  if (breakpoint?.role === "user") return providerMessages;
+  return providerMessages.length > 0
+    ? withMessageTailCacheBreakpoint(providerMessages)
+    : providerMessages;
+}
+
+function withMessageCacheBreakpoint(message: JsonObject): JsonObject {
+  const content = messageContentWithCacheBreakpoint(message.content);
+  return content ? { ...message, content } : message;
+}
+
+function cacheableProviderPrefixBreakpoint(messages: readonly ModelChatMessage[]): { readonly role: "system" | "user"; readonly message: ModelChatMessage } | undefined {
+  const stableTaskPrompt = cacheableStableTaskPrompt(messages);
+  if (stableTaskPrompt) return { role: "user", message: stableTaskPrompt };
+  let breakpoint: { readonly role: "system" | "user"; readonly message: ModelChatMessage } | undefined;
+  for (const message of messages) {
+    if (!isCacheableProviderPrefixMessage(message)) break;
+    breakpoint = { role: message.role, message };
+  }
+  return breakpoint;
+}
+
+function cacheableStableTaskPrompt(messages: readonly ModelChatMessage[]): ModelChatMessage | undefined {
+  for (const message of messages) {
+    if (message.role === "system") continue;
+    if (message.role === "user" && isCacheableSystemPrefixMessage(message)) return message;
+    return undefined;
+  }
+  return undefined;
+}
+
+function isCacheableProviderPrefixMessage(message: ModelChatMessage): message is ModelChatMessage & { readonly role: "system" | "user" } {
+  if (message.role !== "system" && message.role !== "user") return false;
+  return isCacheableSystemPrefixMessage(message);
 }
 
 function glmAnthropicToolFrom(tool: JsonObject): JsonObject | undefined {
@@ -92,4 +160,85 @@ function glmAnthropicToolFrom(tool: JsonObject): JsonObject | undefined {
     ...(typeof fn.description === "string" && fn.description.length > 0 ? { description: fn.description } : {}),
     input_schema: inputSchema
   };
+}
+
+function glmAnthropicToolsFrom(request: ModelRequest, config: ModelProviderConfig): readonly JsonObject[] {
+  const tools = request.tools?.map(glmAnthropicToolFrom).filter((tool): tool is JsonObject => Boolean(tool)) ?? [];
+  if (tools.length === 0 || !supportsExplicitPrefixHints(request, config)) return tools;
+  if (cacheableProviderPrefixBreakpoint(request.messages ?? [])?.role === "user") return tools;
+  return withToolSchemaCacheBreakpoint(tools);
+}
+
+function supportsExplicitPrefixHints(request: ModelRequest, config: ModelProviderConfig): boolean {
+  const capability = request.profile.cacheHints ?? config.cacheHints;
+  if (!capability?.explicitPrefixCacheHints) return false;
+  const pipeline = isJsonObject(request.metadata?.contextPipeline) ? request.metadata.contextPipeline : undefined;
+  if (!stringValue(pipeline?.pipelineFingerprint)) return false;
+  const cacheHintSummary = isJsonObject(pipeline?.cacheHintSummary) ? pipeline.cacheHintSummary : undefined;
+  return (numberValue(cacheHintSummary?.stable) ?? 0) > 0;
+}
+
+function withToolSchemaCacheBreakpoint(tools: readonly JsonObject[]): readonly JsonObject[] {
+  const output = tools.map((tool) => ({ ...tool }));
+  const last = output.at(-1);
+  if (!last) return output;
+  output[output.length - 1] = {
+    ...last,
+    cache_control: anthropicEphemeralCacheControl()
+  };
+  return output;
+}
+
+function lastCacheableSystemPrefixIndex(messages: readonly ModelChatMessage[]): number {
+  let lastCacheable = -1;
+  for (const [index, message] of messages.entries()) {
+    if (!isCacheableSystemPrefixMessage(message)) break;
+    lastCacheable = index;
+  }
+  return lastCacheable;
+}
+
+function isCacheableSystemPrefixMessage(message: ModelChatMessage): boolean {
+  const hint = isJsonObject(message.cacheHint) ? message.cacheHint : undefined;
+  const policy = stringValue(hint?.policy);
+  return policy === "stable";
+}
+
+function withMessageTailCacheBreakpoint(messages: readonly JsonObject[], startIndex = 0): readonly JsonObject[] {
+  const output = messages.map((message) => ({ ...message }));
+  for (let index = output.length - 1; index >= Math.max(0, startIndex); index -= 1) {
+    const message = output[index];
+    if (!message) continue;
+    const content = messageContentWithCacheBreakpoint(message.content);
+    if (!content) continue;
+    output[index] = { ...message, content };
+    return output;
+  }
+  return output;
+}
+
+function messageContentWithCacheBreakpoint(content: JsonObject["content"]): JsonValue | undefined {
+  if (typeof content === "string" && content.trim().length > 0) {
+    return [{
+      type: "text",
+      text: content,
+      cache_control: anthropicEphemeralCacheControl()
+    }];
+  }
+  if (!Array.isArray(content)) return undefined;
+  const blocks = content.map((block) => isJsonObject(block) ? { ...block } : block);
+  for (let index = blocks.length - 1; index >= 0; index -= 1) {
+    const block = blocks[index];
+    if (!isJsonObject(block) || block.type !== "text" || !stringValue(block.text)) continue;
+    blocks[index] = {
+      ...block,
+      cache_control: anthropicEphemeralCacheControl()
+    };
+    return blocks as readonly JsonValue[];
+  }
+  return undefined;
+}
+
+function anthropicEphemeralCacheControl(): JsonObject {
+  return { type: "ephemeral" };
 }

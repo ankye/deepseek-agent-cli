@@ -14,6 +14,8 @@ import {
 import { createDeterministicRuntimeDependencies } from "@deepseek/testing-regression";
 
 describe("runtime family capabilities", () => {
+  const hostAdapterOnlyFamilyIds = new Set<typeof TOOL_FAMILY_IDS[number]>(["benchmark.run"]);
+
   it("registers runtime-owned family tools as model-visible executable capabilities", async () => {
     const deps = createDeterministicRuntimeDependencies();
     await registerRuntimeCoreTools(deps, "/workspace");
@@ -46,17 +48,21 @@ describe("runtime family capabilities", () => {
     assert.equal(Boolean(await deps.capabilities.resolveExecutable(runtimeFamilyCapabilityIds.pipelineSequence)), true);
   });
 
-  it("registers at least one model-visible executable capability for every first-version family", async () => {
+  it("registers at least one model-visible executable capability for every runtime-owned first-version family", async () => {
     const deps = createDeterministicRuntimeDependencies();
     await registerRuntimeCoreTools(deps, "/workspace");
     const visible = await deps.capabilities.listModelVisible();
     const visibleFamilyIds = new Set(visible.map((manifest) => manifest.toolFamily?.familyId).filter((familyId): familyId is typeof TOOL_FAMILY_IDS[number] => typeof familyId === "string"));
+    const runtimeOwnedFamilyIds = TOOL_FAMILY_IDS.filter((familyId) => !hostAdapterOnlyFamilyIds.has(familyId));
 
-    assert.deepEqual([...visibleFamilyIds].sort(), [...TOOL_FAMILY_IDS].sort());
-    for (const familyId of TOOL_FAMILY_IDS) {
+    assert.deepEqual([...visibleFamilyIds].sort(), [...runtimeOwnedFamilyIds].sort());
+    for (const familyId of runtimeOwnedFamilyIds) {
       const manifest = visible.find((candidate) => candidate.toolFamily?.familyId === familyId);
       assert.ok(manifest, `${familyId} should be model-visible`);
       assert.equal(Boolean(await deps.capabilities.resolveExecutable(manifest.id)), true, `${familyId} should be executable`);
+    }
+    for (const familyId of hostAdapterOnlyFamilyIds) {
+      assert.equal(visibleFamilyIds.has(familyId), false, `${familyId} should be registered by a host adapter, not the runtime package`);
     }
   });
 

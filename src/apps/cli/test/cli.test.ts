@@ -11,6 +11,7 @@ import { createDefaultRuntimeKernel, registerRuntimeCoreTools } from "@deepseek/
 import { createDeterministicRuntimeDependencies } from "@deepseek/testing-regression";
 import { DurablePermanentMemoryProvider, InMemoryLosslessContextManager, InMemoryPermanentMemoryStorageAdapter } from "@deepseek/memory-cache-management";
 import { chatPageIndexPagesFromSnapshot, explainChatPageIndexRecallItem, markStalePageIndexPagesAfterWorkspaceEdits, markStalePageIndexPagesFromWorkspaceWatermark, recordChatPageIndexTurn, renderChatPageIndexRecallExplain, resolveChatPageIndexRecall } from "../src/commands/pageindex.js";
+import { boundedText, defineToolManifest, objectSchema, replay } from "@deepseek/core-coding-tools";
 import { createChatPaletteState } from "../src/commands/palette-state.js";
 import { collectCliEvaluation } from "../src/diagnostics/evaluation.js";
 import { collectDeliveryCapabilitySummary } from "../src/diagnostics/delivery-capability.js";
@@ -18,6 +19,7 @@ import { buildEvaluationDeliveryCapabilityEvidence } from "../src/diagnostics/ev
 import { renderDiagnosticsResult } from "../src/diagnostics/index.js";
 import { collectModeMatrix } from "../src/diagnostics/mode-matrix.js";
 import { refreshAcceptanceEvidence } from "../src/diagnostics/refresh-evidence.js";
+import { resolveCliAgentLoopLimits } from "../src/host/model-selection.js";
 import {
   cliUsageLines,
   isCliEntryPoint,
@@ -1025,6 +1027,146 @@ describe("cli host adapter", () => {
     assert.equal(capturedRequests[0]?.profile.model, "glm-5.1");
     assert.equal(lines.some((line) => line.includes("agent.loop.completed")), true);
     await kernel.shutdown("cli-test-live-glm-profile");
+  });
+
+  it("enables context pipeline and profile workflow metadata for SWE-bench one-shot runs", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    const capturedRequests: ModelRequest[] = [];
+    const runtimeDeps = {
+      ...deps,
+      models: new CaptureModelRequestGateway(capturedRequests)
+    };
+    await registerRuntimeCoreTools(runtimeDeps, process.cwd());
+    const kernel = await createDefaultRuntimeKernel(runtimeDeps);
+    const lines: string[] = [];
+
+    await runCli(
+      ["run", "Resolve SWE-bench instance astropy__astropy-12907.", "--output", "jsonl", "--live", "--provider", "glm", "--model", "glm-5.1"],
+      (line: string) => {
+        lines.push(line);
+      },
+      [],
+      { stdinIsTTY: false, stdoutIsTTY: false },
+      {
+        createRuntime: async () => ({ deps: runtimeDeps, kernel })
+      }
+    );
+
+    const records = lines.map((line) => JSON.parse(line) as { kind?: string; data?: { contextPipeline?: JsonObject; profilePolicy?: JsonObject } });
+    const modelRequested = records.find((record) => record.kind === "model.requested");
+    assert.equal(typeof modelRequested?.data?.contextPipeline?.pipelineFingerprint, "string");
+    assert.equal(modelRequested?.data?.profilePolicy?.profileId, "evaluation/swe-bench-lite.v1");
+    assert.equal(modelRequested?.data?.profilePolicy?.role, "evaluation-workflow");
+    assert.equal((modelRequested?.data?.profilePolicy?.loopLimits as { maxModelIterations?: number } | undefined)?.maxModelIterations, 48);
+    assert.deepEqual(modelRequested?.data?.profilePolicy?.workflowCapabilityIds, [
+      "core.swe.bench.run"
+    ]);
+    const modelRequestedStages = modelRequested?.data?.profilePolicy?.workflowStages as readonly { readonly id?: string; readonly exitCriteria?: readonly string[] }[] | undefined;
+    assert.equal(modelRequestedStages?.[0]?.id, "dispatch");
+    assert.equal(modelRequestedStages?.[0]?.exitCriteria?.includes("governed harness result or classified blocker recorded"), true);
+    const modelRequestedStagedWorkflow = modelRequested?.data?.profilePolicy?.stagedTaskWorkflow as { readonly graphId?: string; readonly fingerprint?: string; readonly graph?: { readonly stages?: readonly { readonly stageId?: string; readonly allowedTools?: readonly string[] }[] }; readonly runState?: { readonly stageStates?: readonly { readonly status?: string }[] } } | undefined;
+    assert.equal(modelRequestedStagedWorkflow?.graphId?.startsWith("graph:evaluation/swe-bench-lite.v1:"), true);
+    assert.match(modelRequestedStagedWorkflow?.fingerprint ?? "", /^fnv1a:/);
+    assert.equal(modelRequestedStagedWorkflow?.graph?.stages?.map((stage) => stage.stageId).join(","), "stage:dispatch");
+    assert.equal(modelRequestedStagedWorkflow?.graph?.stages?.[0]?.allowedTools?.includes("core.swe.bench.run"), true);
+    assert.equal(modelRequestedStagedWorkflow?.runState?.stageStates?.filter((stage) => stage.status === "ready").length, 1);
+    assert.equal(typeof capturedRequests[0]?.metadata?.contextPipeline, "object");
+    assert.equal(typeof (capturedRequests[0]?.metadata?.contextPipeline as { pipelineFingerprint?: string } | undefined)?.pipelineFingerprint, "string");
+    const providerProfilePolicy = capturedRequests[0]?.metadata?.profilePolicy as { profileId?: string; workflowCapabilityIds?: readonly string[]; workflowStages?: readonly { readonly id?: string }[]; stagedTaskWorkflow?: { readonly graphId?: string; readonly graph?: { readonly stages?: readonly { readonly stageId?: string }[] } }; loopLimits?: { maxToolCalls?: number } } | undefined;
+    assert.equal(providerProfilePolicy?.profileId, "evaluation/swe-bench-lite.v1");
+    assert.equal(providerProfilePolicy?.loopLimits?.maxToolCalls, 96);
+    assert.equal(providerProfilePolicy?.workflowCapabilityIds?.includes("core.swe.bench.run"), true);
+    assert.equal(providerProfilePolicy?.workflowStages?.map((stage) => stage.id).join(","), "dispatch");
+    assert.equal(providerProfilePolicy?.stagedTaskWorkflow?.graphId, modelRequestedStagedWorkflow?.graphId);
+    assert.equal(providerProfilePolicy?.stagedTaskWorkflow?.graph?.stages?.[0]?.stageId, "stage:dispatch");
+    const modelVisibleProfilePolicy = (capturedRequests[0]?.messages ?? [])
+      .map((message) => message.content)
+      .join("\n");
+    assert.equal(modelVisibleProfilePolicy.includes("Agent profile workflow:"), true);
+    assert.equal(modelVisibleProfilePolicy.includes("Profile id: evaluation/swe-bench-lite.v1"), true);
+    assert.equal(modelVisibleProfilePolicy.includes("Role: evaluation-workflow"), true);
+    assert.equal(modelVisibleProfilePolicy.includes("Workflow graph: workflow/evaluation.swe-bench-lite.v1"), true);
+    assert.equal(modelVisibleProfilePolicy.includes("Primary orchestration capabilities: core.swe.bench.run"), true);
+    assert.equal(modelVisibleProfilePolicy.includes("Workflow stages:"), true);
+    assert.equal(modelVisibleProfilePolicy.includes("1. dispatch: Dispatch the numbered user request to the governed SWE-bench run capability."), true);
+    await kernel.shutdown("cli-test-swe-bench-context-pipeline");
+  });
+
+  it("bounds provider-facing tool history for SWE-bench one-shot runs", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    const gateway = new SweBenchOneShotHistoryTailGateway(8);
+    const runtimeDeps = {
+      ...deps,
+      models: gateway,
+      policy: new AllowAllPolicyEngine()
+    };
+    await runtimeDeps.platform.writeFile(`${process.cwd().replace(/\\/g, "/")}/README.md`, "history tail fixture\n");
+    await registerRuntimeCoreTools(runtimeDeps, process.cwd());
+    const kernel = await createDefaultRuntimeKernel(runtimeDeps);
+    const lines: string[] = [];
+
+    await runCli(
+      ["run", "Resolve SWE-bench instance astropy__astropy-12907.", "--output", "jsonl", "--live", "--provider", "glm", "--model", "glm-5.1"],
+      (line: string) => {
+        lines.push(line);
+      },
+      [],
+      { stdinIsTTY: false, stdoutIsTTY: false },
+      {
+        createRuntime: async () => ({ deps: runtimeDeps, kernel })
+      }
+    );
+
+    const records = lines.map((line) => JSON.parse(line) as { kind?: string; data?: { providerRequestReplay?: { selectedHistoryMessageCount?: number; historyMessageCount?: number; providerMessageCount?: number; toolCallLinkage?: { assistantToolCallCount?: number; toolResultCount?: number } } } });
+    const lastReplay = records.filter((record) => record.kind === "model.requested").at(-1)?.data?.providerRequestReplay;
+    const lastRequest = gateway.requests.at(-1);
+    const toolMessages = lastRequest?.messages?.filter((message) => message.role === "tool") ?? [];
+    const assistantToolMessages = lastRequest?.messages?.filter((message) => (message.toolCalls?.length ?? 0) > 0) ?? [];
+
+    assert.equal(toolMessages.length, 1);
+    assert.equal(assistantToolMessages.length, 1);
+    assert.equal((lastReplay?.historyMessageCount ?? 0) <= 2, true);
+    assert.equal(lastReplay?.toolCallLinkage?.toolResultCount, 1);
+    assert.equal(lastReplay?.toolCallLinkage?.assistantToolCallCount, 1);
+    assert.equal((lastReplay?.selectedHistoryMessageCount ?? 0) <= 4, true);
+    assert.equal((lastReplay?.providerMessageCount ?? 0) > (lastReplay?.selectedHistoryMessageCount ?? 0), true);
+    await kernel.shutdown("cli-test-swe-bench-history-tail");
+  });
+
+  it("promotes live SWE-bench task runs to the governed run tool projection", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    const capturedRequests: ModelRequest[] = [];
+    const runtimeDeps = {
+      ...deps,
+      models: new CaptureModelRequestGateway(capturedRequests)
+    };
+    await registerRuntimeCoreTools(runtimeDeps, process.cwd());
+    const kernel = await createDefaultRuntimeKernel(runtimeDeps);
+    const lines: string[] = [];
+    let capturedToolProjection: unknown;
+
+    await runCli(
+      ["run", "给我完成 SWE-bench Lite 第 3 题测试，跑通并告诉我结果。", "--output", "jsonl", "--live", "--provider", "glm", "--model", "glm-5.1"],
+      (line: string) => {
+        lines.push(line);
+      },
+      [],
+      { stdinIsTTY: false, stdoutIsTTY: false },
+      {
+        createRuntime: async (runtimeOptions) => {
+          capturedToolProjection = runtimeOptions.toolProjection;
+          return { deps: runtimeDeps, kernel };
+        }
+      }
+    );
+
+    const records = lines.map((line) => JSON.parse(line) as { kind?: string; data?: { toolProjection?: string } });
+    const modelRequested = records.find((record) => record.kind === "model.requested");
+    assert.equal(capturedToolProjection, "all");
+    assert.equal(capturedRequests[0]?.toolProjection, "all");
+    assert.equal(modelRequested?.data?.toolProjection, "all");
+    assert.equal(lines.some((line) => line.includes("agent.loop.completed")), true);
+    await kernel.shutdown("cli-test-swe-bench-live-tool-projection");
   });
 
   it("projects one-shot output contracts through prompt assembly and verification", async () => {
@@ -3121,12 +3263,13 @@ describe("cli host adapter", () => {
     assert.equal(events.at(-1)?.kind, "agent.loop.completed");
   });
 
-  it("lets a one-shot agent prepare the SWE-bench environment through its own tool call", async () => {
+  it("dispatches SWE-bench one-shot runs through the governed run capability instead of parent env preparation", async () => {
     const deps = createDeterministicRuntimeDependencies();
-    const gateway = new EnvironmentPrepareModelGateway();
+    const gateway = new SweBenchDispatchRunModelGateway();
     const toolDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
     await registerRuntimeCoreTools(toolDeps, "/workspace");
     await registerCliEnvironmentCapabilities(toolDeps, "/workspace", { env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" } });
+    await registerFakeCliSweBenchRunCapability(toolDeps);
     const kernel = await createDefaultRuntimeKernel(toolDeps);
     const lines: string[] = [];
 
@@ -3142,24 +3285,31 @@ describe("cli host adapter", () => {
       }
     );
     const events = lines.map((line) => JSON.parse(line) as { kind: string; data?: JsonObject });
-    const projectedTool = gateway.requests[0]?.tools?.find((tool) => {
+    const projectedRunTool = gateway.requests[0]?.tools?.find((tool) => {
+      const fn = tool.function;
+      return isJsonObject(fn) && fn.name === "core_swe_bench_run";
+    });
+    const projectedEnvTool = gateway.requests[0]?.tools?.find((tool) => {
       const fn = tool.function;
       return isJsonObject(fn) && fn.name === "core_env_prepare";
     });
-    const toolResultMessage = gateway.requests[1]?.messages?.find((message) => message.role === "tool" && message.toolName === "core.env.prepare");
 
-    assert.equal(Boolean(projectedTool), true);
-    assert.equal(isJsonObject(projectedTool?.metadata) ? projectedTool.metadata.capabilityId : "", "core.env.prepare");
+    assert.equal(Boolean(projectedRunTool), true);
+    assert.equal(Boolean(projectedEnvTool), false);
+    assert.equal(isJsonObject(projectedRunTool?.metadata) ? projectedRunTool.metadata.capabilityId : "", "core.swe.bench.run");
+    assert.deepEqual(gateway.firstToolNames, ["core_swe_bench_run"]);
     assert.equal(gateway.firstPromptText.includes("给我完成 SWE-bench Lite 第 2 题测试，跑通并告诉我结果。"), true);
     assert.equal(gateway.firstPromptText.includes("run this first"), false);
     assert.equal(gateway.firstPromptText.includes("brew install"), false);
     assert.equal(gateway.firstPromptText.includes("deepseek diagnostics env prepare"), false);
-    assert.equal(events.some((event) => event.kind === "model.tool.intent" && event.data?.name === "core.env.prepare"), true);
-    assert.equal(events.some((event) => event.kind === "model.tool.repaired" && event.data?.capabilityId === "core.env.prepare"), true);
-    assert.equal(events.some((event) => event.kind === "capability.completed" && isJsonObject(event.data?.output) && isJsonObject(event.data.output.evidence) && event.data.output.evidence.tool === "env.prepare"), true);
-    assert.equal(events.some((event) => event.kind === "model.tool.result" && String(event.data?.result ?? "").includes("dependencies")), true);
-    assert.equal(toolResultMessage?.content.includes("dependencies"), true);
-    assert.equal(toolResultMessage?.content.includes("deepseek diagnostics"), false);
+    assert.equal(gateway.firstPromptText.includes(".deepseek/swebench-workspaces"), false);
+    assert.equal(resolveCliAgentLoopLimits("给我完成 SWE-bench Lite 第 2 题测试，跑通并告诉我结果。")?.toolTimeoutMs, 600_000);
+    assert.equal(events.some((event) => event.kind === "model.tool.intent" && event.data?.name === "core.swe.bench.run"), true);
+    assert.equal(events.some((event) => event.kind === "model.tool.intent" && event.data?.name === "core.env.prepare"), false);
+    assert.equal(events.some((event) => event.kind === "model.tool.repaired" && event.data?.capabilityId === "core.swe.bench.run"), true);
+    assert.equal(events.some((event) => event.kind === "capability.completed" && isJsonObject(event.data?.output) && isJsonObject(event.data.output.evidence) && event.data.output.evidence.tool === "swe.bench.run"), true);
+    assert.equal(events.some((event) => event.kind === "model.tool.result" && String(event.data?.result ?? "").includes("fake swe-bench run")), true);
+    assert.equal(gateway.requests.length, 1);
     assert.equal(lines.join("\n").includes("fixture-secret-value"), false);
     assert.equal(events.at(-1)?.kind, "agent.loop.completed");
     await kernel.shutdown("cli-test-swe-env-prepare-tool-call");
@@ -4851,30 +5001,34 @@ class ToolCallingModelGateway implements ModelGateway {
   }
 }
 
-class EnvironmentPrepareModelGateway implements ModelGateway {
+class SweBenchDispatchRunModelGateway implements ModelGateway {
   readonly requests: ModelRequest[] = [];
   firstPromptText = "";
+  firstToolNames: readonly string[] = [];
 
   async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
     this.requests.push(request);
-    if (this.requests.length === 1) this.firstPromptText = request.messages?.map((message) => message.content).join("\n") ?? request.prompt;
-    if (request.messages?.some((message) => message.role === "tool" && message.toolName === "core.env.prepare")) {
-      yield { kind: "delta", text: "Environment preparation evidence received." };
+    if (this.requests.length === 1) {
+      this.firstPromptText = request.messages?.map((message) => message.content).join("\n") ?? request.prompt;
+      this.firstToolNames = visibleToolNames(request);
+    }
+    if (request.messages?.some((message) => message.role === "tool" && message.toolName === "core.swe.bench.run")) {
+      yield { kind: "delta", text: "SWE-bench run evidence received." };
       yield { kind: "finish", reason: "stop" };
       yield { kind: "done" };
       return;
     }
-    const hasPrepareTool = request.tools?.some((tool) => {
+    const hasRunTool = request.tools?.some((tool) => {
       const fn = tool.function;
-      return isJsonObject(fn) && fn.name === "core_env_prepare";
+      return isJsonObject(fn) && fn.name === "core_swe_bench_run";
     }) ?? false;
-    if (!hasPrepareTool) {
-      yield { kind: "delta", text: "Missing environment preparation tool." };
+    if (!hasRunTool) {
+      yield { kind: "delta", text: "Missing governed SWE-bench run tool." };
       yield { kind: "finish", reason: "stop" };
       yield { kind: "done" };
       return;
     }
-    yield { kind: "tool-call", id: "call-env-prepare", name: "core_env_prepare", input: { profile: "swe-bench-lite" } };
+    yield { kind: "tool-call", id: "call-swe-bench-run", name: "core_swe_bench_run", input: { taskNumber: 2, dryRun: true } };
     yield { kind: "finish", reason: "tool-call" };
     yield { kind: "done" };
   }
@@ -5349,6 +5503,51 @@ function capabilityContext(): CapabilityExecutionContext {
   };
 }
 
+async function registerFakeCliSweBenchRunCapability(
+  deps: Pick<ReturnType<typeof createDeterministicRuntimeDependencies>, "capabilities">
+): Promise<void> {
+  const definition = defineToolManifest(
+    "swe.bench.run",
+    asId<"capability">("core.swe.bench.run"),
+    "Fake SWE-bench Run",
+    "process",
+    ["process:run", "evaluation:swe-bench"],
+    objectSchema([], {
+      taskNumber: { type: "number" },
+      execute: { type: "boolean" },
+      dryRun: { type: "boolean" }
+    }),
+    objectSchema(["evidence"], { evidence: { type: "object" } }),
+    async (_input, context) => ({
+      ok: true,
+      value: {
+        evidence: {
+          tool: "swe.bench.run",
+          status: "completed",
+          affectedPaths: [],
+          preview: boundedText("fake swe-bench run", 4_000),
+          diagnostics: [],
+          metadata: { redaction: { class: "internal" as const } },
+          replay: replay(context),
+          redaction: { class: "internal" as const, fields: ["metadata"] }
+        }
+      }
+    }),
+    { timeoutMs: 30_000, replayPolicy: { replayable: false, snapshot: "fake-cli-swe-bench-run", deterministic: true } }
+  );
+  await deps.capabilities.register(definition.manifest, definition.execute);
+}
+
+function visibleToolNames(request: ModelRequest): readonly string[] {
+  return (request.tools ?? [])
+    .map((tool) => {
+      const fn = isJsonObject(tool.function) ? tool.function : undefined;
+      return typeof fn?.name === "string" ? fn.name : "";
+    })
+    .filter(Boolean)
+    .sort();
+}
+
 async function withTempCwd<T>(prefix: string, run: () => Promise<T>): Promise<T> {
   const previous = process.cwd();
   const dir = await mkdtemp(join(tmpdir(), prefix));
@@ -5482,6 +5681,34 @@ class CaptureModelRequestGateway implements ModelGateway {
   async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
     this.requests.push(request);
     yield { kind: "delta", text: this.responseText };
+    yield { kind: "finish", reason: "stop" };
+    yield { kind: "done" };
+  }
+
+  async countTokens(text: string): Promise<number> {
+    return text.trim() ? text.trim().split(/\s+/).length : 0;
+  }
+}
+
+class SweBenchOneShotHistoryTailGateway implements ModelGateway {
+  readonly requests: ModelRequest[] = [];
+
+  constructor(private readonly toolCallCount: number) {}
+
+  async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    this.requests.push(request);
+    if (this.requests.length <= this.toolCallCount) {
+      yield {
+        kind: "tool-call",
+        id: `call-swe-history-${this.requests.length}`,
+        name: "core.file.read",
+        input: { path: "README.md" }
+      };
+      yield { kind: "finish", reason: "tool-call" };
+      yield { kind: "done" };
+      return;
+    }
+    yield { kind: "delta", text: "history tail bounded" };
     yield { kind: "finish", reason: "stop" };
     yield { kind: "done" };
   }
