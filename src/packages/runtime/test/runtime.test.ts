@@ -1372,6 +1372,32 @@ describe("headless runtime", () => {
     await kernel.shutdown();
   });
 
+  it("narrows visible tools after source-inspection duplicate rejection without a profile workflow", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    const gateway = new SweBenchDuplicateGateToolProjectionModelGateway();
+    const loopDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
+    await registerRuntimeCoreTools(loopDeps, "/workspace");
+    await loopDeps.platform.writeFile("/workspace/src/example.py", sweBenchExampleSource());
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: [
+        "Resolve SWE-bench instance demo__repo-1.",
+        "Managed SWE-bench execution profile:",
+        "- Inspect the relevant source briefly, then make the smallest source edit and verify it."
+      ].join("\n"),
+      caller: "runtime.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      limits: { maxModelIterations: 5, maxToolCalls: 8 }
+    }));
+
+    assert.equal(events.some((event) => event.kind === "model.tool.result" && event.data.toolCallId === "call-tool-projection-duplicate-read-2" && event.data.terminalKind === "swe-bench-source-inspection-duplicate.rejected"), true);
+    assert.deepEqual(gateway.visibleToolsAfterDuplicate, ["core_file_edit", "core_test_run"]);
+    assert.equal(events.some((event) => event.kind === "model.tool.result" && event.data.toolCallId === "call-edit-after-duplicate-tool-projection" && event.data.terminalKind === "capability.completed"), true);
+    await kernel.shutdown();
+  });
+
   it("does not present read-only workflow actions as active next steps after source-inspection duplicate rejection", async () => {
     const deps = createDeterministicRuntimeDependencies();
     const gateway = new SweBenchDuplicateGateWorkflowGuidanceModelGateway();
@@ -3550,6 +3576,56 @@ class SweBenchDuplicateGateContinuityModelGateway implements ModelGateway {
       return;
     }
     yield { kind: "delta", text: "duplicate gate was not visible" };
+    yield { kind: "finish", reason: "stop" };
+    yield { kind: "done" };
+  }
+
+  async countTokens(text: string): Promise<number> {
+    return text.trim() ? text.trim().split(/\s+/).length : 0;
+  }
+}
+
+class SweBenchDuplicateGateToolProjectionModelGateway implements ModelGateway {
+  readonly requests: ModelRequest[] = [];
+  visibleToolsAfterDuplicate: readonly string[] = [];
+  private step = 0;
+  private editIssued = false;
+
+  async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    this.requests.push(request);
+    const duplicateRejectedSeen = request.messages?.some((message) => message.content.includes("SWE_BENCH_SOURCE_INSPECTION_DUPLICATE_GATE_ENFORCED")) === true;
+    if (duplicateRejectedSeen && !this.editIssued) {
+      this.editIssued = true;
+      this.visibleToolsAfterDuplicate = visibleToolNames(request);
+      yield {
+        kind: "tool-call",
+        id: "call-edit-after-duplicate-tool-projection",
+        name: "core.file.edit",
+        input: sweBenchExampleEditInput()
+      };
+      yield { kind: "finish", reason: "tool-call" };
+      yield { kind: "done" };
+      return;
+    }
+    if (this.editIssued) {
+      yield { kind: "delta", text: "duplicate gate tool projection checked" };
+      yield { kind: "finish", reason: "stop" };
+      yield { kind: "done" };
+      return;
+    }
+    this.step += 1;
+    if (this.step <= 2) {
+      yield {
+        kind: "tool-call",
+        id: `call-tool-projection-duplicate-read-${this.step}`,
+        name: "core.file.read",
+        input: { path: "src/example.py", offset: 1, limit: 80 }
+      };
+      yield { kind: "finish", reason: "tool-call" };
+      yield { kind: "done" };
+      return;
+    }
+    yield { kind: "delta", text: "duplicate source read was not rejected" };
     yield { kind: "finish", reason: "stop" };
     yield { kind: "done" };
   }

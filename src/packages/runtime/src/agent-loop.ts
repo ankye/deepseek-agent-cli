@@ -4,6 +4,7 @@ import type {
   AgentLoopOutputContractVerification,
   AgentLoopRequest,
   AgentLoopSummary,
+  AgentLoopProfileWorkflowGateOverride,
   EvidenceFactClass,
   EvidenceFirstRuntimeContext,
   EvidenceItem,
@@ -66,7 +67,7 @@ import {
 } from "./self-repair/index.js";
 import { runtimeTrace, stableHash } from "./trace.js";
 import { executionFeedbackStatus, referenceContextSummary, summarizeAgentLoop } from "./agent-loop-summary.js";
-import { advanceWorkflowStageFromToolEvidence, extractSkillActivateMetadata, projectToolSet, recordToolResultEvidence, taskScopedToolGuard, workflowCapabilityBoundaryGuard } from "./agent-loop-tools.js";
+import { advanceWorkflowStageFromToolEvidence, extractSkillActivateMetadata, projectToolSet, projectWorkflowGateOverrideTools, recordToolResultEvidence, taskScopedToolGuard, workflowCapabilityBoundaryGuard } from "./agent-loop-tools.js";
 import { consumedBudgetEvents, createAgentLoopBudget } from "./modes/budgets.js";
 import { recordLosslessAssistantMessage, recordLosslessToolResult, recordLosslessUserMessage } from "./lossless-context.js";
 import { proposePermanentMemoryCandidates } from "./permanent-memory.js";
@@ -133,6 +134,7 @@ export async function* runAgentLoop(
   let toolCalls = 0;
   let terminalEmitted = false;
   let activeProfilePolicy = request.profilePolicy;
+  let activeWorkflowGateOverride: AgentLoopProfileWorkflowGateOverride | undefined;
   let repairContinuationRequested = false;
   let toolEvidenceEvents: RuntimeEvent[] = [];
   let outputContractVerification: AgentLoopOutputContractVerification | undefined;
@@ -1012,9 +1014,16 @@ export async function* runAgentLoop(
     iterations += 1;
     let iterationReasoning = "";
     let reasoningPersistedForIteration = false;
-    const iterationRequest = activeProfilePolicy ? { ...request, profilePolicy: activeProfilePolicy } : request;
+    const iterationRequest = activeProfilePolicy
+      ? { ...request, profilePolicy: activeProfilePolicy }
+      : activeWorkflowGateOverride
+        ? { ...request, profilePolicy: runtimeWorkflowGateOverridePolicy(activeWorkflowGateOverride) }
+        : request;
     const availableCapabilities = await deps.capabilities.listModelVisible();
-    const visibleCapabilities = projectToolSet(availableCapabilities, iterationRequest);
+    const projectedCapabilities = projectToolSet(availableCapabilities, iterationRequest);
+    const visibleCapabilities = activeProfilePolicy
+      ? projectedCapabilities
+      : projectWorkflowGateOverrideTools(projectedCapabilities, activeWorkflowGateOverride, { preferCanonicalCoreActions: true });
     const providerHistory = providerHistoryForRequest(messages, sweBenchVerificationGate);
     const assembly = await assemblePromptForIteration(deps, iterationRequest, sessionId, turnId, trace, providerHistory, contextProjection, visibleCapabilities, limits, evidenceFirst, currentRepairOutcome(), {
       phasePlan,
@@ -1388,6 +1397,13 @@ export async function* runAgentLoop(
         if (sweBenchGateRejection) {
           const { error, terminalKind } = sweBenchGateRejection;
           recordSweBenchGatePolicyRejection(sweBenchVerificationGate, terminalKind);
+          const nextWorkflowGateOverride = workflowGateOverrideFromRejection({
+            terminalKind,
+            toolCallId,
+            toolName,
+            capabilityId: String(preflight.capabilityId),
+            error
+          });
           activeProfilePolicy = applyWorkflowGateOverride(activeProfilePolicy, {
             terminalKind,
             toolCallId,
@@ -1395,6 +1411,7 @@ export async function* runAgentLoop(
             capabilityId: String(preflight.capabilityId),
             error
           });
+          activeWorkflowGateOverride = activeProfilePolicy?.workflowGateOverride ?? nextWorkflowGateOverride ?? activeWorkflowGateOverride;
           if (!isNonFatalSweBenchGateRejection(terminalKind)) diagnostics.push(error);
           const gateFeedback = buildToolResultFeedback({
             toolCallId,
@@ -1562,7 +1579,7 @@ export async function* runAgentLoop(
         }, request.agentId, recoverableToolFailure ? undefined : terminal?.error);
         await recordRuntimeAdapterEvent(deps, resultEvent);
         yield resultEvent;
-        const gateOverrideProgressed = shouldClearWorkflowGateOverride(activeProfilePolicy?.workflowGateOverride, toolName, toolInput, terminal);
+        const gateOverrideProgressed = shouldClearWorkflowGateOverride(activeProfilePolicy?.workflowGateOverride ?? activeWorkflowGateOverride, toolName, toolInput, terminal);
         const workflowProgress = advanceWorkflowStageFromToolEvidence({
           ...(activeProfilePolicy ? { profilePolicy: activeProfilePolicy } : {}),
           capabilityId: String(preflight.capabilityId),
@@ -1573,6 +1590,7 @@ export async function* runAgentLoop(
         });
         if (workflowProgress) {
           activeProfilePolicy = clearWorkflowGateOverride(workflowProgress.profilePolicy);
+          activeWorkflowGateOverride = activeProfilePolicy.workflowGateOverride;
           for (const stageEvent of workflowProgress.stageEvents) {
             const workflowStep = agentLoopEvent("workflow.step", sessionId, turnId, trace, {
               workflowId: workflowProgress.profilePolicy.workflowGraphId,
@@ -1588,8 +1606,11 @@ export async function* runAgentLoop(
             await recordRuntimeAdapterEvent(deps, workflowStep);
             yield workflowStep;
           }
-        } else if (gateOverrideProgressed && activeProfilePolicy) {
-          activeProfilePolicy = clearWorkflowGateOverride(activeProfilePolicy);
+        } else if (gateOverrideProgressed) {
+          activeWorkflowGateOverride = undefined;
+          if (activeProfilePolicy) {
+            activeProfilePolicy = clearWorkflowGateOverride(activeProfilePolicy);
+          }
         }
         const toolResultReasoning = await emitVisibleReasoning({
           actor: "runtime",
@@ -2744,6 +2765,28 @@ interface SweBenchGatePolicyRejection {
   readonly terminalKind: string;
 }
 
+function workflowGateOverrideFromRejection(input: {
+  readonly terminalKind: string;
+  readonly toolCallId: string;
+  readonly toolName: string;
+  readonly capabilityId: string;
+  readonly error: RedactedError;
+}): AgentLoopProfileWorkflowGateOverride | undefined {
+  const details = jsonObjectValue(input.error.details);
+  if (!details) return undefined;
+  const requiredNextAction = stringField(details, "requiredNextAction");
+  const gate = stringField(details, "gate");
+  if (!requiredNextAction || !gate) return undefined;
+  return {
+    gate,
+    requiredNextAction: providerFacingWorkflowGateAction(requiredNextAction),
+    rejectedToolName: input.toolName,
+    rejectedCapabilityId: input.capabilityId,
+    terminalKind: input.terminalKind,
+    toolCallId: input.toolCallId
+  };
+}
+
 function applyWorkflowGateOverride(
   profilePolicy: AgentLoopProfilePolicyMetadata | undefined,
   input: {
@@ -2755,21 +2798,11 @@ function applyWorkflowGateOverride(
   }
 ): AgentLoopProfilePolicyMetadata | undefined {
   if (!profilePolicy?.stagedTaskWorkflow) return profilePolicy;
-  const details = jsonObjectValue(input.error.details);
-  if (!details) return profilePolicy;
-  const requiredNextAction = stringField(details, "requiredNextAction");
-  const gate = stringField(details, "gate");
-  if (!requiredNextAction || !gate) return profilePolicy;
+  const override = workflowGateOverrideFromRejection(input);
+  if (!override) return profilePolicy;
   return {
     ...profilePolicy,
-    workflowGateOverride: {
-      gate,
-      requiredNextAction: providerFacingWorkflowGateAction(requiredNextAction),
-      rejectedToolName: input.toolName,
-      rejectedCapabilityId: input.capabilityId,
-      terminalKind: input.terminalKind,
-      toolCallId: input.toolCallId
-    }
+    workflowGateOverride: override
   };
 }
 
@@ -2777,6 +2810,23 @@ function clearWorkflowGateOverride(profilePolicy: AgentLoopProfilePolicyMetadata
   if (!profilePolicy.workflowGateOverride) return profilePolicy;
   const { workflowGateOverride: _workflowGateOverride, ...rest } = profilePolicy;
   return rest;
+}
+
+function runtimeWorkflowGateOverridePolicy(override: AgentLoopProfileWorkflowGateOverride): AgentLoopProfilePolicyMetadata {
+  return {
+    schemaVersion: "1.0.0",
+    profileId: "runtime/workflow-gate-override.v1",
+    role: "runtime-gate-workflow",
+    workflowGraphId: "runtime/workflow-gate-override",
+    workflowPriority: "primary",
+    orchestrationMode: "staged-capability-workflow",
+    workflowCapabilityIds: [],
+    toolProjectionSource: "runtime-gate",
+    workflowGateOverride: override,
+    antiTailoring: false,
+    executionBoundary: "runtime-gate-override",
+    redaction: { class: "internal" }
+  };
 }
 
 function providerFacingWorkflowGateAction(requiredNextAction: string): string {

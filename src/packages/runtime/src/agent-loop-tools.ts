@@ -60,8 +60,21 @@ function applyWorkflowGateToolProjection(
   const workflowCapabilities = capabilities.filter((manifest) => workflowBoundary.has(String(manifest.id)));
   const candidates = workflowCapabilities.length > 0 ? workflowCapabilities : capabilities;
   if (!override) return candidates;
-  const restricted = candidates.filter((manifest) => workflowGateCapabilitySatisfies(String(manifest.id), override.requiredNextAction));
-  return restricted.length > 0 ? restricted : candidates;
+  return projectWorkflowGateOverrideTools(candidates, override);
+}
+
+export function projectWorkflowGateOverrideTools(
+  capabilities: readonly CapabilityManifest[],
+  override: AgentLoopProfilePolicyMetadata["workflowGateOverride"] | undefined,
+  options: { readonly preferCanonicalCoreActions?: boolean } = {}
+): readonly CapabilityManifest[] {
+  if (!override) return capabilities;
+  const restricted = capabilities.filter((manifest) => workflowGateCapabilitySatisfies(String(manifest.id), override.requiredNextAction));
+  if (options.preferCanonicalCoreActions && restricted.length > 0) {
+    const canonical = restricted.filter((manifest) => canonicalWorkflowGateCapabilityIds(override.requiredNextAction).has(String(manifest.id)));
+    if (canonical.length > 0) return canonical;
+  }
+  return restricted.length > 0 ? restricted : capabilities;
 }
 
 function shouldProjectWorkflowBoundary(profilePolicy: AgentLoopProfilePolicyMetadata): boolean {
@@ -79,6 +92,19 @@ function workflowGateCapabilitySatisfies(capabilityId: string, requiredNextActio
     return capabilityId === "core.swe.bench.run";
   }
   return true;
+}
+
+function canonicalWorkflowGateCapabilityIds(requiredNextAction: string): ReadonlySet<string> {
+  if (requiredNextAction === "source-edit-or-test-or-bounded-blocker" || requiredNextAction === "source-edit-or-test-or-blocker") {
+    return new Set(["core.file.edit", "core.test.run"]);
+  }
+  if (requiredNextAction === "standard-test-command-or-bounded-blocker" || requiredNextAction === "standard-test-command") {
+    return new Set(["core.test.run"]);
+  }
+  if (requiredNextAction === "core.swe.bench.run-or-bounded-blocker") {
+    return new Set(["core.swe.bench.run"]);
+  }
+  return new Set();
 }
 
 function isMutationCapabilityId(capabilityId: string): boolean {
