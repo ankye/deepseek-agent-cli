@@ -22,10 +22,10 @@ import type {
   SessionStore
 } from "@deepseek/platform-contracts";
 import { AGENT_MODE_COMPATIBILITY, AGENT_MODE_SCHEMA_VERSION, INTERACTION_MODE_COMPATIBILITY, INTERACTION_MODE_SCHEMA_VERSION, SESSION_SCHEMA_VERSION, asId } from "@deepseek/platform-contracts";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { mkdirSync, readdirSync, readFileSync } from "node:fs";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
+export { userSessionsDirectory } from "./user-sessions-directory.js";
 
 export class InMemorySessionStore implements SessionStore {
   protected next = 1;
@@ -172,12 +172,14 @@ export class InMemorySessionStore implements SessionStore {
 }
 
 export class PersistentFilesystemSessionStore extends InMemorySessionStore {
+  private readonly hydratedSessions = new Set<string>();
+
   constructor(private readonly root: string) {
     super();
-    this.hydrate();
+    this.indexSessionOrdinals();
   }
 
-  private hydrate(): void {
+  private indexSessionOrdinals(): void {
     try {
       mkdirSync(this.root, { recursive: true });
     } catch {
@@ -195,65 +197,100 @@ export class PersistentFilesystemSessionStore extends InMemorySessionStore {
         const sessionId = asId<"session">(name.slice(0, -".jsonl".length));
         const ordinal = parseSessionOrdinal(sessionId);
         if (ordinal !== undefined && ordinal > maxSessionOrdinal) maxSessionOrdinal = ordinal;
-        try {
-          const content = readFileSync(join(this.root, name), "utf8");
-          const events: SessionEvent[] = [];
-          for (const line of content.split(/\r?\n/)) {
-            if (!line.trim()) continue;
-            try {
-              const record = JSON.parse(line) as { recordType?: string; event?: SessionEvent };
-              if (record.recordType === "event" && record.event) events.push(record.event);
-            } catch {
-              continue;
-            }
-          }
-          if (events.length > 0) {
-            this.eventsBySession.set(sessionId, events);
-            this.metadataBySession.set(sessionId, this.buildMetadata(sessionId, {}, {}));
-          }
-        } catch {
-          continue;
-        }
-      }
-    }
-    for (const name of entries) {
-      if (name.endsWith(".metadata.json")) {
-        const sessionId = asId<"session">(name.slice(0, -".metadata.json".length));
-        try {
-          const metadata = JSON.parse(readFileSync(join(this.root, name), "utf8")) as SessionMetadata;
-          this.metadataBySession.set(sessionId, metadata);
-        } catch {
-          continue;
-        }
-      }
-      if (name.endsWith(".snapshot.json")) {
-        const sessionId = asId<"session">(name.slice(0, -".snapshot.json".length));
-        try {
-          const snapshot = JSON.parse(readFileSync(join(this.root, name), "utf8")) as SessionSnapshot;
-          this.snapshotsBySession.set(sessionId, snapshot);
-        } catch {
-          continue;
-        }
       }
     }
     this.next = maxSessionOrdinal + 1;
   }
 
+  override async create(metadata: JsonObject = {}): Promise<SessionId> {
+    const sessionId = await super.create(metadata);
+    this.hydratedSessions.add(sessionId);
+    return sessionId;
+  }
+
   override async append(event: SessionEvent): Promise<void> {
+    await this.hydrateSession(event.sessionId);
     await super.append(event);
     await mkdir(this.root, { recursive: true });
     const path = join(this.root, `${event.sessionId}.jsonl`);
-    const existing = await readFile(path, "utf8").catch(() => "");
-    await writeFile(path, `${existing}${JSON.stringify({ schemaVersion: SESSION_SCHEMA_VERSION, recordType: "event", event })}\n`, "utf8");
+    await appendFile(path, `${JSON.stringify({ schemaVersion: SESSION_SCHEMA_VERSION, recordType: "event", event })}\n`, "utf8");
     const metadata = this.serializeMetadata(event.sessionId);
     if (metadata) await writeFile(join(this.root, `${event.sessionId}.metadata.json`), JSON.stringify(metadata, null, 2), "utf8");
   }
 
+  override async events(sessionId: SessionId): Promise<readonly SessionEvent[]> {
+    await this.hydrateSession(sessionId);
+    return super.events(sessionId);
+  }
+
   override async snapshot(sessionId: SessionId, payload: JsonObject): Promise<SessionSnapshot> {
+    await this.hydrateSession(sessionId);
     const snapshot = await super.snapshot(sessionId, payload);
     await mkdir(this.root, { recursive: true });
     await writeFile(join(this.root, `${sessionId}.snapshot.json`), JSON.stringify(snapshot, null, 2), "utf8");
     return snapshot;
+  }
+
+  override async metadata(sessionId: SessionId): Promise<SerializableResult<SessionMetadata>> {
+    await this.hydrateSession(sessionId);
+    return super.metadata(sessionId);
+  }
+
+  override async resume(sessionId: SessionId): Promise<SerializableResult<SessionResumeResult>> {
+    await this.hydrateSession(sessionId);
+    return super.resume(sessionId);
+  }
+
+  override async fork(request: SessionForkRequest): Promise<SerializableResult<SessionForkResult>> {
+    await this.hydrateSession(request.parentSessionId);
+    const result = await super.fork(request);
+    if (result.ok && result.value) {
+      const forked = result.value;
+      this.hydratedSessions.add(forked.childSessionId);
+      await mkdir(this.root, { recursive: true });
+      const event = forked.forkEvent;
+      await appendFile(join(this.root, `${event.sessionId}.jsonl`), `${JSON.stringify({ schemaVersion: SESSION_SCHEMA_VERSION, recordType: "event", event })}\n`, "utf8");
+      const metadata = this.serializeMetadata(forked.childSessionId);
+      if (metadata) await writeFile(join(this.root, `${forked.childSessionId}.metadata.json`), JSON.stringify(metadata, null, 2), "utf8");
+    }
+    return result;
+  }
+
+  private async hydrateSession(sessionId: SessionId): Promise<void> {
+    if (this.hydratedSessions.has(sessionId)) return;
+    this.hydratedSessions.add(sessionId);
+    const events = await this.readSessionEvents(sessionId);
+    if (events.length > 0) {
+      this.eventsBySession.set(sessionId, [...events]);
+      this.metadataBySession.set(sessionId, this.buildMetadata(sessionId, {}, {}));
+    }
+    const metadata = await this.readJson<SessionMetadata>(join(this.root, `${sessionId}.metadata.json`));
+    if (metadata) this.metadataBySession.set(sessionId, metadata);
+    const snapshot = await this.readJson<SessionSnapshot>(join(this.root, `${sessionId}.snapshot.json`));
+    if (snapshot) this.snapshotsBySession.set(sessionId, snapshot);
+  }
+
+  private async readSessionEvents(sessionId: SessionId): Promise<readonly SessionEvent[]> {
+    const content = await readFile(join(this.root, `${sessionId}.jsonl`), "utf8").catch(() => "");
+    const events: SessionEvent[] = [];
+    for (const line of content.split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      try {
+        const record = JSON.parse(line) as { recordType?: string; event?: SessionEvent };
+        if (record.recordType === "event" && record.event) events.push(record.event);
+      } catch {
+        continue;
+      }
+    }
+    return events;
+  }
+
+  private async readJson<T>(path: string): Promise<T | undefined> {
+    try {
+      return JSON.parse(await readFile(path, "utf8")) as T;
+    } catch {
+      return undefined;
+    }
   }
 }
 
@@ -268,28 +305,6 @@ function parseSessionOrdinal(sessionId: string): number | undefined {
   if (!match) return undefined;
   const ordinal = Number(match[1]);
   return Number.isFinite(ordinal) ? ordinal : undefined;
-}
-
-export function userSessionsDirectory(env?: NodeJS.ProcessEnv, platform?: NodeJS.Platform): string {
-  const resolvedEnv = env ?? sessionEnv();
-  const resolvedPlatform = platform ?? sessionPlatform();
-  if (resolvedPlatform === "win32") {
-    const appData = resolvedEnv.APPDATA ?? resolvedEnv.LOCALAPPDATA ?? join(homedir(), "AppData", "Roaming");
-    return join(appData, "deepseek", "sessions");
-  }
-  const xdgDataHome = resolvedEnv.XDG_DATA_HOME;
-  if (xdgDataHome && xdgDataHome.length > 0) return join(xdgDataHome, "deepseek", "sessions");
-  return join(homedir(), ".deepseek", "sessions");
-}
-
-function sessionEnv(): NodeJS.ProcessEnv {
-  const proc = globalThis as unknown as { process?: { env?: NodeJS.ProcessEnv } };
-  return proc.process?.env ?? {};
-}
-
-function sessionPlatform(): NodeJS.Platform {
-  const proc = globalThis as unknown as { process?: { platform?: NodeJS.Platform } };
-  return proc.process?.platform ?? "linux";
 }
 
 function latestSequenceOf(events: readonly SessionEvent[]): number {

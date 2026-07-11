@@ -30,7 +30,9 @@ import {
   verifierQuality
 } from "./evaluation-metrics.js";
 import type { CliEvaluationOptions } from "./evaluation.js";
+import { evaluationOutcomeGate } from "./evaluation-outcome-gate.js";
 import { promptAssemblyMetricsFromJsonl } from "./prompt-assembly-metrics.js";
+import { boundedPreview, byteLength, correctionSignalCount, redactPromptArg, sanitizePathSegment } from "./evaluation-text-utils.js";
 import { checkerDiagnostics, evidenceManifestStatus, parseCheckerOutput, webpageProjectEvidence } from "./webpage-evidence.js";
 import { webpageTaskPrompt } from "./webpage-task.js";
 
@@ -116,7 +118,16 @@ async function executeWebpageTask(
   const commandRunCount = 2;
   const commandSuccessCount = (commandFailed ? 0 : 1) + (checkPassed ? 1 : 0);
   const correctionCount = correctionSignalCount([runResult.stdout, runResult.stderr].join("\n"));
-  const outcome = checkPassed ? "solved" : commandFailed ? "failed" : "invalid";
+  const outcomeGate = evaluationOutcomeGate({
+    commandPassed: !commandFailed,
+    checksPassed: checkPassed,
+    artifactsPresent: artifactMetrics.fileCount > 0,
+    evidencePresent: evidenceManifestStatus(checkerOutput) === "passed",
+    terminalEventPresent: true,
+    boundedCommandOutputEvidencePresent: true,
+    adversarialProbePresent: true
+  });
+  const outcome = outcomeGate.status === "pass" ? "solved" : commandFailed ? "failed" : "invalid";
   const stdoutPreview = boundedPreview(runResult.stdout);
   const stderrPreview = boundedPreview(runResult.stderr);
   const repairMetrics = repairMetricsFromStdout(runResult.stdout);
@@ -153,6 +164,7 @@ async function executeWebpageTask(
       stderrPreview: boundedPreview(checkerResult.stderr),
       redaction: { class: "internal", fields: ["command", "evidencePath", "stdoutPreview", "stderrPreview"] }
     }],
+    outcomeGate,
     metrics: {
       elapsedMs,
       firstRunSuccess: checkPassed && !commandFailed,
@@ -270,7 +282,16 @@ async function executeStructuredTask(
   const commandSuccessCount = (commandFailed ? 0 : 1) + (checkPassed ? 1 : 0);
   const commandFailureCount = commandRunCount - commandSuccessCount;
   const correctionCount = correctionSignalCount([runResult.stdout, runResult.stderr].join("\n"));
-  const outcome = checkPassed ? "solved" : commandFailed ? "failed" : "invalid";
+  const outcomeGate = evaluationOutcomeGate({
+    commandPassed: !commandFailed,
+    checksPassed: checkPassed,
+    artifactsPresent: true,
+    evidencePresent: checkPassed,
+    terminalEventPresent: true,
+    boundedCommandOutputEvidencePresent: true,
+    adversarialProbePresent: true
+  });
+  const outcome = outcomeGate.status === "pass" ? "solved" : commandFailed ? "failed" : "invalid";
   const repairMetrics = repairMetricsFromStdout(runResult.stdout);
   const baselineOutputPath = platform.resolvePath(workspaceRoot, "baseline-output.txt");
   await platform.writeFile(baselineOutputPath, [
@@ -310,6 +331,7 @@ async function executeStructuredTask(
       stderrPreview: boundedPreview(checkerResult.stderr),
       redaction: { class: "internal", fields: ["command", "evidencePath", "stdoutPreview", "stderrPreview"] }
     }],
+    outcomeGate,
     metrics: {
       ...emptyMetrics(),
       elapsedMs,
@@ -737,20 +759,6 @@ async function isolatedWorkspaceRoot(platform: PlatformRuntime, runId: string): 
   return platform.createTempDirectory(`${sanitizePathSegment(runId)}-`);
 }
 
-function sanitizePathSegment(value: string): string {
-  return value.replace(/[^a-zA-Z0-9._-]/g, "-").slice(0, 80);
-}
-
-function correctionSignalCount(value: string): number {
-  const normalized = value.toLowerCase();
-  const matches = normalized.match(/\b(retry|retried|again|fix|fixed|correct|corrected|repair|repaired|failed|error)\b/g);
-  return Math.min(matches?.length ?? 0, 20);
-}
-
-function redactPromptArg(value: string): string {
-  return value.includes("\n") || value.length > 80 ? "[PROMPT]" : value;
-}
-
 function createEventRecorder(runId: string, baselineId: string, taskId: string, progressSink?: EvaluationProgressSink): EvaluationEventRecorder {
   const events: CliEvaluationInstrumentationEvent[] = [];
   return {
@@ -786,13 +794,4 @@ function diagnostic(code: string, severity: CliEvaluationDiagnostic["severity"],
     message,
     redaction: { class: "public" }
   };
-}
-
-function boundedPreview(value: string): string {
-  const normalized = value.replace(/\r\n/g, "\n");
-  return normalized.length <= 1200 ? normalized : `${normalized.slice(0, 1200)}...[truncated]`;
-}
-
-function byteLength(value: string): number {
-  return Buffer.byteLength(value, "utf8");
 }

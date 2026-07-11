@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import type { ApprovalBroker, ApprovalRequest, JsonObject } from "@deepseek/platform-contracts";
+import type { ApprovalBroker, ApprovalRequest, JsonObject, PolicyEngine, PolicyRequest } from "@deepseek/platform-contracts";
 import { asId, APPROVAL_SCHEMA_VERSION, TOOL_FAMILY_IDS } from "@deepseek/platform-contracts";
 import {
   collectRuntimeEvents,
@@ -12,6 +12,8 @@ import {
   runtimeFamilyCapabilityIds
 } from "../src/index.js";
 import { createDeterministicRuntimeDependencies } from "@deepseek/testing-regression";
+import { FakePlatformRuntime } from "@deepseek/platform-abstraction";
+import { buildReferenceToolArsenalReport } from "@deepseek/core-coding-tools";
 
 describe("runtime family capabilities", () => {
   const hostAdapterOnlyFamilyIds = new Set<typeof TOOL_FAMILY_IDS[number]>(["benchmark.run"]);
@@ -33,7 +35,7 @@ describe("runtime family capabilities", () => {
     });
 
     assert.deepEqual(
-      visible.map((manifest) => manifest.toolFamily?.familyId).sort(),
+      [...new Set(visible.flatMap((manifest) => manifest.toolFamily?.familyId ? [manifest.toolFamily.familyId] : []))].sort(),
       [
         "agent.wait-result",
         "approval.permission",
@@ -63,6 +65,24 @@ describe("runtime family capabilities", () => {
     }
     for (const familyId of hostAdapterOnlyFamilyIds) {
       assert.equal(visibleFamilyIds.has(familyId), false, `${familyId} should be registered by a host adapter, not the runtime package`);
+    }
+  });
+
+  it("registers external adapter reference tools as model-visible executable runtime capabilities", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await registerRuntimeCoreTools(deps, "/workspace");
+    const visible = await deps.capabilities.listModelVisible();
+    const visibleIds = new Set(visible.map((manifest) => String(manifest.id)));
+    const externalEntries = buildReferenceToolArsenalReport().entries.filter((entry) => entry.executionBoundary === "external-adapter");
+
+    assert.equal(externalEntries.length > 0, true);
+    for (const entry of externalEntries) {
+      assert.equal(entry.coreExecutableCapabilityIds.length, 0, entry.referenceTool);
+      assert.equal(entry.externalAdapterCapabilityIds.length > 0, true, entry.referenceTool);
+      for (const capabilityId of entry.externalAdapterCapabilityIds) {
+        assert.equal(visibleIds.has(capabilityId), true, `${entry.referenceTool} should register ${capabilityId}`);
+        assert.equal(Boolean(await deps.capabilities.resolveExecutable(asId<"capability">(capabilityId))), true, `${capabilityId} should resolve executable`);
+      }
     }
   });
 
@@ -244,6 +264,511 @@ describe("runtime family capabilities", () => {
       timeoutMs: 30_000
     }));
     assert.equal(events.some((event) => event.kind === "capability.failed"), true);
+    await kernel.shutdown();
+  });
+
+  it("rejects parallel pipelines that depend on sibling step artifacts", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await registerRuntimeCoreTools(deps, "/workspace");
+    let executions = 0;
+    const capability = {
+      ...runtimeEchoCapability,
+      id: asId<"capability">("test.parallel-artifact-dependency"),
+      name: "Test Parallel Artifact Dependency",
+      sideEffect: "none" as const
+    };
+    await deps.capabilities.register(capability, async () => {
+      executions += 1;
+      return { ok: true, value: { status: "executed" } };
+    });
+    const kernel = await createDefaultRuntimeKernel(deps);
+    const events = await collectRuntimeEvents(kernel.execute({
+      capabilityId: runtimeFamilyCapabilityIds.pipelineParallel,
+      caller: "runtime-family.test",
+      input: {
+        pipelineId: "pipeline:test-parallel-artifact-dependency",
+        steps: [
+          { stepId: "producer", capabilityId: capability.id, input: { text: "producer" } },
+          {
+            stepId: "consumer",
+            capabilityId: capability.id,
+            input: { text: "consumer" },
+            inputFromArtifacts: { previous: "pipeline:test-parallel-artifact-dependency:producer:output" }
+          }
+        ]
+      },
+      timeoutMs: 30_000
+    }));
+
+    assert.equal(events.some((event) => event.kind === "capability.failed" && (event.error?.details as JsonObject | undefined)?.originalCode === "PIPELINE_PARALLEL_ARTIFACT_DEPENDENCY"), true);
+    assert.equal(executions, 0);
+    await kernel.shutdown();
+  });
+
+  it("rejects parallel pipelines with equivalent explicit resource locks", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await registerRuntimeCoreTools(deps, "/workspace");
+    let executions = 0;
+    const writeCapability = {
+      ...runtimeEchoCapability,
+      id: asId<"capability">("test.explicit-equivalent-lock"),
+      name: "Test Explicit Equivalent Lock",
+      sideEffect: "write" as const
+    };
+    await deps.capabilities.register(writeCapability, async () => {
+      executions += 1;
+      return { ok: true, value: { status: "written" } };
+    });
+    const kernel = await createDefaultRuntimeKernel(deps);
+    const events = await collectRuntimeEvents(kernel.execute({
+      capabilityId: runtimeFamilyCapabilityIds.pipelineParallel,
+      caller: "runtime-family.test",
+      input: {
+        pipelineId: "pipeline:test-equivalent-explicit-conflict",
+        steps: [
+          { stepId: "a", capabilityId: writeCapability.id, input: { text: "a" }, resourceLocks: ["path:src/index.ts"] },
+          { stepId: "b", capabilityId: writeCapability.id, input: { text: "b" }, resourceLocks: ["path:./src/index.ts"] }
+        ]
+      },
+      timeoutMs: 30_000
+    }));
+    assert.equal(events.some((event) => event.kind === "capability.failed"), true);
+    assert.equal(executions, 0);
+    await kernel.shutdown();
+  });
+
+  it("rejects parallel pipelines when write steps infer the same resource lock", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await registerRuntimeCoreTools(deps, "/workspace");
+    let writes = 0;
+    const writeCapability = {
+      ...runtimeEchoCapability,
+      id: asId<"capability">("test.write-file"),
+      name: "Test Write File",
+      sideEffect: "write" as const
+    };
+    await deps.capabilities.register(writeCapability, async () => {
+      writes += 1;
+      return { ok: true, value: { status: "written" } };
+    });
+    const kernel = await createDefaultRuntimeKernel(deps);
+    const events = await collectRuntimeEvents(kernel.execute({
+      capabilityId: runtimeFamilyCapabilityIds.pipelineParallel,
+      caller: "runtime-family.test",
+      input: {
+        pipelineId: "pipeline:test-inferred-conflict",
+        steps: [
+          { stepId: "a", capabilityId: writeCapability.id, input: { path: "src/index.ts", content: "a" } },
+          { stepId: "b", capabilityId: writeCapability.id, input: { path: "src/index.ts", content: "b" } }
+        ]
+      },
+      timeoutMs: 30_000
+    }));
+
+    assert.equal(events.some((event) => event.kind === "capability.failed" && (event.error?.details as JsonObject | undefined)?.originalCode === "PIPELINE_LOCK_CONFLICT"), true);
+    assert.equal(writes, 0);
+    await kernel.shutdown();
+  });
+
+  it("rejects parallel pipelines when equivalent write paths infer the same resource lock", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await registerRuntimeCoreTools(deps, "/workspace");
+    let writes = 0;
+    const writeCapability = {
+      ...runtimeEchoCapability,
+      id: asId<"capability">("test.write-equivalent-file"),
+      name: "Test Write Equivalent File",
+      sideEffect: "write" as const
+    };
+    await deps.capabilities.register(writeCapability, async () => {
+      writes += 1;
+      return { ok: true, value: { status: "written" } };
+    });
+    const kernel = await createDefaultRuntimeKernel(deps);
+    const events = await collectRuntimeEvents(kernel.execute({
+      capabilityId: runtimeFamilyCapabilityIds.pipelineParallel,
+      caller: "runtime-family.test",
+      input: {
+        pipelineId: "pipeline:test-equivalent-inferred-conflict",
+        steps: [
+          { stepId: "a", capabilityId: writeCapability.id, input: { path: "src/index.ts", content: "a" } },
+          { stepId: "b", capabilityId: writeCapability.id, input: { path: "./src/index.ts", content: "b" } }
+        ]
+      },
+      timeoutMs: 30_000
+    }));
+
+    assert.equal(events.some((event) => event.kind === "capability.failed" && (event.error?.details as JsonObject | undefined)?.originalCode === "PIPELINE_LOCK_CONFLICT"), true);
+    assert.equal(writes, 0);
+    await kernel.shutdown();
+  });
+
+  it("rejects parallel pipelines with case-equivalent paths on case-insensitive platforms", async () => {
+    const deps = createDeterministicRuntimeDependencies({ platform: new FakePlatformRuntime("macos") });
+    await registerRuntimeCoreTools(deps, "/workspace");
+    let writes = 0;
+    const writeCapability = {
+      ...runtimeEchoCapability,
+      id: asId<"capability">("test.write-case-equivalent-file"),
+      name: "Test Write Case Equivalent File",
+      sideEffect: "write" as const
+    };
+    await deps.capabilities.register(writeCapability, async () => {
+      writes += 1;
+      return { ok: true, value: { status: "written" } };
+    });
+    const kernel = await createDefaultRuntimeKernel(deps);
+    const events = await collectRuntimeEvents(kernel.execute({
+      capabilityId: runtimeFamilyCapabilityIds.pipelineParallel,
+      caller: "runtime-family.test",
+      input: {
+        pipelineId: "pipeline:test-case-equivalent-inferred-conflict",
+        steps: [
+          { stepId: "a", capabilityId: writeCapability.id, input: { path: "README.md", content: "a" } },
+          { stepId: "b", capabilityId: writeCapability.id, input: { path: "readme.md", content: "b" } }
+        ]
+      },
+      timeoutMs: 30_000
+    }));
+
+    assert.equal(events.some((event) => event.kind === "capability.failed" && (event.error?.details as JsonObject | undefined)?.originalCode === "PIPELINE_LOCK_CONFLICT"), true);
+    assert.equal(writes, 0);
+    await kernel.shutdown();
+  });
+
+  it("rejects parallel pipelines with case-equivalent explicit locks on case-insensitive platforms", async () => {
+    const deps = createDeterministicRuntimeDependencies({ platform: new FakePlatformRuntime("macos") });
+    await registerRuntimeCoreTools(deps, "/workspace");
+    let writes = 0;
+    const writeCapability = {
+      ...runtimeEchoCapability,
+      id: asId<"capability">("test.write-case-equivalent-explicit-lock"),
+      name: "Test Write Case Equivalent Explicit Lock",
+      sideEffect: "write" as const
+    };
+    await deps.capabilities.register(writeCapability, async () => {
+      writes += 1;
+      return { ok: true, value: { status: "written" } };
+    });
+    const kernel = await createDefaultRuntimeKernel(deps);
+    const events = await collectRuntimeEvents(kernel.execute({
+      capabilityId: runtimeFamilyCapabilityIds.pipelineParallel,
+      caller: "runtime-family.test",
+      input: {
+        pipelineId: "pipeline:test-case-equivalent-explicit-conflict",
+        steps: [
+          { stepId: "a", capabilityId: writeCapability.id, input: { text: "a" }, resourceLocks: ["path:README.md"] },
+          { stepId: "b", capabilityId: writeCapability.id, input: { text: "b" }, resourceLocks: ["path:readme.md"] }
+        ]
+      },
+      timeoutMs: 30_000
+    }));
+
+    assert.equal(events.some((event) => event.kind === "capability.failed" && (event.error?.details as JsonObject | undefined)?.originalCode === "PIPELINE_LOCK_CONFLICT"), true);
+    assert.equal(writes, 0);
+    await kernel.shutdown();
+  });
+
+  it("rejects parallel pipelines when explicit path locks overlap inferred workspace locks", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await registerRuntimeCoreTools(deps, "/workspace");
+    let writes = 0;
+    const writeCapability = {
+      ...runtimeEchoCapability,
+      id: asId<"capability">("test.write-path-workspace-overlap"),
+      name: "Test Write Path Workspace Overlap",
+      sideEffect: "write" as const
+    };
+    await deps.capabilities.register(writeCapability, async () => {
+      writes += 1;
+      return { ok: true, value: { status: "written" } };
+    });
+    const kernel = await createDefaultRuntimeKernel(deps);
+    const events = await collectRuntimeEvents(kernel.execute({
+      capabilityId: runtimeFamilyCapabilityIds.pipelineParallel,
+      caller: "runtime-family.test",
+      input: {
+        pipelineId: "pipeline:test-path-workspace-overlap",
+        steps: [
+          { stepId: "a", capabilityId: writeCapability.id, input: { text: "a" }, resourceLocks: ["path:src/index.ts"] },
+          { stepId: "b", capabilityId: writeCapability.id, input: { path: "src/index.ts", content: "b" } }
+        ]
+      },
+      timeoutMs: 30_000
+    }));
+
+    assert.equal(events.some((event) => event.kind === "capability.failed" && (event.error?.details as JsonObject | undefined)?.originalCode === "PIPELINE_LOCK_CONFLICT"), true);
+    assert.equal(writes, 0);
+    await kernel.shutdown();
+  });
+
+  it("rejects parallel pipelines when absolute explicit locks overlap inferred workspace locks", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await registerRuntimeCoreTools(deps, "/workspace");
+    let writes = 0;
+    const writeCapability = {
+      ...runtimeEchoCapability,
+      id: asId<"capability">("test.write-absolute-path-workspace-overlap"),
+      name: "Test Write Absolute Path Workspace Overlap",
+      sideEffect: "write" as const
+    };
+    await deps.capabilities.register(writeCapability, async () => {
+      writes += 1;
+      return { ok: true, value: { status: "written" } };
+    });
+    const kernel = await createDefaultRuntimeKernel(deps);
+    const events = await collectRuntimeEvents(kernel.execute({
+      capabilityId: runtimeFamilyCapabilityIds.pipelineParallel,
+      caller: "runtime-family.test",
+      input: {
+        pipelineId: "pipeline:test-absolute-path-workspace-overlap",
+        steps: [
+          { stepId: "a", capabilityId: writeCapability.id, input: { text: "a" }, resourceLocks: ["path:/workspace/src/index.ts"] },
+          { stepId: "b", capabilityId: writeCapability.id, input: { path: "src/index.ts", workspaceRoot: "/workspace", content: "b" } }
+        ]
+      },
+      timeoutMs: 30_000
+    }));
+
+    assert.equal(events.some((event) => event.kind === "capability.failed" && (event.error?.details as JsonObject | undefined)?.originalCode === "PIPELINE_LOCK_CONFLICT"), true);
+    assert.equal(writes, 0);
+    await kernel.shutdown();
+  });
+
+  it("rejects parallel pipelines when a directory lock overlaps a child file lock", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await registerRuntimeCoreTools(deps, "/workspace");
+    let writes = 0;
+    const writeCapability = {
+      ...runtimeEchoCapability,
+      id: asId<"capability">("test.write-directory-child-overlap"),
+      name: "Test Write Directory Child Overlap",
+      sideEffect: "write" as const
+    };
+    await deps.capabilities.register(writeCapability, async () => {
+      writes += 1;
+      return { ok: true, value: { status: "written" } };
+    });
+    const kernel = await createDefaultRuntimeKernel(deps);
+    const events = await collectRuntimeEvents(kernel.execute({
+      capabilityId: runtimeFamilyCapabilityIds.pipelineParallel,
+      caller: "runtime-family.test",
+      input: {
+        pipelineId: "pipeline:test-directory-child-overlap",
+        steps: [
+          { stepId: "a", capabilityId: writeCapability.id, input: { text: "a" }, resourceLocks: ["path:src"] },
+          { stepId: "b", capabilityId: writeCapability.id, input: { path: "src/index.ts", content: "b" } }
+        ]
+      },
+      timeoutMs: 30_000
+    }));
+
+    assert.equal(events.some((event) => event.kind === "capability.failed" && (event.error?.details as JsonObject | undefined)?.originalCode === "PIPELINE_LOCK_CONFLICT"), true);
+    assert.equal(writes, 0);
+    await kernel.shutdown();
+  });
+
+  it("rejects parallel pipelines when a process cwd overlaps a workspace write", async () => {
+    const deps = {
+      ...createDeterministicRuntimeDependencies(),
+      policy: {
+        async decide() {
+          return {
+            action: "allow",
+            reason: "test policy",
+            audit: {},
+            sandboxProfile: "none"
+          };
+        }
+      } satisfies PolicyEngine
+    };
+    await registerRuntimeCoreTools(deps, "/workspace");
+    let processRuns = 0;
+    let writes = 0;
+    const processCapability = {
+      ...runtimeEchoCapability,
+      id: asId<"capability">("test.pipeline-process-root"),
+      name: "Test Pipeline Process Root",
+      sideEffect: "process" as const
+    };
+    const writeCapability = {
+      ...runtimeEchoCapability,
+      id: asId<"capability">("test.pipeline-write-during-process"),
+      name: "Test Pipeline Write During Process",
+      sideEffect: "write" as const
+    };
+    await deps.capabilities.register(processCapability, async () => {
+      processRuns += 1;
+      return { ok: true, value: { status: "process" } };
+    });
+    await deps.capabilities.register(writeCapability, async () => {
+      writes += 1;
+      return { ok: true, value: { status: "written" } };
+    });
+    const kernel = await createDefaultRuntimeKernel(deps);
+    const events = await collectRuntimeEvents(kernel.execute({
+      capabilityId: runtimeFamilyCapabilityIds.pipelineParallel,
+      caller: "runtime-family.test",
+      input: {
+        pipelineId: "pipeline:test-process-write-overlap",
+        steps: [
+          { stepId: "test", capabilityId: processCapability.id, input: { cwd: ".", workspaceRoot: "/workspace" } },
+          { stepId: "write", capabilityId: writeCapability.id, input: { path: "src/index.ts", content: "b", workspaceRoot: "/workspace" } }
+        ]
+      },
+      timeoutMs: 30_000
+    }));
+
+    assert.equal(events.some((event) => event.kind === "capability.failed" && (event.error?.details as JsonObject | undefined)?.originalCode === "PIPELINE_LOCK_CONFLICT"), true);
+    assert.equal(processRuns, 0);
+    assert.equal(writes, 0);
+    await kernel.shutdown();
+  });
+
+  it("rejects parallel pipelines when a process step relies on the pipeline workspace root", async () => {
+    const deps = {
+      ...createDeterministicRuntimeDependencies(),
+      policy: {
+        async decide() {
+          return {
+            action: "allow",
+            reason: "test policy",
+            audit: {},
+            sandboxProfile: "none"
+          };
+        }
+      } satisfies PolicyEngine
+    };
+    await registerRuntimeCoreTools(deps, "/workspace");
+    let processRuns = 0;
+    let writes = 0;
+    const processCapability = {
+      ...runtimeEchoCapability,
+      id: asId<"capability">("test.pipeline-default-root-process"),
+      name: "Test Pipeline Default Root Process",
+      sideEffect: "process" as const
+    };
+    const writeCapability = {
+      ...runtimeEchoCapability,
+      id: asId<"capability">("test.pipeline-default-root-write"),
+      name: "Test Pipeline Default Root Write",
+      sideEffect: "write" as const
+    };
+    await deps.capabilities.register(processCapability, async () => {
+      processRuns += 1;
+      return { ok: true, value: { status: "process" } };
+    });
+    await deps.capabilities.register(writeCapability, async () => {
+      writes += 1;
+      return { ok: true, value: { status: "written" } };
+    });
+    const kernel = await createDefaultRuntimeKernel(deps);
+    const events = await collectRuntimeEvents(kernel.execute({
+      capabilityId: runtimeFamilyCapabilityIds.pipelineParallel,
+      caller: "runtime-family.test",
+      input: {
+        pipelineId: "pipeline:test-default-root-process-write-overlap",
+        steps: [
+          { stepId: "test", capabilityId: processCapability.id, input: {} },
+          { stepId: "write", capabilityId: writeCapability.id, input: { path: "src/index.ts", content: "b" } }
+        ]
+      },
+      timeoutMs: 30_000
+    }));
+
+    assert.equal(events.some((event) => event.kind === "capability.failed" && (event.error?.details as JsonObject | undefined)?.originalCode === "PIPELINE_LOCK_CONFLICT"), true);
+    assert.equal(processRuns, 0);
+    assert.equal(writes, 0);
+    await kernel.shutdown();
+  });
+
+  it("allows a single pipeline step to hold overlapping explicit and inferred locks", async () => {
+    const deps = {
+      ...createDeterministicRuntimeDependencies(),
+      policy: {
+        async decide() {
+          return {
+            action: "allow",
+            reason: "test policy",
+            audit: {},
+            sandboxProfile: "none"
+          };
+        }
+      } satisfies PolicyEngine
+    };
+    await registerRuntimeCoreTools(deps, "/workspace");
+    let writes = 0;
+    const writeCapability = {
+      ...runtimeEchoCapability,
+      id: asId<"capability">("test.write-overlapping-self-locks"),
+      name: "Test Write Overlapping Self Locks",
+      sideEffect: "write" as const
+    };
+    await deps.capabilities.register(writeCapability, async () => {
+      writes += 1;
+      return { ok: true, value: { status: "written" } };
+    });
+    const kernel = await createDefaultRuntimeKernel(deps);
+    const events = await collectRuntimeEvents(kernel.execute({
+      capabilityId: runtimeFamilyCapabilityIds.pipelineParallel,
+      caller: "runtime-family.test",
+      input: {
+        pipelineId: "pipeline:test-overlapping-self-locks",
+        steps: [
+          { stepId: "write", capabilityId: writeCapability.id, input: { path: "src/index.ts", content: "x" }, resourceLocks: ["path:src"] }
+        ]
+      },
+      timeoutMs: 30_000
+    }));
+
+    assert.equal(events.some((event) => event.kind === "capability.completed"), true);
+    assert.equal(writes, 1);
+    await kernel.shutdown();
+  });
+
+  it("passes step side-effect metadata into pipeline policy decisions", async () => {
+    const policyRequests: PolicyRequest[] = [];
+    const deps = {
+      ...createDeterministicRuntimeDependencies(),
+      policy: {
+        async decide(request: PolicyRequest) {
+          policyRequests.push(request);
+          return {
+            action: "allow",
+            reason: "test policy",
+            audit: {},
+            sandboxProfile: "none"
+          };
+        }
+      } satisfies PolicyEngine
+    };
+    await registerRuntimeCoreTools(deps, "/workspace");
+    const writeCapability = {
+      ...runtimeEchoCapability,
+      id: asId<"capability">("test.write-policy"),
+      name: "Test Write Policy",
+      sideEffect: "write" as const
+    };
+    await deps.capabilities.register(writeCapability, async () => ({ ok: true, value: { status: "written" } }));
+    const kernel = await createDefaultRuntimeKernel(deps);
+    const events = await collectRuntimeEvents(kernel.execute({
+      capabilityId: runtimeFamilyCapabilityIds.pipelineSequence,
+      caller: "runtime-family.test",
+      input: {
+        pipelineId: "pipeline:test-step-policy",
+        steps: [
+          { stepId: "write", capabilityId: writeCapability.id, input: { path: "src/index.ts", content: "x" } }
+        ]
+      },
+      timeoutMs: 30_000
+    }));
+
+    assert.equal(events.some((event) => event.kind === "capability.completed"), true);
+    const stepPolicyRequest = policyRequests.find((request) => request.subject === "runtime.pipeline" && request.resource === String(writeCapability.id));
+    assert.equal(stepPolicyRequest?.metadata.sideEffect, "write");
+    assert.deepEqual(stepPolicyRequest?.metadata.resourceLocks, ["workspace:src/index.ts"]);
+    assert.equal(stepPolicyRequest?.resourceScope?.kind, "filesystem");
+    assert.equal(stepPolicyRequest?.sandbox?.capabilities.includes("filesystem-write"), true);
     await kernel.shutdown();
   });
 

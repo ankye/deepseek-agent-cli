@@ -83,6 +83,13 @@ describe("secret and sandbox policy helpers", () => {
     assert.deepEqual(redactJsonSecrets({ model }), { model });
   });
 
+  it("does not classify human-readable DeepSeek report directory slugs as api keys", () => {
+    const path = "/workspace/.deepseek/capability-matrix/live-20260623-deepseek-t08-after-implement-stage/T08/workspace";
+
+    assert.equal(classifySecretText(path).detected, false);
+    assert.equal(redactSecretText(path), path);
+  });
+
   it("does not classify product copy mentioning credential packages as a secret", () => {
     const copy = "Governance packages include config, credential-auth-management, and usage-budget-management.";
 

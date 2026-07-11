@@ -23,6 +23,84 @@ describe("deterministic scheduler", () => {
     );
   });
 
+  it("serializes overlapping workspace path locks without blocking sibling files", async () => {
+    const scheduler = new DeterministicScheduler();
+    let active = 0;
+    let maxActive = 0;
+    const runWithLock = (key: string) => scheduler.withLock({ kind: "workspace", key }, async () => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      active -= 1;
+    });
+
+    await Promise.all([
+      runWithLock("src"),
+      runWithLock("src/index.ts")
+    ]);
+    assert.equal(maxActive, 1);
+
+    active = 0;
+    maxActive = 0;
+    await Promise.all([
+      runWithLock("src/a.ts"),
+      runWithLock("src/b.ts")
+    ]);
+    assert.equal(maxActive, 2);
+  });
+
+  it("serializes process cwd locks against overlapping workspace writes", async () => {
+    const scheduler = new DeterministicScheduler();
+    let active = 0;
+    let maxActive = 0;
+    const runWithLock = (kind: "process-slot" | "workspace", key: string) => scheduler.withLock({ kind, key }, async () => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      active -= 1;
+    });
+
+    await Promise.all([
+      runWithLock("process-slot", "."),
+      runWithLock("workspace", "src/index.ts")
+    ]);
+    assert.equal(maxActive, 1);
+
+    active = 0;
+    maxActive = 0;
+    await Promise.all([
+      runWithLock("process-slot", "src"),
+      runWithLock("workspace", "src")
+    ]);
+    assert.equal(maxActive, 1);
+
+    active = 0;
+    maxActive = 0;
+    await Promise.all([
+      runWithLock("process-slot", "packages/a"),
+      runWithLock("workspace", "packages/b/index.ts")
+    ]);
+    assert.equal(maxActive, 2);
+  });
+
+  it("keeps non-path lock keys literal instead of path-normalizing them", async () => {
+    const scheduler = new DeterministicScheduler();
+    let active = 0;
+    let maxActive = 0;
+    const runWithLock = (key: string) => scheduler.withLock({ kind: "session", key }, async () => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      active -= 1;
+    });
+
+    await Promise.all([
+      runWithLock("tenant-a/../session-1"),
+      runWithLock("session-1")
+    ]);
+    assert.equal(maxActive, 2);
+  });
+
   it("queues work beyond the concurrency limit", async () => {
     const scheduler = new DeterministicScheduler({ maxConcurrency: 1 });
     let releaseFirst!: () => void;

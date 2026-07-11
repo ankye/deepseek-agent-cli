@@ -8,10 +8,12 @@ import {
   type StagedTaskGraph,
   type StagedTaskRef,
   type StagedTaskRunState,
+  type StagedTaskEvaluationResult,
   type StagedTaskStageContract,
   type StagedTaskStageEvent,
   type StagedTaskStageState,
   type StagedTaskStageStatus,
+  type StagedTaskTechnicalDirectorAcceptance,
   type ValidationResult
 } from "@deepseek/platform-contracts";
 
@@ -200,14 +202,21 @@ export async function runReadyStage(
     inputRefs: runningState.refs.filter((ref) => stage.inputRefs.includes(ref.refId)),
     expectedOutputRefIds: stage.expectedOutputRefs
   });
+  const completedAt = now();
+  const evaluation = stageEvaluationForResult(stage, result, completedAt);
+  const technicalDirectorAcceptance = technicalDirectorAcceptanceForResult(result, stage);
   const completed = createStageEvent({
-    kind: resultKindToEventKind(result.status),
+    kind: resultKindToEventKind(stage, result),
     taskRunId: state.taskRunId,
     graphId: graph.graphId,
     stageId,
-    at: now(),
+    at: completedAt,
     outputRefs: result.outputRefs,
-    diagnostics: result.diagnostics
+    ...(evaluation ? { evaluation } : {}),
+    ...(technicalDirectorAcceptance ? { technicalDirectorAcceptance } : {}),
+    diagnostics: result.status === "succeeded"
+      ? [...result.diagnostics, technicalDirectorAcceptanceRequiredDiagnostic()]
+      : result.diagnostics
   });
 
   return {
@@ -229,6 +238,8 @@ function updateStageState(
     status,
     attempts: event.kind === "stage.started" ? stageState.attempts + 1 : stageState.attempts,
     outputRefs,
+    ...(event.evaluation ? { evaluation: event.evaluation } : {}),
+    ...(event.technicalDirectorAcceptance ? { technicalDirectorAcceptance: event.technicalDirectorAcceptance } : {}),
     diagnostics: event.diagnostics,
     ...(event.kind === "stage.started" ? { startedAt: event.at } : {}),
     ...(isTerminalStatus(status) ? { completedAt: event.at } : {})
@@ -259,6 +270,8 @@ function createStageEvent(input: {
   readonly stageId: string;
   readonly at: string;
   readonly outputRefs?: readonly StagedTaskRef[];
+  readonly evaluation?: StagedTaskEvaluationResult;
+  readonly technicalDirectorAcceptance?: StagedTaskTechnicalDirectorAcceptance;
   readonly diagnostics: readonly RedactedError[];
 }): StagedTaskStageEvent {
   return {
@@ -270,9 +283,11 @@ function createStageEvent(input: {
     stageId: input.stageId,
     at: input.at,
     ...(input.outputRefs ? { outputRefs: input.outputRefs } : {}),
+    ...(input.evaluation ? { evaluation: input.evaluation } : {}),
+    ...(input.technicalDirectorAcceptance ? { technicalDirectorAcceptance: input.technicalDirectorAcceptance } : {}),
     diagnostics: input.diagnostics,
     compatibility: STAGED_TASK_COMPATIBILITY,
-    redaction: { class: "internal", fields: ["diagnostics.details", "outputRefs.preview"] }
+    redaction: { class: "internal", fields: ["diagnostics.details", "outputRefs.preview", "evaluation.reason", "technicalDirectorAcceptance.reason"] }
   };
 }
 
@@ -281,6 +296,8 @@ function eventKindToStatus(kind: StagedTaskStageEvent["kind"]): StagedTaskStageS
     case "stage.ready":
       return "ready";
     case "stage.started":
+      return "running";
+    case "stage.evaluation.required":
       return "running";
     case "stage.succeeded":
       return "succeeded";
@@ -291,15 +308,94 @@ function eventKindToStatus(kind: StagedTaskStageEvent["kind"]): StagedTaskStageS
   }
 }
 
-function resultKindToEventKind(status: StagedTaskExecutionResult["status"]): StagedTaskStageEvent["kind"] {
-  switch (status) {
+function resultKindToEventKind(
+  stage: StagedTaskStageContract,
+  result: StagedTaskExecutionResult
+): StagedTaskStageEvent["kind"] {
+  switch (result.status) {
     case "succeeded":
-      return "stage.succeeded";
+      return technicalDirectorAcceptanceAccepted(result, stage) ? "stage.succeeded" : "stage.evaluation.required";
     case "failed":
       return "stage.failed";
     case "skipped":
       return "stage.skipped";
   }
+}
+
+function technicalDirectorAcceptanceAccepted(
+  result: StagedTaskExecutionResult,
+  stage: StagedTaskStageContract
+): boolean {
+  const typedAcceptance = technicalDirectorAcceptanceForResult(result, stage);
+  if (typedAcceptance) {
+    return typedAcceptance.decision === "accepted" &&
+      typedAcceptance.criteriaApplicable &&
+      typedAcceptance.evidenceSufficient;
+  }
+  const acceptedByDiagnostic = result.diagnostics.some((entry) =>
+    entry.code === "STAGED_TASK_TECHNICAL_DIRECTOR_ACCEPTED" ||
+    entry.code === `STAGED_TASK_TECHNICAL_DIRECTOR_ACCEPTED:${stage.stageId}`
+  );
+  const acceptedByMetadata = Boolean(result.metadata && typeof result.metadata === "object" &&
+    (result.metadata as { readonly technicalDirectorAcceptance?: unknown }).technicalDirectorAcceptance === "accepted");
+  return acceptedByDiagnostic || acceptedByMetadata;
+}
+
+function stageEvaluationForResult(
+  stage: StagedTaskStageContract,
+  result: StagedTaskExecutionResult,
+  evaluatedAt: string
+): StagedTaskEvaluationResult | undefined {
+  if (result.evaluation) return result.evaluation;
+  if (result.status !== "succeeded") return undefined;
+  const evidenceRefs = result.outputRefs.map((ref) => ref.refId);
+  return {
+    schemaVersion: STAGED_TASK_SCHEMA_VERSION,
+    evaluationId: `evaluation:${stage.stageId}:${evaluatedAt}`,
+    stageId: stage.stageId,
+    evaluatorId: "runtime:staged-task-default-evaluator",
+    status: "needs-review",
+    reason: "Stage output requires evaluation before success can be accepted.",
+    evidenceRefs,
+    evaluatedAt,
+    compatibility: STAGED_TASK_COMPATIBILITY,
+    redaction: { class: "internal", fields: ["reason"] }
+  };
+}
+
+function technicalDirectorAcceptanceForResult(
+  result: StagedTaskExecutionResult,
+  stage: StagedTaskStageContract
+): StagedTaskTechnicalDirectorAcceptance | undefined {
+  if (result.technicalDirectorAcceptance) return result.technicalDirectorAcceptance;
+  const acceptedByDiagnostic = result.diagnostics.some((entry) =>
+    entry.code === "STAGED_TASK_TECHNICAL_DIRECTOR_ACCEPTED" ||
+    entry.code === `STAGED_TASK_TECHNICAL_DIRECTOR_ACCEPTED:${stage.stageId}`
+  );
+  const acceptedByMetadata = Boolean(result.metadata && typeof result.metadata === "object" &&
+    (result.metadata as { readonly technicalDirectorAcceptance?: unknown }).technicalDirectorAcceptance === "accepted");
+  if (!acceptedByDiagnostic && !acceptedByMetadata) return undefined;
+  return {
+    schemaVersion: STAGED_TASK_SCHEMA_VERSION,
+    acceptanceId: `technical-director-acceptance:${stage.stageId}:${result.evaluation?.evaluationId ?? "diagnostic"}`,
+    stageId: stage.stageId,
+    reviewerId: "runtime:technical-director",
+    decision: "accepted",
+    criteriaApplicable: true,
+    evidenceSufficient: true,
+    reason: "Technical-director acceptance was provided by execution result diagnostics or metadata.",
+    ...(result.evaluation?.evaluationId ? { evaluationId: result.evaluation.evaluationId } : {}),
+    acceptedAt: result.evaluation?.evaluatedAt ?? new Date(0).toISOString(),
+    compatibility: STAGED_TASK_COMPATIBILITY,
+    redaction: { class: "internal", fields: ["reason"] }
+  };
+}
+
+function technicalDirectorAcceptanceRequiredDiagnostic(): RedactedError {
+  return diagnostic(
+    "STAGED_TASK_TECHNICAL_DIRECTOR_ACCEPTANCE_REQUIRED",
+    "Stage produced output, but final success requires technical-director acceptance of criteria applicability and evidence sufficiency."
+  );
 }
 
 function isTerminalStatus(status: StagedTaskStageStatus): boolean {

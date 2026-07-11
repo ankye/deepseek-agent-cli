@@ -8,11 +8,13 @@ import type {
   AgentReasoningEffortMapping,
   JsonObject,
   ModelChatMessage,
+  PromptSchedulingNextAction,
   PromptAssemblyMode,
   PromptAssemblyResult,
   RuntimeDependencies,
   SessionId,
   TaskDecisionRequest,
+  ToolDecisionBoard,
   TraceContext,
   TurnId
 } from "@deepseek/platform-contracts";
@@ -34,6 +36,8 @@ export async function assemblePromptForIteration(
     readonly phasePlan?: AgentPhasePlan | undefined;
     readonly reasoningEffortMapping?: AgentReasoningEffortMapping | undefined;
     readonly taskDecision?: TaskDecisionRequest | undefined;
+    readonly toolDecisionBoard?: ToolDecisionBoard | undefined;
+    readonly schedulingNextAction?: PromptSchedulingNextAction | undefined;
   }
 ): Promise<PromptAssemblyResult> {
   const assembler = deps.promptAssembler ?? createDefaultPromptAssembler();
@@ -54,6 +58,8 @@ export async function assemblePromptForIteration(
     ...(contextProjection ? { contextProjection } : {}),
     ...(contextProjection?.pipeline ? { contextPipelineManifest: contextProjection.pipeline } : {}),
     ...(mode?.taskDecision ? { taskDecision: mode.taskDecision } : {}),
+    ...(mode?.schedulingNextAction ? { schedulingNextAction: mode.schedulingNextAction } : {}),
+    ...(mode?.toolDecisionBoard ? { toolDecisionBoard: mode.toolDecisionBoard } : {}),
     ...(request.profilePolicy ? { profilePolicy: request.profilePolicy } : {}),
     ...(evidenceFirst ? { evidenceFirst } : {}),
     ...(selfRepair ? { selfRepair } : {}),
@@ -68,6 +74,7 @@ export async function assemblePromptForIteration(
     ...(request.outputContract ? { outputContract: request.outputContract } : {}),
     availableTools: availableCapabilities,
     toolPolicy: toolProjectionPolicy(request),
+    ...(request.toolOptIns ? { toolOptIns: request.toolOptIns } : {}),
     budget: {
       hardLimitTokens: limits.maxOutputBytes,
       reservedOutputTokens: 0
@@ -111,7 +118,7 @@ export function promptAssemblyEventPayload(assembly: PromptAssemblyResult, reque
 }
 
 export function toolProjectionPolicy(request: AgentLoopRequest): AgentLoopToolProjection {
-  return request.toolProjection ?? (request.live ? "read-only" : "all");
+  return request.toolProjection ?? (request.live ? "read-only" : "safe-all");
 }
 
 function promptAssemblyModeFor(request: AgentLoopRequest): PromptAssemblyMode {

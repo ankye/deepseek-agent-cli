@@ -10,8 +10,6 @@ export type ToolIntentRepairKind =
   | "provider-arguments-unwrapped"
   | "provider-tool-alias-normalized"
   | "semantic-platform-operation"
-  | "swe-bench-run-execution-normalized"
-  | "swe-bench-task-range-normalized"
   | "workspace-cwd-defaulted"
   | "workspace-root-defaulted"
   | "workspace-tool-timeout-defaulted"
@@ -47,6 +45,7 @@ export interface ToolIntentPreflightRequest extends JsonObject {
   readonly profileId?: ModelProfileId;
   readonly providerHints?: JsonObject;
   readonly pathFields?: readonly string[];
+  readonly toolTimeoutMs?: number;
 }
 
 export interface ToolIntentProviderProfile extends JsonObject {
@@ -100,6 +99,8 @@ export interface ToolResultFeedback extends JsonObject {
   readonly status: ToolFeedbackStatus;
   readonly preview: ToolFeedbackPreview;
   readonly diagnostics: readonly RedactedError[];
+  readonly correctiveAction?: string;
+  readonly recommendedNextAction?: string;
   readonly trace: { readonly traceId: string; readonly correlationId: string };
   readonly continuation: "continue" | "terminate";
   readonly redaction: RedactionMetadata;

@@ -53,16 +53,14 @@ function isInternalEvaluationArtifactPath(path: string): boolean {
   return (
     path === ".deepseek/evaluation-boundary-runs" ||
     path.startsWith(".deepseek/evaluation-boundary-runs/") ||
-    path === ".deepseek/swebench-predictions" ||
-    path.startsWith(".deepseek/swebench-predictions/") ||
-    path === ".deepseek/swebench-reports" ||
-    path.startsWith(".deepseek/swebench-reports/") ||
-    path === ".deepseek/swebench-runs" ||
-    path.startsWith(".deepseek/swebench-runs/") ||
-    path === ".deepseek/swebench-venv" ||
-    path.startsWith(".deepseek/swebench-venv/") ||
-    path === ".deepseek/swe-lite-runs" ||
-    path.startsWith(".deepseek/swe-lite-runs/")
+    path === ".deepseek/evaluation-runs" ||
+    path.startsWith(".deepseek/evaluation-runs/") ||
+    path === ".deepseek/evaluation-predictions" ||
+    path.startsWith(".deepseek/evaluation-predictions/") ||
+    path === ".deepseek/evaluation-reports" ||
+    path.startsWith(".deepseek/evaluation-reports/") ||
+    path === ".deepseek/evaluation-venv" ||
+    path.startsWith(".deepseek/evaluation-venv/")
   );
 }
 

@@ -1,6 +1,7 @@
 import type {
   AgentLoopControl,
   AgentLoopLimits,
+  AgentLoopOutputContract,
   AgentLoopOutputContractVerification,
   AgentLoopRequest,
   AgentLoopSummary,
@@ -22,6 +23,7 @@ import type {
   ModelChatMessage,
   ModelOutputOptions,
   ModelReasoningOptions,
+  PromptSchedulingNextAction,
   RedactedError,
   RuntimeDependencies,
   RuntimeEvent,
@@ -32,6 +34,7 @@ import type {
   SelfRepairOutcomeSummary,
   SelfRepairPlan,
   SelfRepairVerificationSummary,
+  SessionEvent,
   SessionId,
   TaskDecisionEnvelope,
   TraceContext,
@@ -41,7 +44,7 @@ import type {
   VisibleReasoningStatus
 } from "@deepseek/platform-contracts";
 import { EVIDENCE_FIRST_COMPATIBILITY, EVIDENCE_FIRST_SCHEMA_VERSION, asId } from "@deepseek/platform-contracts";
-import { isStandardTestCommand } from "@deepseek/core-coding-tools";
+import { modelToolSchema } from "@deepseek/prompt-assembly";
 import { projectAgentLoopContext, projectionEventData } from "./context-projection.js";
 import { kernelError, toolIntentError } from "./errors.js";
 import { createEvidenceFirstRuntimeContext, evidenceFirstEventData, groundStrictClaims } from "./evidence-first.js";
@@ -67,8 +70,24 @@ import {
 } from "./self-repair/index.js";
 import { runtimeTrace, stableHash } from "./trace.js";
 import { executionFeedbackStatus, referenceContextSummary, summarizeAgentLoop } from "./agent-loop-summary.js";
-import { advanceWorkflowStageFromToolEvidence, extractSkillActivateMetadata, projectToolSet, projectWorkflowGateOverrideTools, recordToolResultEvidence, taskScopedToolGuard, workflowCapabilityBoundaryGuard } from "./agent-loop-tools.js";
+import { advanceWorkflowStageFromToolEvidence, extractSkillActivateMetadata, isAllowedEvaluationReproductionToolInput, projectProviderCacheToolSet, projectToolSet, projectWorkflowGateOverrideTools, recordToolResultEvidence, workflowCapabilityBoundaryGuard } from "./agent-loop-tools.js";
 import { consumedBudgetEvents, createAgentLoopBudget } from "./modes/budgets.js";
+import {
+  createReadyStageBudgetUsage,
+  nextReadyStageBudgetUsage,
+  readyStageBudgetEventData,
+  readyStageBudgetForControl,
+  readyStageBudgetKey,
+  readyStageBudgetReviewMessage
+} from "./ready-stage-budget.js";
+import {
+  READY_STAGE_REQUIRED_ACTION_CORRECTION_LIMIT,
+  readyStageAntiLoopInstruction,
+  readyStageNonProgressCapabilityMiss,
+  readyStageProgressCapabilitySatisfied,
+  readyStageRequiredActionCorrectionMessage,
+  readyStageRequiredActionMissKey
+} from "./ready-stage-control.js";
 import { recordLosslessAssistantMessage, recordLosslessToolResult, recordLosslessUserMessage } from "./lossless-context.js";
 import { proposePermanentMemoryCandidates } from "./permanent-memory.js";
 import { createRuntimeModePlan } from "./modes/phase-planner.js";
@@ -80,6 +99,7 @@ import {
   summarizeModePlan
 } from "./modes/mode-state.js";
 import { runFinalVerification } from "./agent-loop-verification.js";
+import { isStandardTestCommand } from "@deepseek/core-coding-tools";
 import { projectReasoningForOutput, recordVisibleReasoning, recordVisibleReasoningProjection, visibleReasoningEvidence } from "./visible-reasoning.js";
 import {
   createTaskDeliveryFlowSummary,
@@ -88,6 +108,38 @@ import {
   taskDeliveryFlowEventData,
   taskDeliveryFlowWithDecisionData
 } from "./task-delivery-flow.js";
+import {
+  createToolDecisionBoardState,
+  normalizeToolInputHash,
+  feedbackStatusToDecisionStatus,
+  recordFailureAnalysis,
+  recordRejectedIntent,
+  recordRejectedToolFeedback,
+  recordToolDecision,
+  shouldSuppressRepeatedMutationFailure,
+  shouldSuppressRepeatedRejectedIntent,
+  toolDecisionBoardSnapshot
+} from "./tool-decision-board.js";
+import {
+  buildDispatchTerminalSummary,
+  buildDeniedDispatchFeedback,
+  buildDeniedDispatchResult,
+  buildRejectedDispatchFeedback,
+  buildRejectedDispatchResult,
+  correctiveActionForToolFeedback,
+  isRecoverableToolError,
+  outputContractArtifactPathRejection,
+  recommendedNextActionForToolFeedback,
+  toolTimeoutFor
+} from "./agent-loop-tool-dispatch.js";
+import {
+  readyStageRequiredActionConvergence,
+  readyStageToolBudgetConvergence,
+  repeatedRejectedIntentConvergence,
+  terminalToolConvergence
+} from "./agent-loop-convergence.js";
+import { planToolDispatchBatch } from "./agent-loop-tool-batches.js";
+import { isMutationCapabilityId, isTestCapabilityId, progressCapabilityIdsForWorkflowStage } from "./workflow-capability-policy.js";
 
 export const defaultAgentLoopLimits: AgentLoopLimits = {
   maxModelIterations: 4,
@@ -101,18 +153,6 @@ export const defaultAgentLoopLimits: AgentLoopLimits = {
 
 const RESTORED_HISTORY_MESSAGE_LIMIT = 12;
 const RESTORED_HISTORY_CONTENT_LIMIT = 4_000;
-const SWE_BENCH_PROVIDER_HISTORY_TOOL_TAIL_LIMIT = 1;
-const SWE_BENCH_PROVIDER_TOOL_FEEDBACK_LIMIT_BYTES = 1_024;
-const TERMINAL_TOOL_CAPABILITY_IDS = new Set(["core.swe.bench.run"]);
-const SWE_BENCH_SOURCE_INSPECTION_GATE_TOOL_THRESHOLD = 8;
-const SWE_BENCH_SOURCE_INSPECTION_GATE_FOCUSED_READ_LIMIT = 1;
-const SWE_BENCH_SOURCE_INSPECTION_GATE_DEFIANCE_LIMIT = 2;
-const SWE_BENCH_SOURCE_READ_DUPLICATE_OVERLAP_RATIO = 0.8;
-const SWE_BENCH_VERIFICATION_GATE_SHELL_THRESHOLD = 8;
-const SWE_BENCH_ENVIRONMENT_BLOCKER_SHELL_THRESHOLD = 2;
-const SWE_BENCH_MODEL_REQUEST_BUDGET = 12;
-const SWE_BENCH_RUN_ROUTING_GATE_TOOL_THRESHOLD = 3;
-
 export async function* runAgentLoop(
   deps: RuntimeDependencies,
   kernel: RuntimeKernel,
@@ -122,7 +162,10 @@ export async function* runAgentLoop(
   const sessionId = request.sessionId ?? await deps.sessions.create({ caller: request.caller, workspaceRoot: request.workspaceRoot });
   const trace: TraceContext = request.trace ?? runtimeTrace(sessionId, "agent-loop");
   const turnId = asId<"turn">(`turn-${stableHash(`${sessionId}:${request.prompt}`)}`);
-  const limits = { ...defaultAgentLoopLimits, ...(request.limits ?? {}) };
+  const baseLimits = { ...defaultAgentLoopLimits, ...(request.limits ?? {}) };
+  const limits = request.timeoutMs && request.timeoutMs > baseLimits.turnTimeoutMs
+    ? { ...baseLimits, turnTimeoutMs: request.timeoutMs }
+    : baseLimits;
   const diagnostics: RedactedError[] = [];
   const selfRepair = selfRepairConfig(request.selfRepair, limits.maxRepairAttempts);
   const repairClassifications: SelfRepairFailureClassification[] = [];
@@ -139,7 +182,11 @@ export async function* runAgentLoop(
   let toolEvidenceEvents: RuntimeEvent[] = [];
   let outputContractVerification: AgentLoopOutputContractVerification | undefined;
   const restoredHistory = await restoreSessionHistory(deps, sessionId);
-  const messages: ModelChatMessage[] = [...restoredHistory.messages, { role: "user", content: request.prompt }];
+  const messages: ModelChatMessage[] = [
+    ...restoredHistory.messages,
+    { role: "user", content: request.prompt },
+    ...(request.initialMessages ?? [])
+  ];
   let contextProjection: ContextProjectionResult | undefined;
   let evidenceFirst: EvidenceFirstRuntimeContext | undefined;
   let phasePlan: AgentPhasePlan | undefined;
@@ -155,7 +202,17 @@ export async function* runAgentLoop(
   const taskDeliveryFlow = createTaskDeliveryFlowSummary({ rawInput: request.prompt, activeTaskAvailable: true });
   let taskDeliveryFlowData = taskDeliveryFlowEventData(taskDeliveryFlow);
   const signal = control.signal;
-  const sweBenchVerificationGate = createSweBenchVerificationGateState(request.prompt);
+  let currentReadyStageControl: JsonObject | undefined;
+  const readyStageRequiredActionMisses = new Map<string, number>();
+  const readyStageMutationRepairMisses = new Map<string, number>();
+  const readyStageEditRepairFailures = new Set<string>();
+  const readyStagePatchRepairFailures = new Set<string>();
+  const readyStageMutationInputStalls = new Map<string, number>();
+  const readyStageMutationRepairHadFocusedRefresh = new Set<string>();
+  const readyStageProgressEvidenceCounts = new Map<string, number>();
+  const readyStageBudgetUsage = new Map<string, ReturnType<typeof createReadyStageBudgetUsage>>();
+  const toolDecisionBoard = createToolDecisionBoardState({ sessionId, turnId });
+  const acceptedSourceEvidencePaths = new Set<string>();
 
   const currentRepairOutcome = (): SelfRepairOutcomeSummary => outcomeFromState({
     enabled: selfRepair.enabled,
@@ -176,443 +233,6 @@ export async function* runAgentLoop(
     visibleReasoning: visibleReasoningProjection ?? (visibleReasoningRecords.length > 0 ? projectReasoningForOutput(visibleReasoningRecords, request.outputMode) : undefined),
     taskDeliveryFlow: taskDeliveryFlowData
   });
-
-  const maybeInsertSweBenchVerificationGate = async (): Promise<RuntimeEvent | undefined> => {
-    if (shouldInsertSweBenchRunCapabilityRoutingGate(sweBenchVerificationGate)) {
-      sweBenchVerificationGate.runCapabilityRoutingGateInserted = true;
-      const content = [
-        "SWE_BENCH_RUN_CAPABILITY_ROUTING_GATE",
-        "Framework routing gate: this user-level SWE-bench Lite task request has spent the pre-run tool budget without invoking the governed core.swe.bench.run terminal capability.",
-        `Observed preRunNonTerminalToolCalls=${sweBenchVerificationGate.preRunNonTerminalToolCount}, iterations=${iterations}, toolCalls=${toolCalls}.`,
-        "Next action must call core.swe.bench.run for the requested task number or task range, or report a bounded blocker. Do not continue read/search/memory/project exploration before the governed run capability."
-      ].join("\n");
-      messages.push({ role: "user", content });
-      const budget = createAgentLoopBudget({
-        kind: "verification",
-        requested: 1,
-        allowed: 1,
-        consumed: 1,
-        stopReason: "swe-bench-run-capability-routing",
-        policySource: "runtime.swe-bench-routing-gate"
-      });
-      const event = agentLoopEvent("agent.loop.budget.consumed", sessionId, turnId, trace, {
-        budget,
-        gate: "SWE_BENCH_RUN_CAPABILITY_ROUTING_GATE",
-        preRunNonTerminalToolCount: sweBenchVerificationGate.preRunNonTerminalToolCount,
-        iterationCount: iterations,
-        toolCallCount: toolCalls
-      }, request.agentId);
-      await recordRuntimeAdapterEvent(deps, event);
-      return event;
-    }
-    if (shouldInsertSweBenchSourceInspectionGate(sweBenchVerificationGate)) {
-      sweBenchVerificationGate.sourceInspectionGateInserted = true;
-      const content = [
-        "SWE_BENCH_SOURCE_INSPECTION_GATE",
-        "Framework acceptance gate: this managed SWE-bench run has spent the source-inspection budget on read/search/list tools without producing source-edit or test progress.",
-        `Observed sourceInspectionTools=${sweBenchVerificationGate.sourceInspectionToolCount}, sourceMutations=${sweBenchVerificationGate.sourceMutationCount}, shellCommands=${sweBenchVerificationGate.shellCommandCount}, testCommands=${sweBenchVerificationGate.testCommandCount}, iterations=${iterations}, toolCalls=${toolCalls}.`,
-        "Next action must make concrete progress: perform the smallest source edit, run a standard test command, or report a bounded blocker. Do not continue broad read/search/list exploration."
-      ].join("\n");
-      messages.push({ role: "user", content });
-      const budget = createAgentLoopBudget({
-        kind: "verification",
-        requested: 1,
-        allowed: 1,
-        consumed: 1,
-        stopReason: "swe-bench-source-inspection-budget",
-        policySource: "runtime.swe-bench-phase-gate"
-      });
-      const event = agentLoopEvent("agent.loop.budget.consumed", sessionId, turnId, trace, {
-        budget,
-        gate: "SWE_BENCH_SOURCE_INSPECTION_GATE",
-        sourceInspectionToolCount: sweBenchVerificationGate.sourceInspectionToolCount,
-        shellCommandCount: sweBenchVerificationGate.shellCommandCount,
-        testCommandCount: sweBenchVerificationGate.testCommandCount,
-        sourceMutationCount: sweBenchVerificationGate.sourceMutationCount,
-        iterationCount: iterations,
-        toolCallCount: toolCalls
-      }, request.agentId);
-      await recordRuntimeAdapterEvent(deps, event);
-      return event;
-    }
-    if (shouldInsertSweBenchReadyForHarnessGate(sweBenchVerificationGate)) {
-      const budget = createAgentLoopBudget({
-        kind: "verification",
-        requested: 1,
-        allowed: 1,
-        consumed: 1,
-        stopReason: "swe-bench-ready-for-harness",
-        policySource: "runtime.swe-bench-ready-for-harness-gate"
-      });
-      const event = agentLoopEvent("agent.loop.budget.consumed", sessionId, turnId, trace, {
-        budget,
-        gate: "SWE_BENCH_READY_FOR_HARNESS_GATE",
-        modelRequestCount: iterations,
-        toolCallCount: toolCalls,
-        sourceInspectionToolCount: sweBenchVerificationGate.sourceInspectionToolCount,
-        sourceMutationCount: sweBenchVerificationGate.sourceMutationCount,
-        shellCommandCount: sweBenchVerificationGate.shellCommandCount,
-        testCommandCount: sweBenchVerificationGate.testCommandCount,
-        successfulTestCommandCount: sweBenchVerificationGate.successfulTestCommandCount,
-        diffInspectionCount: sweBenchVerificationGate.diffInspectionCount,
-        postVerificationShellCommandCount: sweBenchVerificationGate.postVerificationShellCommandCount
-      }, request.agentId);
-      await recordRuntimeAdapterEvent(deps, event);
-      return event;
-    }
-    if (shouldInsertSweBenchRepoLocalRunnerGate(sweBenchVerificationGate)) {
-      sweBenchVerificationGate.repoLocalRunnerGateInserted = true;
-      const alternateCommand = sweBenchVerificationGate.pendingRepoLocalRunnerCommand ?? "repo-local test runner";
-      const alternateRunnerPath = sweBenchVerificationGate.pendingRepoLocalRunnerPath ?? "repo-local runner";
-      const content = [
-        "SWE_BENCH_REPO_LOCAL_RUNNER_GATE",
-        "Framework workflow gate: the latest Python test command failed because a Python test launcher is unavailable, but the tool evidence found a repo-local Python test runner.",
-        `Observed alternateRunnerPath=${alternateRunnerPath}, alternateCommand=${alternateCommand}, testCommands=${sweBenchVerificationGate.testCommandCount}, sourceMutations=${sweBenchVerificationGate.sourceMutationCount}, iterations=${iterations}, toolCalls=${toolCalls}.`,
-        `Next action must rerun the focused test through the repo-local runner from the checkout root, starting with: ${alternateCommand}.`,
-        "Do not install the missing test launcher or continue dependency probing before trying the repo-local runner once."
-      ].join("\n");
-      messages.push({ role: "user", content });
-      const budget = createAgentLoopBudget({
-        kind: "verification",
-        requested: 1,
-        allowed: 1,
-        consumed: 1,
-        stopReason: "swe-bench-repo-local-runner-routing",
-        policySource: "runtime.swe-bench-workflow-gate"
-      });
-      const event = agentLoopEvent("agent.loop.budget.consumed", sessionId, turnId, trace, {
-        budget,
-        gate: "SWE_BENCH_REPO_LOCAL_RUNNER_GATE",
-        alternateCommand,
-        alternateRunnerPath,
-        testCommandCount: sweBenchVerificationGate.testCommandCount,
-        sourceMutationCount: sweBenchVerificationGate.sourceMutationCount,
-        iterationCount: iterations,
-        toolCallCount: toolCalls
-      }, request.agentId);
-      await recordRuntimeAdapterEvent(deps, event);
-      return event;
-    }
-    if (shouldInsertSweBenchEnvironmentBlockerGate(sweBenchVerificationGate)) {
-      sweBenchVerificationGate.environmentBlockerInserted = true;
-      const content = [
-        "SWE_BENCH_ENVIRONMENT_BLOCKER_GATE",
-        "Framework acceptance gate: this managed SWE-bench run has already produced source-edit and test evidence, but continues spending shell commands on environment setup or dependency probing.",
-        `Observed shellCommands=${sweBenchVerificationGate.shellCommandCount}, postVerificationShellCommands=${sweBenchVerificationGate.postVerificationShellCommandCount}, testCommands=${sweBenchVerificationGate.testCommandCount}, sourceMutations=${sweBenchVerificationGate.sourceMutationCount}, iterations=${iterations}, toolCalls=${toolCalls}.`,
-        "Do not continue broad dependency installation or environment probing. Use existing test output and source evidence to make the smallest source adjustment if needed, inspect git diff if useful, then end the child run so the governed outer SWE-bench harness can score the patch.",
-        "If the local environment is blocked, report that blocker briefly and still return control with the current diff instead of consuming more setup iterations."
-      ].join("\n");
-      messages.push({ role: "user", content });
-      const budget = createAgentLoopBudget({
-        kind: "verification",
-        requested: 1,
-        allowed: 1,
-        consumed: 1,
-        stopReason: "swe-bench-environment-blocker",
-        policySource: "runtime.swe-bench-phase-gate"
-      });
-      const event = agentLoopEvent("agent.loop.budget.consumed", sessionId, turnId, trace, {
-        budget,
-        gate: "SWE_BENCH_ENVIRONMENT_BLOCKER_GATE",
-        shellCommandCount: sweBenchVerificationGate.shellCommandCount,
-        postVerificationShellCommandCount: sweBenchVerificationGate.postVerificationShellCommandCount,
-        testCommandCount: sweBenchVerificationGate.testCommandCount,
-        successfulTestCommandCount: sweBenchVerificationGate.successfulTestCommandCount,
-        sourceMutationCount: sweBenchVerificationGate.sourceMutationCount,
-        iterationCount: iterations,
-        toolCallCount: toolCalls
-      }, request.agentId);
-      await recordRuntimeAdapterEvent(deps, event);
-      return event;
-    }
-    if (shouldInsertSweBenchPostEditVerificationGate(sweBenchVerificationGate)) {
-      sweBenchVerificationGate.postEditVerificationGateInserted = true;
-      const content = [
-        "SWE_BENCH_POST_EDIT_VERIFICATION_GATE",
-        "Framework acceptance gate: this managed SWE-bench run has produced a source edit after heavy inspection but still has no model-authored standard test command.",
-        `Observed sourceInspectionTools=${sweBenchVerificationGate.sourceInspectionToolCount}, sourceMutations=${sweBenchVerificationGate.sourceMutationCount}, shellCommands=${sweBenchVerificationGate.shellCommandCount}, testCommands=${sweBenchVerificationGate.testCommandCount}, iterations=${iterations}, toolCalls=${toolCalls}.`,
-        "Next action must be a standard test command that exercises the checkout, such as pytest, python -m pytest, python -m unittest, tox, nox, or the repository package test runner.",
-        "If the test environment is blocked, report the bounded blocker instead of spending more read/search/list or setup iterations."
-      ].join("\n");
-      messages.push({ role: "user", content });
-      const budget = createAgentLoopBudget({
-        kind: "verification",
-        requested: 1,
-        allowed: 1,
-        consumed: 1,
-        stopReason: "swe-bench-post-edit-test-command-missing",
-        policySource: "runtime.swe-bench-phase-gate"
-      });
-      const event = agentLoopEvent("agent.loop.budget.consumed", sessionId, turnId, trace, {
-        budget,
-        gate: "SWE_BENCH_POST_EDIT_VERIFICATION_GATE",
-        sourceInspectionToolCount: sweBenchVerificationGate.sourceInspectionToolCount,
-        shellCommandCount: sweBenchVerificationGate.shellCommandCount,
-        testCommandCount: sweBenchVerificationGate.testCommandCount,
-        sourceMutationCount: sweBenchVerificationGate.sourceMutationCount,
-        iterationCount: iterations,
-        toolCallCount: toolCalls
-      }, request.agentId);
-      await recordRuntimeAdapterEvent(deps, event);
-      return event;
-    }
-    if (!shouldInsertSweBenchVerificationGate(sweBenchVerificationGate)) return undefined;
-    sweBenchVerificationGate.inserted = true;
-    const content = [
-      "SWE_BENCH_VERIFICATION_GATE",
-      "Framework acceptance gate: this managed SWE-bench run has used shell commands without a model-authored standard test command.",
-      `Observed shellCommands=${sweBenchVerificationGate.shellCommandCount}, testCommands=${sweBenchVerificationGate.testCommandCount}, iterations=${iterations}, toolCalls=${toolCalls}.`,
-      "Next action must be a standard test command that exercises the checkout, such as pytest, python -m pytest, python -m unittest, tox, nox, or the repository package test runner.",
-      "After that test evidence exists, continue with the smallest source fix or report the test/setup blocker."
-    ].join("\n");
-    messages.push({ role: "user", content });
-    const budget = createAgentLoopBudget({
-      kind: "verification",
-      requested: 1,
-      allowed: 1,
-      consumed: 1,
-      stopReason: "swe-bench-test-command-missing",
-      policySource: "runtime.swe-bench-phase-gate"
-    });
-    const event = agentLoopEvent("agent.loop.budget.consumed", sessionId, turnId, trace, {
-      budget,
-      gate: "SWE_BENCH_VERIFICATION_GATE",
-      shellCommandCount: sweBenchVerificationGate.shellCommandCount,
-      testCommandCount: sweBenchVerificationGate.testCommandCount,
-      iterationCount: iterations,
-      toolCallCount: toolCalls
-    }, request.agentId);
-    await recordRuntimeAdapterEvent(deps, event);
-    return event;
-  };
-
-  const maybeStopAtSweBenchRequestBudget = async function* (): AsyncGenerator<RuntimeEvent, boolean, void> {
-    if (!shouldStopAtSweBenchRequestBudget(sweBenchVerificationGate, iterations)) return false;
-    if (shouldStopAtSweBenchRunCapabilityRoutingBudget(sweBenchVerificationGate, iterations)) {
-      const error = kernelError(
-        "KERNEL_QUEUE_BACKPRESSURE",
-        "SWE_BENCH_RUN_CAPABILITY_ROUTING_REQUEST_BUDGET_GATE: user-level SWE-bench task request exhausted the model request budget before invoking core.swe.bench.run.",
-        {
-          gate: "SWE_BENCH_RUN_CAPABILITY_ROUTING_REQUEST_BUDGET_GATE",
-          maxModelRequests: SWE_BENCH_MODEL_REQUEST_BUDGET,
-          modelRequestCount: iterations,
-          toolCallCount: toolCalls,
-          preRunNonTerminalToolCount: sweBenchVerificationGate.preRunNonTerminalToolCount
-        }
-      );
-      diagnostics.push(error);
-      const budget = createAgentLoopBudget({
-        kind: "model-iteration",
-        requested: SWE_BENCH_MODEL_REQUEST_BUDGET,
-        allowed: SWE_BENCH_MODEL_REQUEST_BUDGET,
-        consumed: iterations,
-        stopReason: "swe-bench-run-capability-routing-budget-exceeded",
-        policySource: "runtime.swe-bench-routing-request-budget-gate"
-      });
-      const event = agentLoopEvent("agent.loop.budget.consumed", sessionId, turnId, trace, {
-        budget,
-        gate: "SWE_BENCH_RUN_CAPABILITY_ROUTING_REQUEST_BUDGET_GATE",
-        modelRequestCount: iterations,
-        toolCallCount: toolCalls,
-        preRunNonTerminalToolCount: sweBenchVerificationGate.preRunNonTerminalToolCount
-      }, request.agentId, error);
-      await recordRuntimeAdapterEvent(deps, event);
-      yield event;
-      yield* emitFailureWithRepair("rejected", "swe-bench-run-capability-routing-budget-exceeded", error, event, {
-        requestBudget: {
-          gate: "SWE_BENCH_RUN_CAPABILITY_ROUTING_REQUEST_BUDGET_GATE",
-          maxModelRequests: SWE_BENCH_MODEL_REQUEST_BUDGET,
-          modelRequestCount: iterations,
-          toolCallCount: toolCalls
-        }
-      });
-      terminalEmitted = true;
-      return true;
-    }
-    if (shouldCompleteSweBenchReadyForHarness(sweBenchVerificationGate)) {
-      const budget = createAgentLoopBudget({
-        kind: "verification",
-        requested: 1,
-        allowed: 1,
-        consumed: 1,
-        stopReason: "swe-bench-ready-for-harness",
-        policySource: "runtime.swe-bench-ready-for-harness-gate"
-      });
-      const event = agentLoopEvent("agent.loop.budget.consumed", sessionId, turnId, trace, {
-        budget,
-        gate: "SWE_BENCH_READY_FOR_HARNESS_GATE",
-        modelRequestCount: iterations,
-        toolCallCount: toolCalls,
-        sourceInspectionToolCount: sweBenchVerificationGate.sourceInspectionToolCount,
-        sourceMutationCount: sweBenchVerificationGate.sourceMutationCount,
-        shellCommandCount: sweBenchVerificationGate.shellCommandCount,
-        testCommandCount: sweBenchVerificationGate.testCommandCount,
-        successfulTestCommandCount: sweBenchVerificationGate.successfulTestCommandCount,
-        diffInspectionCount: sweBenchVerificationGate.diffInspectionCount,
-        postVerificationShellCommandCount: sweBenchVerificationGate.postVerificationShellCommandCount
-      }, request.agentId);
-      await recordRuntimeAdapterEvent(deps, event);
-      yield event;
-      const outcomeReasoning = await emitVisibleReasoning({
-        actor: "runtime",
-        stepKind: "outcome",
-        status: "completed",
-        summary: "SWE-bench child run has source edit and successful test evidence at the request budget boundary; returning control for official harness scoring.",
-        phase: "verification",
-        certainty: "verified",
-        evidence: [visibleReasoningEvidence("trace", {
-          kind: "turn",
-          id: `${event.kind}:${event.createdAt}`,
-          label: "SWE-bench ready for harness gate",
-          sessionId,
-          turnId,
-          metadata: { gate: event.data.gate }
-        }, "SWE-bench ready for harness gate")]
-      });
-      yield outcomeReasoning;
-      const projectedReasoning = await emitVisibleReasoningProjection();
-      yield projectedReasoning;
-      const summary = {
-        ...summarizeAgentLoop("completed", request, sessionId, turnId, trace, assistantText, iterations, toolCalls, diagnostics, summaryMode()),
-        reason: "swe-bench-ready-for-harness",
-        terminalGate: {
-          gate: "SWE_BENCH_READY_FOR_HARNESS_GATE",
-          modelRequestCount: iterations,
-          toolCallCount: toolCalls,
-          sourceMutationCount: sweBenchVerificationGate.sourceMutationCount,
-          testCommandCount: sweBenchVerificationGate.testCommandCount,
-          successfulTestCommandCount: sweBenchVerificationGate.successfulTestCommandCount,
-          diffInspectionCount: sweBenchVerificationGate.diffInspectionCount
-        }
-      };
-      yield* recordLosslessAssistantMessage(deps, {
-        sessionId,
-        turnId,
-        trace,
-        content: assistantText,
-        ...(losslessUserNodeId ? { userNodeId: losslessUserNodeId } : {}),
-        ...(request.agentId ? { agentId: request.agentId } : {})
-      });
-      const completed = agentLoopEvent("turn.completed", sessionId, turnId, trace, summary, request.agentId);
-      await recordRuntimeAdapterEvent(deps, completed);
-      yield completed;
-      const loopTerminal = agentLoopEvent("agent.loop.completed", sessionId, turnId, trace, summary, request.agentId);
-      await recordRuntimeAdapterEvent(deps, loopTerminal);
-      yield loopTerminal;
-      terminalEmitted = true;
-      return true;
-    }
-    const error = kernelError(
-      "KERNEL_QUEUE_BACKPRESSURE",
-      "SWE_BENCH_REQUEST_BUDGET_GATE: managed SWE-bench child run exhausted the model request budget before producing completion-grade evidence.",
-      {
-        gate: "SWE_BENCH_REQUEST_BUDGET_GATE",
-        maxModelRequests: SWE_BENCH_MODEL_REQUEST_BUDGET,
-        modelRequestCount: iterations,
-        toolCallCount: toolCalls,
-        sourceInspectionToolCount: sweBenchVerificationGate.sourceInspectionToolCount,
-        sourceMutationCount: sweBenchVerificationGate.sourceMutationCount,
-        shellCommandCount: sweBenchVerificationGate.shellCommandCount,
-        testCommandCount: sweBenchVerificationGate.testCommandCount,
-        successfulTestCommandCount: sweBenchVerificationGate.successfulTestCommandCount,
-        diffInspectionCount: sweBenchVerificationGate.diffInspectionCount,
-        postVerificationShellCommandCount: sweBenchVerificationGate.postVerificationShellCommandCount
-      }
-    );
-    diagnostics.push(error);
-    const budget = createAgentLoopBudget({
-      kind: "model-iteration",
-      requested: SWE_BENCH_MODEL_REQUEST_BUDGET,
-      allowed: SWE_BENCH_MODEL_REQUEST_BUDGET,
-      consumed: iterations,
-      stopReason: "swe-bench-request-budget-exceeded",
-      policySource: "runtime.swe-bench-request-budget-gate"
-    });
-    const event = agentLoopEvent("agent.loop.budget.consumed", sessionId, turnId, trace, {
-      budget,
-      gate: "SWE_BENCH_REQUEST_BUDGET_GATE",
-      modelRequestCount: iterations,
-      toolCallCount: toolCalls,
-      sourceInspectionToolCount: sweBenchVerificationGate.sourceInspectionToolCount,
-      sourceMutationCount: sweBenchVerificationGate.sourceMutationCount,
-      shellCommandCount: sweBenchVerificationGate.shellCommandCount,
-      testCommandCount: sweBenchVerificationGate.testCommandCount,
-      diffInspectionCount: sweBenchVerificationGate.diffInspectionCount,
-      postVerificationShellCommandCount: sweBenchVerificationGate.postVerificationShellCommandCount
-    }, request.agentId, error);
-    await recordRuntimeAdapterEvent(deps, event);
-    yield event;
-    yield* emitFailureWithRepair("rejected", "swe-bench-request-budget-exceeded", error, event, {
-      requestBudget: {
-        gate: "SWE_BENCH_REQUEST_BUDGET_GATE",
-        maxModelRequests: SWE_BENCH_MODEL_REQUEST_BUDGET,
-        modelRequestCount: iterations,
-        toolCallCount: toolCalls
-      }
-    });
-    terminalEmitted = true;
-    return true;
-  };
-
-  const maybeStopAtSweBenchSourceInspectionDefiance = async function* (
-    terminalKind: string,
-    rejectedEvent: RuntimeEvent
-  ): AsyncGenerator<RuntimeEvent, boolean, void> {
-    if (!shouldStopAtSweBenchSourceInspectionDefiance(sweBenchVerificationGate, terminalKind)) return false;
-    const error = kernelError(
-      "KERNEL_POLICY_DENIED",
-      "SWE_BENCH_SOURCE_INSPECTION_DEFIANCE_GATE: managed SWE-bench child run repeatedly requested read/search/list or non-test setup after the source-inspection gate required edit, test, or bounded blocker progress.",
-      {
-        gate: "SWE_BENCH_SOURCE_INSPECTION_DEFIANCE_GATE",
-        sourceInspectionGate: "SWE_BENCH_SOURCE_INSPECTION_GATE",
-        defianceCount: sweBenchVerificationGate.sourceInspectionGateDefianceCount,
-        defianceLimit: SWE_BENCH_SOURCE_INSPECTION_GATE_DEFIANCE_LIMIT,
-        modelRequestCount: iterations,
-        toolCallCount: toolCalls,
-        sourceInspectionToolCount: sweBenchVerificationGate.sourceInspectionToolCount,
-        sourceMutationCount: sweBenchVerificationGate.sourceMutationCount,
-        shellCommandCount: sweBenchVerificationGate.shellCommandCount,
-        testCommandCount: sweBenchVerificationGate.testCommandCount
-      }
-    );
-    diagnostics.push(error);
-    const budget = createAgentLoopBudget({
-      kind: "verification",
-      requested: SWE_BENCH_SOURCE_INSPECTION_GATE_DEFIANCE_LIMIT,
-      allowed: SWE_BENCH_SOURCE_INSPECTION_GATE_DEFIANCE_LIMIT,
-      consumed: sweBenchVerificationGate.sourceInspectionGateDefianceCount,
-      stopReason: "swe-bench-source-inspection-defiance",
-      policySource: "runtime.swe-bench-source-inspection-defiance-gate"
-    });
-    const event = agentLoopEvent("agent.loop.budget.consumed", sessionId, turnId, trace, {
-      budget,
-      gate: "SWE_BENCH_SOURCE_INSPECTION_DEFIANCE_GATE",
-      sourceInspectionGate: "SWE_BENCH_SOURCE_INSPECTION_GATE",
-      modelRequestCount: iterations,
-      toolCallCount: toolCalls,
-      defianceCount: sweBenchVerificationGate.sourceInspectionGateDefianceCount,
-      sourceInspectionToolCount: sweBenchVerificationGate.sourceInspectionToolCount,
-      sourceMutationCount: sweBenchVerificationGate.sourceMutationCount,
-      shellCommandCount: sweBenchVerificationGate.shellCommandCount,
-      testCommandCount: sweBenchVerificationGate.testCommandCount,
-      rejectedToolCallId: rejectedEvent.data.toolCallId,
-      rejectedToolName: rejectedEvent.data.toolName,
-      rejectedTerminalKind: terminalKind
-    }, request.agentId, error);
-    await recordRuntimeAdapterEvent(deps, event);
-    yield event;
-    yield* emitFailureWithRepair("rejected", "swe-bench-source-inspection-defiance", error, event, {
-      sourceInspectionDefiance: {
-        gate: "SWE_BENCH_SOURCE_INSPECTION_DEFIANCE_GATE",
-        sourceInspectionGate: "SWE_BENCH_SOURCE_INSPECTION_GATE",
-        defianceCount: sweBenchVerificationGate.sourceInspectionGateDefianceCount,
-        defianceLimit: SWE_BENCH_SOURCE_INSPECTION_GATE_DEFIANCE_LIMIT,
-        modelRequestCount: iterations,
-        toolCallCount: toolCalls
-      }
-    });
-    return true;
-  };
 
   const nextReasoningSequence = (): number => {
     visibleReasoningSequence += 10;
@@ -645,6 +265,63 @@ export async function* runAgentLoop(
     return event;
   };
 
+  const emitDecisionBoardSnapshot = async function* (): AsyncGenerator<RuntimeEvent, void, void> {
+    const availableCapabilities = await deps.capabilities.listModelVisible();
+    const snapshotRequest: AgentLoopRequest = {
+      ...request,
+      ...(activeProfilePolicy ? { profilePolicy: activeProfilePolicy } : {})
+    };
+    const projectedCapabilities = projectToolSet(availableCapabilities, snapshotRequest);
+    const visibleCapabilities = projectWorkflowGateOverrideTools(
+      projectedCapabilities,
+      activeWorkflowGateOverride,
+      { preferCanonicalCoreActions: true }
+    );
+    const activeStageId = currentReadyStageControl && typeof currentReadyStageControl.stageId === "string"
+      ? currentReadyStageControl.stageId
+      : undefined;
+    const decisionBoard = toolDecisionBoardSnapshot({
+      state: toolDecisionBoard,
+      iteration: iterations,
+      activeProfileId: activeProfilePolicy?.profileId ?? request.profile.id,
+      ...(activeStageId ? { activeStageId } : {}),
+      availableCapabilities,
+      visibleCapabilities,
+      ...(activeProfilePolicy ? { profilePolicy: projectionEvidencePolicy(activeProfilePolicy, currentReadyStageControl) } : {})
+    });
+    const event = agentLoopEvent("tool.decision-board.snapshot", sessionId, turnId, trace, decisionBoard, request.agentId);
+    await recordRuntimeAdapterEvent(deps, event);
+    yield event;
+  };
+
+  const recordLoopFailureAnalysis = (input: {
+    readonly reason: string;
+    readonly status: AgentLoopSummary["status"];
+    readonly error?: RedactedError;
+    readonly event?: RuntimeEvent;
+  }) => {
+    const stageId = currentReadyStageControl && typeof currentReadyStageControl.stageId === "string"
+      ? currentReadyStageControl.stageId
+      : undefined;
+    const terminalKind = input.event?.kind ?? input.reason;
+    return recordFailureAnalysis(toolDecisionBoard, {
+      attemptId: `attempt:${turnId}:${input.reason}:${iterations}`,
+      ...(stageId ? { stageId } : {}),
+      terminalKind,
+      failureClass: failureClassForLoopTerminal(input.reason, input.status),
+      attribution: attributionForLoopTerminal(input.reason, input.error),
+      proofStatus: "proven",
+      evidenceQueries: evidenceQueriesForLoopTerminal(input.reason),
+      acceptedEvidenceRefs: [
+        `turn:${turnId}`,
+        `terminal:${terminalKind}`,
+        `iterations:${iterations}`,
+        `toolCalls:${toolCalls}`
+      ],
+      nextAllowedAction: nextActionForLoopTerminal(input.reason)
+    });
+  };
+
   const emitFailureWithRepair = async function* (
     status: AgentLoopSummary["status"],
     reason: string,
@@ -652,6 +329,8 @@ export async function* runAgentLoop(
     event?: RuntimeEvent,
     extraData: JsonObject = {}
   ): AsyncGenerator<RuntimeEvent, boolean, void> {
+    const failureAnalysis = recordLoopFailureAnalysis({ reason, status, ...(error ? { error } : {}), ...(event ? { event } : {}) });
+    yield* emitDecisionBoardSnapshot();
     if (error || event) {
       const classification = classifyRepairFailure({
         terminalKind: event?.kind ?? reason,
@@ -738,7 +417,7 @@ export async function* runAgentLoop(
     const projectedReasoning = await emitVisibleReasoningProjection();
     yield projectedReasoning;
     const summary = summarizeAgentLoop(status, request, sessionId, turnId, trace, assistantText, iterations, toolCalls, diagnostics, summaryMode());
-    const failed = agentLoopEvent("agent.loop.failed", sessionId, turnId, trace, { ...summary, reason, ...extraData }, request.agentId, error);
+    const failed = agentLoopEvent("agent.loop.failed", sessionId, turnId, trace, { ...summary, reason, failureAnalysis, ...extraData }, request.agentId, error);
     await recordRuntimeAdapterEvent(deps, failed);
     yield failed;
     return false;
@@ -1010,25 +689,151 @@ export async function* runAgentLoop(
       terminalEmitted = true;
       return;
     }
-    if (yield* maybeStopAtSweBenchRequestBudget()) return;
     iterations += 1;
     let iterationReasoning = "";
     let reasoningPersistedForIteration = false;
-    const iterationRequest = activeProfilePolicy
-      ? { ...request, profilePolicy: activeProfilePolicy }
-      : activeWorkflowGateOverride
-        ? { ...request, profilePolicy: runtimeWorkflowGateOverridePolicy(activeWorkflowGateOverride) }
-        : request;
+    let iterationProgressCapabilitySatisfied = false;
+    const iterationProfilePolicy = profilePolicyWithRuntimeWorkflowGateOverride(activeProfilePolicy, activeWorkflowGateOverride);
+    const iterationRequest = iterationProfilePolicy
+      ? { ...request, profilePolicy: iterationProfilePolicy }
+      : request;
+    currentReadyStageControl = readyStageControlForProfilePolicy(iterationRequest.profilePolicy);
+    const stalledWorkflowError = currentReadyStageControl
+      ? undefined
+      : stalledPrimaryWorkflowError(iterationRequest.profilePolicy);
+    if (stalledWorkflowError) {
+      diagnostics.push(stalledWorkflowError);
+      yield* emitFailureWithRepair("failed", "workflow-orchestration-stalled", stalledWorkflowError);
+      terminalEmitted = true;
+      return;
+    }
+    if (currentReadyStageControl) {
+      const controlEvent = agentLoopEvent("workflow.ready-stage.control", sessionId, turnId, trace, currentReadyStageControl, request.agentId);
+      await recordRuntimeAdapterEvent(deps, controlEvent);
+      yield controlEvent;
+      const externalHarnessReturn = externalHarnessReturnGateForReadyScoreStage(iterationRequest.profilePolicy, currentReadyStageControl);
+      if (externalHarnessReturn) {
+        const consumed = agentLoopEvent("agent.loop.budget.consumed", sessionId, turnId, trace, externalHarnessReturn, request.agentId);
+        await recordRuntimeAdapterEvent(deps, consumed);
+        yield consumed;
+        const summary = {
+          ...summarizeAgentLoop("completed", request, sessionId, turnId, trace, assistantText, iterations, toolCalls, diagnostics, summaryMode()),
+          reason: "external-score-ready",
+          workflow: {
+            profileId: iterationRequest.profilePolicy?.profileId,
+            workflowGraphId: iterationRequest.profilePolicy?.workflowGraphId,
+            graphId: iterationRequest.profilePolicy?.stagedTaskWorkflow?.graphId,
+            stageStates: iterationRequest.profilePolicy?.stagedTaskWorkflow?.runState.stageStates.map((stage) => ({
+              stageId: stage.stageId,
+              status: stage.status,
+              outputRefs: stage.outputRefs
+            })) ?? []
+          }
+        };
+        yield* recordLosslessAssistantMessage(deps, {
+          sessionId,
+          turnId,
+          trace,
+          content: assistantText,
+          ...(losslessUserNodeId ? { userNodeId: losslessUserNodeId } : {}),
+          ...(request.agentId ? { agentId: request.agentId } : {})
+        });
+        const completed = agentLoopEvent("turn.completed", sessionId, turnId, trace, summary, request.agentId);
+        await recordRuntimeAdapterEvent(deps, completed);
+        yield completed;
+        const loopTerminal = agentLoopEvent("agent.loop.completed", sessionId, turnId, trace, summary, request.agentId);
+        await recordRuntimeAdapterEvent(deps, loopTerminal);
+        yield loopTerminal;
+        terminalEmitted = true;
+        return;
+      }
+      const readyStageBudget = readyStageBudgetForControl(limits, currentReadyStageControl);
+      if (readyStageBudget?.maxModelIterations !== undefined) {
+        const budgetKey = readyStageBudgetKey(currentReadyStageControl, readyStageBudget);
+        const usage = readyStageBudgetUsage.get(budgetKey) ?? {
+          modelIterations: 0,
+          toolCalls: 0,
+          modelIterationReviewInjected: false,
+          toolCallReviewInjected: false
+        };
+        if (usage.modelIterations >= readyStageBudget.maxModelIterations) {
+          const budget = readyStageBudgetEventData({
+            control: currentReadyStageControl,
+            budget: readyStageBudget,
+            kind: "ready-stage-model-iterations",
+            allowed: readyStageBudget.maxModelIterations,
+            consumed: usage.modelIterations,
+            remaining: 0,
+            stopReason: readyStageBudget.stopReason ?? "ready-stage-model-budget-review-required"
+          });
+          const consumed = agentLoopEvent("agent.loop.budget.consumed", sessionId, turnId, trace, budget, request.agentId);
+          await recordRuntimeAdapterEvent(deps, consumed);
+          yield consumed;
+          if (usage.modelIterationReviewInjected) {
+            const stopReason = readyStageBudget.stopReason ?? "ready-stage-model-budget-review-required";
+            const error = kernelError("KERNEL_QUEUE_BACKPRESSURE", "WORKFLOW_STAGE_BUDGET_REVIEW_REQUIRED: active ready-stage model budget is spent after review feedback; stop this stage and classify the blocker.", {
+              workflowReadyStageControl: currentReadyStageControl,
+              budget
+            });
+            diagnostics.push(error);
+            yield* emitFailureWithRepair("rejected", stopReason, error, consumed, {
+              workflowReadyStageControl: currentReadyStageControl,
+              budget
+            });
+            terminalEmitted = true;
+            return;
+          }
+          messages.push(readyStageBudgetReviewMessage(currentReadyStageControl, budget));
+          readyStageBudgetUsage.set(budgetKey, {
+            ...usage,
+            modelIterations: Math.max(readyStageBudget.maxModelIterations - 1, 0),
+            modelIterationReviewInjected: true
+          });
+          continue;
+        }
+        readyStageBudgetUsage.set(budgetKey, { ...usage, modelIterations: usage.modelIterations + 1 });
+      }
+    }
     const availableCapabilities = await deps.capabilities.listModelVisible();
     const projectedCapabilities = projectToolSet(availableCapabilities, iterationRequest);
-    const visibleCapabilities = activeProfilePolicy
-      ? projectedCapabilities
-      : projectWorkflowGateOverrideTools(projectedCapabilities, activeWorkflowGateOverride, { preferCanonicalCoreActions: true });
-    const providerHistory = providerHistoryForRequest(messages, sweBenchVerificationGate);
+    const visibleCapabilities = projectWorkflowGateOverrideTools(
+      projectedCapabilities,
+      iterationRequest.profilePolicy?.workflowGateOverride,
+      {
+        preferCanonicalCoreActions: true,
+        strict: iterationRequest.profilePolicy?.workflowGateOverride?.gate === "runtime-convergence"
+      }
+    );
+    const activeStageId = currentReadyStageControl && typeof currentReadyStageControl.stageId === "string"
+      ? currentReadyStageControl.stageId
+      : undefined;
+    const decisionBoard = toolDecisionBoardSnapshot({
+      state: toolDecisionBoard,
+      iteration: iterations,
+      activeProfileId: iterationRequest.profilePolicy?.profileId ?? request.profile.id,
+      ...(activeStageId ? { activeStageId } : {}),
+      availableCapabilities,
+      visibleCapabilities,
+      ...(iterationRequest.profilePolicy ? { profilePolicy: projectionEvidencePolicy(iterationRequest.profilePolicy, currentReadyStageControl) } : {})
+    });
+    const decisionBoardEvent = agentLoopEvent("tool.decision-board.snapshot", sessionId, turnId, trace, decisionBoard, request.agentId);
+    await recordRuntimeAdapterEvent(deps, decisionBoardEvent);
+    yield decisionBoardEvent;
+    const projectionError = workflowProjectionError(iterationRequest.profilePolicy, availableCapabilities, visibleCapabilities, currentReadyStageControl);
+    if (projectionError) {
+      diagnostics.push(projectionError);
+      yield* emitFailureWithRepair("failed", "workflow-capability-projection-empty", projectionError);
+      terminalEmitted = true;
+      return;
+    }
+    const providerHistory = messages;
+    const schedulingNextAction = schedulingNextActionForModelRequest(iterationRequest.profilePolicy, currentReadyStageControl, visibleCapabilities);
     const assembly = await assemblePromptForIteration(deps, iterationRequest, sessionId, turnId, trace, providerHistory, contextProjection, visibleCapabilities, limits, evidenceFirst, currentRepairOutcome(), {
       phasePlan,
       reasoningEffortMapping,
-      taskDecision: taskDeliveryFlow.decisionRequest
+      taskDecision: taskDeliveryFlow.decisionRequest,
+      ...(schedulingNextAction ? { schedulingNextAction } : {}),
+      toolDecisionBoard: decisionBoard
     });
     if (assembly.status === "rejected") {
       diagnostics.push(...assembly.diagnostics);
@@ -1037,6 +842,10 @@ export async function* runAgentLoop(
       terminalEmitted = true;
       return;
     }
+    const providerTools = projectProviderCacheToolSet(availableCapabilities, {
+      ...iterationRequest,
+      ...(currentReadyStageControl ? { workflowReadyStageControl: currentReadyStageControl } : {})
+    }).map((capability) => modelToolSchema(capability));
     const toolProjection = toolProjectionPolicy(iterationRequest);
     const visibleCapabilityIds = visibleCapabilities.map((capability) => capability.id);
     const capabilityResolutionSet = visibleCapabilities.length === availableCapabilities.length
@@ -1093,12 +902,14 @@ export async function* runAgentLoop(
     });
     yield promptReasoning;
 
+    const providerMessages = providerCacheMessages(assembly.messages);
     const modelRequested = agentLoopEvent("model.requested", sessionId, turnId, trace, {
       iteration: iterations,
       model: request.profile.model,
       toolProjection,
       visibleToolCount: assembly.toolPlan.visibleToolCount,
-      providerRequestReplay: providerRequestReplayEvidence(assembly.messages, restoredHistory, assembly.toolPlan.visibleToolCount, providerHistory.length),
+      providerToolSchemaCount: providerTools.length,
+      providerRequestReplay: providerRequestReplayEvidence(providerMessages, restoredHistory, providerTools.length, providerMessages.length),
       promptAssembly: {
         fingerprint: assembly.fingerprint,
         sectionCount: assembly.sections.length,
@@ -1107,6 +918,7 @@ export async function* runAgentLoop(
       ...(assembly.trace.pipeline ? { contextPipeline: assembly.trace.pipeline } : {}),
       ...(evidenceFirst ? { evidenceFirst: evidenceFirstEventData(evidenceFirst) } : {}),
       ...(contextProjection ? { contextProjection: projectionEventData(contextProjection) } : {}),
+      ...(currentReadyStageControl ? { workflowReadyStageControl: currentReadyStageControl } : {}),
       ...(iterationRequest.profilePolicy ? { profilePolicy: iterationRequest.profilePolicy } : {}),
       taskDeliveryFlow: taskDeliveryFlowData,
       ...(iterationRequest.referenceContext ? { referenceContext: referenceContextSummary(iterationRequest) } : {})
@@ -1119,18 +931,21 @@ export async function* runAgentLoop(
       model: request.profile.model,
       promptAssemblyFingerprint: assembly.fingerprint,
       ...(iterationRequest.profilePolicy ? { profilePolicy: iterationRequest.profilePolicy } : {}),
+      ...(currentReadyStageControl ? { workflowReadyStageControl: currentReadyStageControl } : {}),
       taskDeliveryFlow: taskDeliveryFlowData
     });
     yield modelRequested;
 
     let requestedTool = false;
+    let restartModelAfterWorkflowCorrection = false;
+    let modelDispatchInterrupted = false;
     const reasoning = modelReasoningOptions(request.reasoning, reasoningEffortMapping);
     const output = modelOutputOptions(request);
     for await (const modelEvent of deps.models.stream({
       profile: request.profile,
       prompt: assembly.promptText,
-      messages: assembly.messages,
-      tools: assembly.toolPlan.visibleTools,
+      messages: providerMessages,
+      tools: providerTools,
       toolProjection,
       ...(request.credentialRef ? { credentialRef: request.credentialRef } : {}),
       ...(reasoning ? { reasoning } : {}),
@@ -1144,6 +959,7 @@ export async function* runAgentLoop(
         trace,
         outputMode: request.outputMode,
         ...(contextProjection ? { contextProjection: projectionEventData(contextProjection) } : {}),
+        ...(currentReadyStageControl ? { workflowReadyStageControl: currentReadyStageControl } : {}),
         ...(iterationRequest.profilePolicy ? { profilePolicy: iterationRequest.profilePolicy } : {}),
         taskDeliveryFlow: taskDeliveryFlowData,
         promptAssembly: {
@@ -1207,26 +1023,30 @@ export async function* runAgentLoop(
           const providerToolName = modelEvent.name;
           const toolName = resolveCapabilityId(providerToolName, capabilityResolutionSet);
           const toolCallId = modelEvent.id ?? `tool-${iterations}-${toolCalls + 1}`;
-          const limitFeedback = buildToolResultFeedback({
+          const rejectedDispatch = buildRejectedDispatchResult({
             toolCallId,
             toolName,
-            status: "rejected",
+            normalizedInputHash: normalizeToolInputHash(modelEvent.input),
+            terminalKind: "tool-call-limit",
             text: error.message,
             diagnostics: [error],
+            correctiveAction: "Stop requesting additional tools and report the bounded tool-call budget blocker.",
+            recommendedNextAction: "bounded blocker report",
             trace,
             limitBytes: limits.maxOutputBytes,
-            continuation: "terminate"
+            iteration: iterations,
+            continuation: "terminate",
+            metadata: { maxToolCalls: limits.maxToolCalls }
           });
+          recordRejectedToolFeedback(toolDecisionBoard, rejectedDispatch.decisionRecord);
           const rejected = agentLoopEvent("model.tool.rejected", sessionId, turnId, trace, {
             reason: "tool-call-limit",
             maxToolCalls: limits.maxToolCalls,
             toolName,
-            feedback: limitFeedback,
+            feedback: rejectedDispatch.feedback,
             evidence: await recordToolResultEvidence(deps, {
-              toolCallId,
-              toolName,
-              terminalKind: "tool-call-limit",
-              feedback: limitFeedback
+              ...rejectedDispatch.evidenceInput,
+              terminalKind: "tool-call-limit"
             })
           }, request.agentId, error);
           await recordRuntimeAdapterEvent(deps, rejected);
@@ -1239,11 +1059,45 @@ export async function* runAgentLoop(
         const providerToolName = modelEvent.name;
         const toolCallId = modelEvent.id ?? `tool-${iterations}-${toolCalls}`;
         const toolName = resolveCapabilityId(providerToolName, capabilityResolutionSet);
-        recordSweBenchVerificationGateToolIntent(sweBenchVerificationGate, toolName, modelEvent.input);
+        const normalizedInputHash = normalizeToolInputHash(modelEvent.input);
+        const requestedCapabilityManifest = visibleCapabilities.find((capability) => String(capability.id) === toolName) ??
+          availableCapabilities.find((capability) => String(capability.id) === toolName);
+        const dispatchBatch = planToolDispatchBatch({
+          modelToolCalls: [{
+            toolCallId,
+            providerToolName,
+            resolvedCapabilityId: toolName,
+            normalizedInputHash,
+            input: modelEvent.input,
+            sideEffect: requestedCapabilityManifest?.sideEffect ?? "unknown",
+            iteration: iterations
+          }],
+          visibleCapabilityIds: visibleCapabilityIds.map(String),
+          ...(currentReadyStageControl ? { activeStageControl: currentReadyStageControl } : {})
+        });
+        const dispatchItem = dispatchBatch.items[0];
+        recordToolDecision(toolDecisionBoard, {
+          kind: "intent",
+          status: "requested",
+          toolCallId,
+          toolName,
+          normalizedInputHash,
+          iteration: iterations,
+          metadata: {
+            providerToolName,
+            inputKeys: Object.keys(modelEvent.input).sort(),
+            dispatch: {
+              itemCount: dispatchBatch.items.length,
+              executionMode: dispatchItem?.executionMode ?? "serial",
+              sideEffect: dispatchItem?.sideEffect ?? "unknown"
+            }
+          }
+        });
         const intentEvent = agentLoopEvent("model.tool.intent", sessionId, turnId, trace, {
           toolCallId,
           name: toolName,
           input: modelEvent.input,
+          normalizedInputHash,
           provider: modelEvent.provider ?? providerMetadata(request),
           iteration: iterations
         }, request.agentId);
@@ -1288,12 +1142,274 @@ export async function* runAgentLoop(
           ...(persistedReasoning.length > 0 ? { reasoningContent: persistedReasoning, reasoningRedaction: { class: "internal" } } : {})
         });
 
+        const activePreflightWorkflowGate = iterationRequest.profilePolicy?.workflowGateOverride;
+        const preflightWorkflowGateMiss = activePreflightWorkflowGate !== undefined
+          && !workflowGateOverrideAllowsCapability(activePreflightWorkflowGate, toolName)
+          && currentReadyStageControl?.stageKind !== undefined
+          && ["produce", "materialize", "repair"].includes(String(currentReadyStageControl.stageKind))
+          && (
+            readyStageProgressCapabilitySatisfied(toolName, currentReadyStageControl) ||
+            readyStageNonProgressCapabilityMiss(toolName, currentReadyStageControl)
+          );
+        if (preflightWorkflowGateMiss) {
+          const readyStageControl = currentReadyStageControl;
+          if (!readyStageControl) continue;
+          const missKey = readyStageRequiredActionMissKey(readyStageControl);
+          const missCount = readyStageRequiredActionMisses.get(missKey) ?? 0;
+          const convergence = readyStageRequiredActionConvergence({
+            missCount,
+            correctionLimit: READY_STAGE_REQUIRED_ACTION_CORRECTION_LIMIT,
+            iteration: iterations,
+            maxModelIterations: limits.maxModelIterations,
+            workflowReadyStageControl: readyStageControl,
+            requestedCapabilityId: toolName,
+            rejectedBeforeExecution: true
+          });
+          const correctionAttempt = Number(convergence.metadata?.correctionAttempt ?? missCount + 1);
+          const retryPolicy = String(convergence.metadata?.retryPolicy ?? "fail-closed");
+          const canCorrect = convergence.kind === "retry-with-feedback";
+          const error = kernelError(
+            "KERNEL_POLICY_DENIED",
+            `WORKFLOW_REQUIRED_ACTION_MISSED: model requested ${toolName} but the active workflow gate requires ${activePreflightWorkflowGate.requiredNextAction}.`,
+            {
+              workflowReadyStageControl: readyStageControl,
+              requestedCapabilityId: toolName,
+              workflowGateOverride: activePreflightWorkflowGate,
+              iteration: iterations
+            }
+          );
+          diagnostics.push(error);
+          const missed = agentLoopEvent("workflow.required-action.missed", sessionId, turnId, trace, {
+            ...readyStageControl,
+            requestedCapabilityId: toolName,
+            iteration: iterations,
+            modelRequestCount: iterations,
+            toolCallCount: toolCalls,
+            correctionAttempt,
+            retryPolicy,
+            rejectedBeforeExecution: true,
+            terminalKind: "workflow-required-action.rejected"
+          }, request.agentId, error);
+          await recordRuntimeAdapterEvent(deps, missed);
+          yield missed;
+          const stageFeedback = buildRejectedDispatchFeedback({
+            toolCallId,
+            toolName,
+            capabilityId: toolName,
+            text: error.message,
+            diagnostics: [error],
+            ...(convergence.correctiveAction ? { correctiveAction: convergence.correctiveAction } : {}),
+            ...(convergence.recommendedNextAction ? { recommendedNextAction: convergence.recommendedNextAction } : {}),
+            trace,
+            limitBytes: limits.maxOutputBytes,
+            continuation: "continue"
+          });
+          recordRejectedToolFeedback(toolDecisionBoard, {
+            toolCallId,
+            toolName,
+            capabilityId: toolName,
+            normalizedInputHash,
+            terminalKind: "workflow-required-action.rejected",
+            correctiveAction: stageFeedback.correctiveAction,
+            recommendedNextAction: stageFeedback.recommendedNextAction,
+            iteration: iterations,
+            metadata: { workflowReadyStageControl: readyStageControl, workflowGateOverride: activePreflightWorkflowGate }
+          });
+          const stageRejectedEvent = agentLoopEvent("model.tool.result", sessionId, turnId, trace, {
+            toolCallId,
+            toolName,
+            result: stageFeedback.preview.text,
+            terminalKind: "workflow-required-action.rejected",
+            feedback: stageFeedback,
+            evidence: await recordToolResultEvidence(deps, {
+              toolCallId,
+              toolName,
+              capabilityId: toolName,
+              terminalKind: "workflow-required-action.rejected",
+              feedback: stageFeedback
+            })
+          }, request.agentId, error);
+          await recordRuntimeAdapterEvent(deps, stageRejectedEvent);
+          yield stageRejectedEvent;
+          messages.push({ role: "tool", content: stageFeedback.preview.text, toolCallId, toolName });
+          readyStageRequiredActionMisses.set(missKey, missCount + 1);
+          if (canCorrect) {
+            messages.push(readyStageRequiredActionCorrectionMessage(readyStageControl, missCount + 1, error));
+            restartModelAfterWorkflowCorrection = true;
+            break;
+          }
+          yield* emitFailureWithRepair("rejected", "workflow-required-action-missed", error, missed);
+          terminalEmitted = true;
+          return;
+        }
+
+        if (shouldSuppressRepeatedRejectedIntent(toolDecisionBoard, { toolName, normalizedInputHash })) {
+          const error = kernelError("KERNEL_POLICY_DENIED", "DECISION_LOOP_REPEATED_REJECTED_INTENT: repeated identical rejected tool intent suppressed; choose a different projected tool, corrected input, or report a bounded blocker.", {
+            toolName,
+            normalizedInputHash,
+            threshold: 3
+          });
+          diagnostics.push(error);
+          const convergence = repeatedRejectedIntentConvergence({
+            threshold: 3,
+            count: 3
+          });
+          const suppressFeedback = buildRejectedDispatchFeedback({
+            toolCallId,
+            toolName,
+            text: "Repeated identical rejected tool intent suppressed. Use a different projected tool, provide corrected input, or report an explicit bounded blocker.",
+            diagnostics: [error],
+            ...(convergence.correctiveAction ? { correctiveAction: convergence.correctiveAction } : {}),
+            ...(convergence.recommendedNextAction ? { recommendedNextAction: convergence.recommendedNextAction } : {}),
+            trace,
+            limitBytes: limits.maxOutputBytes,
+            continuation: "continue"
+          });
+          const repeated = recordRejectedIntent(toolDecisionBoard, {
+            toolCallId,
+            toolName,
+            normalizedInputHash,
+            terminalKind: convergence.terminalKind ?? "decision-loop.rejected",
+            correctiveAction: convergence.correctiveAction,
+            recommendedNextAction: convergence.recommendedNextAction,
+            iteration: iterations
+          });
+          const suppressedBoard = toolDecisionBoardSnapshot({
+            state: toolDecisionBoard,
+            iteration: iterations,
+            activeProfileId: iterationRequest.profilePolicy?.profileId ?? request.profile.id,
+            ...(activeStageId ? { activeStageId } : {}),
+            availableCapabilities,
+            visibleCapabilities,
+            ...(iterationRequest.profilePolicy ? { profilePolicy: projectionEvidencePolicy(iterationRequest.profilePolicy, currentReadyStageControl) } : {})
+          });
+          const suppressEvent = agentLoopEvent("model.tool.result", sessionId, turnId, trace, {
+            toolCallId,
+            toolName,
+            result: suppressFeedback.preview.text,
+            terminalKind: "decision-loop.rejected",
+            feedback: suppressFeedback,
+            decisionBoard: {
+              boardId: suppressedBoard.boardId,
+              repeatedRejectedIntentCount: repeated.count,
+              decisionLoopFailureCandidate: suppressedBoard.decisionLoopFailureCandidate,
+              record: repeated.record
+            },
+            evidence: await recordToolResultEvidence(deps, {
+              toolCallId,
+              toolName,
+              terminalKind: "decision-loop.rejected",
+              feedback: suppressFeedback
+            })
+          }, request.agentId, error);
+          await recordRuntimeAdapterEvent(deps, suppressEvent);
+          yield suppressEvent;
+          messages.push({ role: "tool", content: suppressFeedback.preview.text, toolCallId, toolName });
+          continue;
+        }
+
+        const activeReadyStageBudget = currentReadyStageControl
+          ? readyStageBudgetForControl(limits, currentReadyStageControl)
+          : undefined;
+        if (currentReadyStageControl && activeReadyStageBudget?.maxToolCalls !== undefined) {
+          const budgetKey = readyStageBudgetKey(currentReadyStageControl, activeReadyStageBudget);
+          const usage = readyStageBudgetUsage.get(budgetKey) ?? {
+            modelIterations: 0,
+            toolCalls: 0,
+            modelIterationReviewInjected: false,
+            toolCallReviewInjected: false
+          };
+          if (usage.toolCalls >= activeReadyStageBudget.maxToolCalls) {
+            const budget = readyStageBudgetEventData({
+              control: currentReadyStageControl,
+              budget: activeReadyStageBudget,
+              kind: "ready-stage-tool-calls",
+              allowed: activeReadyStageBudget.maxToolCalls,
+              consumed: usage.toolCalls,
+              remaining: 0,
+              stopReason: activeReadyStageBudget.stopReason ?? "ready-stage-tool-budget-review-required"
+            });
+            const consumed = agentLoopEvent("agent.loop.budget.consumed", sessionId, turnId, trace, budget, request.agentId);
+            await recordRuntimeAdapterEvent(deps, consumed);
+            yield consumed;
+            if (usage.toolCallReviewInjected) {
+              const stopReason = activeReadyStageBudget.stopReason ?? "ready-stage-tool-budget-review-required";
+              const error = kernelError("KERNEL_QUEUE_BACKPRESSURE", "WORKFLOW_STAGE_BUDGET_REVIEW_REQUIRED: active ready-stage tool budget is spent after review feedback; stop this stage and classify the blocker.", {
+                workflowReadyStageControl: currentReadyStageControl,
+                budget,
+                requestedToolName: toolName
+              });
+              diagnostics.push(error);
+              yield* emitFailureWithRepair("rejected", stopReason, error, consumed, {
+                workflowReadyStageControl: currentReadyStageControl,
+                budget,
+                requestedToolName: toolName
+              });
+              terminalEmitted = true;
+              return;
+            }
+            const error = kernelError("KERNEL_QUEUE_BACKPRESSURE", "WORKFLOW_STAGE_BUDGET_REVIEW_REQUIRED: active ready-stage tool budget is spent; review progress and choose the next workflow action or report a bounded blocker.", {
+              workflowReadyStageControl: currentReadyStageControl,
+              budget,
+              requestedToolName: toolName
+            });
+            diagnostics.push(error);
+            const convergence = readyStageToolBudgetConvergence({
+              workflowReadyStageControl: currentReadyStageControl,
+              budget
+            });
+            const budgetFeedback = buildRejectedDispatchFeedback({
+              toolCallId,
+              toolName,
+              text: error.message,
+              diagnostics: [error],
+              ...(convergence.correctiveAction ? { correctiveAction: convergence.correctiveAction } : {}),
+              ...(convergence.recommendedNextAction ? { recommendedNextAction: convergence.recommendedNextAction } : {}),
+              trace,
+              limitBytes: limits.maxOutputBytes,
+              continuation: "continue"
+            });
+            recordRejectedToolFeedback(toolDecisionBoard, {
+              toolCallId,
+              toolName,
+              normalizedInputHash,
+              terminalKind: "workflow-stage-budget.review-required",
+              correctiveAction: budgetFeedback.correctiveAction,
+              recommendedNextAction: budgetFeedback.recommendedNextAction,
+              iteration: iterations,
+              metadata: { workflowReadyStageControl: currentReadyStageControl, budget }
+            });
+            const budgetRejected = agentLoopEvent("model.tool.result", sessionId, turnId, trace, {
+              toolCallId,
+              toolName,
+              result: budgetFeedback.preview.text,
+              terminalKind: "workflow-stage-budget.review-required",
+              feedback: budgetFeedback,
+              evidence: await recordToolResultEvidence(deps, {
+                toolCallId,
+                toolName,
+                terminalKind: "workflow-stage-budget.review-required",
+                feedback: budgetFeedback
+              })
+            }, request.agentId, error);
+            await recordRuntimeAdapterEvent(deps, budgetRejected);
+            yield budgetRejected;
+            messages.push({ role: "tool", content: budgetFeedback.preview.text, toolCallId, toolName });
+            messages.push(readyStageBudgetReviewMessage(currentReadyStageControl, budget));
+            readyStageBudgetUsage.set(budgetKey, { ...usage, toolCalls: 0, toolCallReviewInjected: true });
+            continue;
+          }
+          readyStageBudgetUsage.set(budgetKey, { ...usage, toolCalls: usage.toolCalls + 1 });
+        }
+
         const descriptor = await deps.platform.descriptor();
         const resolvedCapabilityId = asId<"capability">(toolName);
         const preflightVisibleCapabilityIds = visibleCapabilityIds.includes(resolvedCapabilityId) ||
           !availableCapabilities.some((capability) => capability.id === resolvedCapabilityId)
           ? visibleCapabilityIds
           : [...visibleCapabilityIds, resolvedCapabilityId];
+        const preflightManifest = visibleCapabilities.find((capability) => capability.id === resolvedCapabilityId);
+        const preflightToolTimeoutMs = toolTimeoutFor(modelEvent.input, limits.toolTimeoutMs, preflightManifest?.timeoutMs, request.timeoutMs);
         const preflight = await deps.toolIntentPreflight.check({
           intent: {
             toolCallId,
@@ -1308,7 +1424,8 @@ export async function* runAgentLoop(
           profileId: request.profile.id,
           providerHints: {
             userPrompt: request.prompt
-          }
+          },
+          toolTimeoutMs: preflightToolTimeoutMs
         });
         const preflightKind = preflight.status === "rejected" ? "model.tool.rejected" : preflight.status === "repaired" ? "model.tool.repaired" : "model.tool.repaired";
         const preflightEvent = agentLoopEvent(preflightKind, sessionId, turnId, trace, {
@@ -1323,165 +1440,508 @@ export async function* runAgentLoop(
         if (preflight.status === "rejected" || !preflight.capabilityId) {
           const error = toolIntentError(preflight.diagnostics);
           diagnostics.push(error);
-          const preflightFeedback = buildToolResultFeedback({
+          const rejectedDispatch = buildRejectedDispatchResult({
             toolCallId,
             toolName,
             ...(preflight.capabilityId ? { capabilityId: String(preflight.capabilityId) } : {}),
-            status: "rejected",
+            normalizedInputHash,
+            terminalKind: "preflight.rejected",
             text: `Tool request rejected: ${error.message}`,
             diagnostics: [error, ...preflight.diagnostics],
+            correctiveAction: "Correct the tool input or choose a different projected tool.",
+            recommendedNextAction: "corrected input or different projected tool",
             trace,
             limitBytes: limits.maxOutputBytes,
-            continuation: "continue"
+            continuation: "continue",
+            iteration: iterations
           });
           const preflightResultEvent = agentLoopEvent("model.tool.result", sessionId, turnId, trace, {
-            toolCallId,
-            toolName,
-            result: preflightFeedback.preview.text,
-            terminalKind: "preflight.rejected",
-            feedback: preflightFeedback,
+            ...rejectedDispatch.eventData,
             evidence: await recordToolResultEvidence(deps, {
-              toolCallId,
-              toolName,
-              ...(preflight.capabilityId ? { capabilityId: String(preflight.capabilityId) } : {}),
-              terminalKind: "preflight.rejected",
-              feedback: preflightFeedback
+              ...rejectedDispatch.evidenceInput,
+              terminalKind: "preflight.rejected"
             })
           }, request.agentId, error);
+          recordRejectedIntent(toolDecisionBoard, rejectedDispatch.decisionRecord);
           await recordRuntimeAdapterEvent(deps, preflightResultEvent);
           yield preflightResultEvent;
-          messages.push({ role: "tool", content: preflightFeedback.preview.text, toolCallId, toolName });
+          messages.push({ role: "tool", content: rejectedDispatch.feedback.preview.text, toolCallId, toolName });
           continue;
         }
 
         const toolInput = preflight.repaired?.input ?? modelEvent.input;
         const workflowBoundaryError = workflowCapabilityBoundaryGuard({
-          ...(activeProfilePolicy ? { profilePolicy: activeProfilePolicy } : {}),
+          ...(iterationRequest.profilePolicy ? { profilePolicy: iterationRequest.profilePolicy } : {}),
+          ...(currentReadyStageControl ? { workflowReadyStageControl: currentReadyStageControl } : {}),
           capabilityId: String(preflight.capabilityId),
           toolName,
           toolInput
         });
         if (workflowBoundaryError) {
           diagnostics.push(workflowBoundaryError);
-          const boundaryFeedback = buildToolResultFeedback({
+          const readyStageControl = currentReadyStageControl;
+          const missKey = readyStageControl ? readyStageRequiredActionMissKey(readyStageControl) : undefined;
+          const missCount = missKey ? readyStageRequiredActionMisses.get(missKey) ?? 0 : 0;
+          const convergence = readyStageControl
+            ? readyStageRequiredActionConvergence({
+              missCount,
+              correctionLimit: READY_STAGE_REQUIRED_ACTION_CORRECTION_LIMIT,
+              iteration: iterations,
+              maxModelIterations: limits.maxModelIterations,
+              workflowReadyStageControl: readyStageControl,
+              requestedCapabilityId: String(preflight.capabilityId),
+              rejectedBeforeExecution: true
+            })
+            : undefined;
+          const correctionAttempt = Number(convergence?.metadata?.correctionAttempt ?? missCount + 1);
+          const retryPolicy = String(convergence?.metadata?.retryPolicy ?? "correct-bounded");
+          const canCorrect = convergence?.kind !== "terminal";
+          const rejectedDispatch = buildRejectedDispatchResult({
             toolCallId,
             toolName,
             capabilityId: String(preflight.capabilityId),
-            status: "rejected",
+            normalizedInputHash,
+            terminalKind: "workflow-capability-boundary.rejected",
             text: workflowBoundaryError.message,
             diagnostics: [workflowBoundaryError],
+            correctiveAction: convergence?.correctiveAction ?? "Choose a tool allowed by the active workflow profile boundary or report a bounded blocker.",
+            recommendedNextAction: convergence?.recommendedNextAction ?? "allowed workflow tool or bounded blocker",
             trace,
             limitBytes: limits.maxOutputBytes,
-            continuation: "continue"
+            continuation: "continue",
+            iteration: iterations
           });
+          recordRejectedToolFeedback(toolDecisionBoard, rejectedDispatch.decisionRecord);
           const boundaryRejectedEvent = agentLoopEvent("model.tool.result", sessionId, turnId, trace, {
-            toolCallId,
-            toolName,
-            result: boundaryFeedback.preview.text,
-            terminalKind: "workflow-capability-boundary.rejected",
-            feedback: boundaryFeedback,
+            ...rejectedDispatch.eventData,
             evidence: await recordToolResultEvidence(deps, {
-              toolCallId,
-              toolName,
-              capabilityId: String(preflight.capabilityId),
-              terminalKind: "workflow-capability-boundary.rejected",
-              feedback: boundaryFeedback
+              ...rejectedDispatch.evidenceInput,
+              terminalKind: "workflow-capability-boundary.rejected"
             })
           }, request.agentId, workflowBoundaryError);
           await recordRuntimeAdapterEvent(deps, boundaryRejectedEvent);
           yield boundaryRejectedEvent;
-          messages.push({ role: "tool", content: boundaryFeedback.preview.text, toolCallId, toolName });
+          if (readyStageControl && missKey) {
+            const missed = agentLoopEvent("workflow.required-action.missed", sessionId, turnId, trace, {
+              ...readyStageControl,
+              requestedCapabilityId: String(preflight.capabilityId),
+              iteration: iterations,
+              modelRequestCount: iterations,
+              toolCallCount: toolCalls,
+              correctionAttempt,
+              retryPolicy,
+              rejectedBeforeExecution: true,
+              terminalKind: "workflow-capability-boundary.rejected"
+            }, request.agentId, workflowBoundaryError);
+            await recordRuntimeAdapterEvent(deps, missed);
+            yield missed;
+            readyStageRequiredActionMisses.set(missKey, missCount + 1);
+            if (!canCorrect) {
+              yield* emitFailureWithRepair("rejected", "workflow-required-action-missed", workflowBoundaryError, missed);
+              terminalEmitted = true;
+              return;
+            }
+          }
+          messages.push({ role: "tool", content: rejectedDispatch.feedback.preview.text, toolCallId, toolName });
+          if (readyStageControl && missKey && canCorrect) {
+            if (workflowBoundaryError.code === "WORKFLOW_STANDARD_TEST_REQUIRED") {
+              const gateOverride = convergenceWorkflowGateOverride({
+                requiredNextAction: "standard-test-command",
+                rejectedCapabilityId: String(preflight.capabilityId),
+                rejectedToolName: toolName,
+                terminalKind: "workflow-standard-test-required",
+                toolCallId
+              });
+              activeWorkflowGateOverride = gateOverride;
+              activeProfilePolicy = profilePolicyWithRuntimeWorkflowGateOverride(iterationRequest.profilePolicy, gateOverride);
+              restartModelAfterWorkflowCorrection = true;
+            }
+            messages.push(readyStageRequiredActionCorrectionMessage(readyStageControl, missCount + 1, workflowBoundaryError));
+          }
+          if (restartModelAfterWorkflowCorrection) break;
           continue;
         }
-        const sweBenchGateRejection = sweBenchGatePolicyRejection(sweBenchVerificationGate, toolName, toolInput);
-        if (sweBenchGateRejection) {
-          const { error, terminalKind } = sweBenchGateRejection;
-          recordSweBenchGatePolicyRejection(sweBenchVerificationGate, terminalKind);
-          const nextWorkflowGateOverride = workflowGateOverrideFromRejection({
-            terminalKind,
-            toolCallId,
+        const repeatedMutationFailureSuppressed = isMutationCapabilityId(String(preflight.capabilityId)) &&
+          shouldSuppressRepeatedMutationFailure(toolDecisionBoard, { toolName, normalizedInputHash });
+        if (repeatedMutationFailureSuppressed) {
+          const error = kernelError("KERNEL_POLICY_DENIED", "DECISION_LOOP_REPEATED_STALE_MUTATION: repeated stale mutation input suppressed after diagnostic evidence; use the current nearestContext/actual context from the failed tool result, corrected input, or report a bounded blocker.", {
             toolName,
             capabilityId: String(preflight.capabilityId),
-            error
+            normalizedInputHash,
+            threshold: 2
           });
-          activeProfilePolicy = applyWorkflowGateOverride(activeProfilePolicy, {
-            terminalKind,
-            toolCallId,
-            toolName,
-            capabilityId: String(preflight.capabilityId),
-            error
+          diagnostics.push(error);
+          const convergence = repeatedRejectedIntentConvergence({
+            threshold: 2,
+            count: 2
           });
-          activeWorkflowGateOverride = activeProfilePolicy?.workflowGateOverride ?? nextWorkflowGateOverride ?? activeWorkflowGateOverride;
-          if (!isNonFatalSweBenchGateRejection(terminalKind)) diagnostics.push(error);
-          const gateFeedback = buildToolResultFeedback({
+          const suppressFeedback = buildRejectedDispatchFeedback({
             toolCallId,
             toolName,
             capabilityId: String(preflight.capabilityId),
-            status: "rejected",
-            text: error.message,
+            text: "Repeated stale mutation input suppressed. Use nearestContext/actual context from the failed mutation diagnostic to provide corrected input, choose a different mutation, or report an explicit bounded blocker.",
             diagnostics: [error],
+            ...(convergence.correctiveAction ? { correctiveAction: convergence.correctiveAction } : {}),
+            ...(convergence.recommendedNextAction ? { recommendedNextAction: convergence.recommendedNextAction } : {}),
             trace,
             limitBytes: limits.maxOutputBytes,
             continuation: "continue"
           });
-          const gateRejectedEvent = agentLoopEvent("model.tool.result", sessionId, turnId, trace, {
+          const repeated = recordRejectedIntent(toolDecisionBoard, {
             toolCallId,
             toolName,
-            result: gateFeedback.preview.text,
-            terminalKind,
-            feedback: gateFeedback,
+            capabilityId: String(preflight.capabilityId),
+            normalizedInputHash,
+            terminalKind: convergence.terminalKind ?? "decision-loop.rejected",
+            correctiveAction: convergence.correctiveAction,
+            recommendedNextAction: convergence.recommendedNextAction,
+            iteration: iterations
+          });
+          const suppressedBoard = toolDecisionBoardSnapshot({
+            state: toolDecisionBoard,
+            iteration: iterations,
+            activeProfileId: iterationRequest.profilePolicy?.profileId ?? request.profile.id,
+            ...(activeStageId ? { activeStageId } : {}),
+            availableCapabilities,
+            visibleCapabilities,
+            ...(iterationRequest.profilePolicy ? { profilePolicy: projectionEvidencePolicy(iterationRequest.profilePolicy, currentReadyStageControl) } : {})
+          });
+          const suppressEvent = agentLoopEvent("model.tool.result", sessionId, turnId, trace, {
+            toolCallId,
+            toolName,
+            result: suppressFeedback.preview.text,
+            terminalKind: "decision-loop.rejected",
+            feedback: suppressFeedback,
+            decisionBoard: {
+              boardId: suppressedBoard.boardId,
+              repeatedRejectedIntentCount: repeated.count,
+              decisionLoopFailureCandidate: suppressedBoard.decisionLoopFailureCandidate,
+              record: repeated.record
+            },
             evidence: await recordToolResultEvidence(deps, {
               toolCallId,
               toolName,
-              capabilityId: String(preflight.capabilityId),
-              terminalKind,
-              feedback: gateFeedback
+              terminalKind: "decision-loop.rejected",
+              feedback: suppressFeedback
             })
           }, request.agentId, error);
-          await recordRuntimeAdapterEvent(deps, gateRejectedEvent);
-          yield gateRejectedEvent;
-          if (yield* maybeStopAtSweBenchSourceInspectionDefiance(terminalKind, gateRejectedEvent)) {
-            terminalEmitted = true;
-            return;
+          await recordRuntimeAdapterEvent(deps, suppressEvent);
+          yield suppressEvent;
+          messages.push({ role: "tool", content: suppressFeedback.preview.text, toolCallId, toolName });
+          if (readyStageKindMatches(currentReadyStageControl, ["produce", "materialize", "repair"])) {
+            const patchRecoveryAvailable = readyStageAllowsCapability(currentReadyStageControl, "core.patch.apply");
+            const gateOverride = convergenceWorkflowGateOverride({
+              requiredNextAction: patchRecoveryAvailable
+                ? "core.patch.apply"
+                : String(currentReadyStageControl?.requiredNextAction ?? "core.file.edit"),
+              rejectedCapabilityId: String(preflight.capabilityId),
+              rejectedToolName: toolName,
+              terminalKind: "decision-loop.rejected",
+              toolCallId
+            });
+            activeWorkflowGateOverride = gateOverride;
+            activeProfilePolicy = activeProfilePolicy ? { ...activeProfilePolicy, workflowGateOverride: gateOverride } : activeProfilePolicy;
           }
-          messages.push({ role: "tool", content: gateFeedback.preview.text, toolCallId, toolName });
           continue;
         }
-        const taskScopeError = taskScopedToolGuard({
-          taskDeliveryFlow: taskDeliveryFlowData,
+        const activeOutputContract = outputContractVerification?.contract ?? request.outputContract;
+        const activeOutputContractGate = iterationRequest.profilePolicy?.workflowGateOverride ?? activeWorkflowGateOverride;
+        const outputContractPathRejection = outputContractArtifactPathRejection({
           toolName,
-          toolInput
+          toolInput,
+          ...(activeOutputContract ? { outputContract: activeOutputContract } : {}),
+          ...(activeOutputContractGate ? { workflowGateOverride: activeOutputContractGate } : {})
         });
-        if (taskScopeError) {
-          diagnostics.push(taskScopeError);
-          const deniedFeedback = buildToolResultFeedback({
+        if (outputContractPathRejection) {
+          const { error, terminalKind } = outputContractPathRejection;
+          diagnostics.push(error);
+          const rejectedDispatch = buildRejectedDispatchResult({
             toolCallId,
             toolName,
             capabilityId: String(preflight.capabilityId),
-            status: "rejected",
-            text: taskScopeError.message,
-            diagnostics: [taskScopeError],
+            normalizedInputHash,
+            terminalKind,
+            text: error.message,
+            diagnostics: [error],
+            correctiveAction: "Write to the required output artifact path or report an output-contract blocker.",
+            recommendedNextAction: "required output artifact path or bounded blocker",
+            trace,
+            limitBytes: limits.maxOutputBytes,
+            continuation: "continue",
+            iteration: iterations
+          });
+          recordRejectedToolFeedback(toolDecisionBoard, rejectedDispatch.decisionRecord);
+          const deniedEvent = agentLoopEvent("model.tool.result", sessionId, turnId, trace, {
+            ...rejectedDispatch.eventData,
+            evidence: await recordToolResultEvidence(deps, {
+              ...rejectedDispatch.evidenceInput,
+              terminalKind
+            })
+          }, request.agentId, error);
+          await recordRuntimeAdapterEvent(deps, deniedEvent);
+          yield deniedEvent;
+          messages.push({ role: "tool", content: rejectedDispatch.feedback.preview.text, toolCallId, toolName });
+          continue;
+        }
+        const activeWorkflowGate = iterationRequest.profilePolicy?.workflowGateOverride;
+        const preExecutionGateMiss = activeWorkflowGate !== undefined
+          && !workflowGateOverrideAllowsCapability(activeWorkflowGate, String(preflight.capabilityId))
+          && currentReadyStageControl?.stageKind !== undefined
+          && ["produce", "materialize", "repair"].includes(String(currentReadyStageControl.stageKind))
+          && (
+            readyStageProgressCapabilitySatisfied(String(preflight.capabilityId), currentReadyStageControl) ||
+            readyStageNonProgressCapabilityMiss(String(preflight.capabilityId), currentReadyStageControl)
+          );
+        if (preExecutionGateMiss) {
+          const readyStageControl = currentReadyStageControl;
+          if (!readyStageControl) continue;
+          const missKey = readyStageRequiredActionMissKey(readyStageControl);
+          const missCount = readyStageRequiredActionMisses.get(missKey) ?? 0;
+          const convergence = readyStageRequiredActionConvergence({
+            missCount,
+            correctionLimit: READY_STAGE_REQUIRED_ACTION_CORRECTION_LIMIT,
+            iteration: iterations,
+            maxModelIterations: limits.maxModelIterations,
+            workflowReadyStageControl: readyStageControl,
+            requestedCapabilityId: String(preflight.capabilityId),
+            rejectedBeforeExecution: true
+          });
+          const correctionAttempt = Number(convergence.metadata?.correctionAttempt ?? missCount + 1);
+          const retryPolicy = String(convergence.metadata?.retryPolicy ?? "fail-closed");
+          const canCorrect = convergence.kind === "retry-with-feedback";
+          const error = kernelError(
+            "KERNEL_POLICY_DENIED",
+            `WORKFLOW_REQUIRED_ACTION_MISSED: model requested ${String(preflight.capabilityId)} but the active stage requires ${String(readyStageControl.requiredNextAction ?? "")}.`,
+            {
+              workflowReadyStageControl: readyStageControl,
+              requestedCapabilityId: String(preflight.capabilityId),
+              iteration: iterations
+            }
+          );
+          diagnostics.push(error);
+          const missed = agentLoopEvent("workflow.required-action.missed", sessionId, turnId, trace, {
+            ...readyStageControl,
+            requestedCapabilityId: String(preflight.capabilityId),
+            iteration: iterations,
+            modelRequestCount: iterations,
+            toolCallCount: toolCalls,
+            correctionAttempt,
+            retryPolicy,
+            rejectedBeforeExecution: true
+          }, request.agentId, error);
+          await recordRuntimeAdapterEvent(deps, missed);
+          yield missed;
+          const stageFeedback = buildRejectedDispatchFeedback({
+            toolCallId,
+            toolName,
+            capabilityId: String(preflight.capabilityId),
+            text: error.message,
+            diagnostics: [error],
+            ...(convergence.correctiveAction ? { correctiveAction: convergence.correctiveAction } : {}),
+            ...(convergence.recommendedNextAction ? { recommendedNextAction: convergence.recommendedNextAction } : {}),
             trace,
             limitBytes: limits.maxOutputBytes,
             continuation: "continue"
           });
-          const deniedEvent = agentLoopEvent("model.tool.result", sessionId, turnId, trace, {
+          recordRejectedToolFeedback(toolDecisionBoard, {
             toolCallId,
             toolName,
-            result: deniedFeedback.preview.text,
-            terminalKind: "task-scope.rejected",
-            feedback: deniedFeedback,
+            capabilityId: String(preflight.capabilityId),
+            normalizedInputHash,
+            terminalKind: "workflow-required-action.rejected",
+            correctiveAction: stageFeedback.correctiveAction,
+            recommendedNextAction: stageFeedback.recommendedNextAction,
+            iteration: iterations,
+            metadata: { workflowReadyStageControl: readyStageControl }
+          });
+          const stageRejectedEvent = agentLoopEvent("model.tool.result", sessionId, turnId, trace, {
+            toolCallId,
+            toolName,
+            result: stageFeedback.preview.text,
+            terminalKind: "workflow-required-action.rejected",
+            feedback: stageFeedback,
             evidence: await recordToolResultEvidence(deps, {
               toolCallId,
               toolName,
               capabilityId: String(preflight.capabilityId),
-              terminalKind: "task-scope.rejected",
-              feedback: deniedFeedback
+              terminalKind: "workflow-required-action.rejected",
+              feedback: stageFeedback
             })
-          }, request.agentId, taskScopeError);
-          await recordRuntimeAdapterEvent(deps, deniedEvent);
-          yield deniedEvent;
-          messages.push({ role: "tool", content: deniedFeedback.preview.text, toolCallId, toolName });
+          }, request.agentId, error);
+          await recordRuntimeAdapterEvent(deps, stageRejectedEvent);
+          yield stageRejectedEvent;
+          messages.push({ role: "tool", content: stageFeedback.preview.text, toolCallId, toolName });
+          readyStageRequiredActionMisses.set(missKey, missCount + 1);
+          if (canCorrect) {
+            messages.push(readyStageRequiredActionCorrectionMessage(readyStageControl, missCount + 1, error));
+            restartModelAfterWorkflowCorrection = true;
+            break;
+          }
+          yield* emitFailureWithRepair("rejected", "workflow-required-action-missed", error, missed);
+          terminalEmitted = true;
+          return;
+        }
+        const unboundedSourceRead = unboundedSourceReadDiagnostic({
+          capabilityId: String(preflight.capabilityId),
+          toolName,
+          toolInput,
+          workflowReadyStageControl: currentReadyStageControl
+        });
+        if (unboundedSourceRead) {
+          diagnostics.push(unboundedSourceRead);
+          const rejectedDispatch = buildRejectedDispatchResult({
+            toolCallId,
+            toolName,
+            capabilityId: String(preflight.capabilityId),
+            normalizedInputHash,
+            terminalKind: "workflow-unbounded-source-read.rejected",
+            text: unboundedSourceRead.message,
+            diagnostics: [unboundedSourceRead],
+            correctiveAction: "Read a bounded source window with offset and limit, or use search/glob if the target file is not yet known.",
+            recommendedNextAction: "bounded source read or focused evidence query",
+            trace,
+            limitBytes: limits.maxOutputBytes,
+            continuation: "continue",
+            iteration: iterations
+          });
+          recordRejectedToolFeedback(toolDecisionBoard, rejectedDispatch.decisionRecord);
+          const unboundedReadEvent = agentLoopEvent("model.tool.result", sessionId, turnId, trace, {
+            ...rejectedDispatch.eventData,
+            evidence: await recordToolResultEvidence(deps, {
+              ...rejectedDispatch.evidenceInput,
+              terminalKind: "workflow-unbounded-source-read.rejected"
+            })
+          }, request.agentId, unboundedSourceRead);
+          await recordRuntimeAdapterEvent(deps, unboundedReadEvent);
+          yield unboundedReadEvent;
+          messages.push({ role: "tool", content: rejectedDispatch.feedback.preview.text, toolCallId, toolName });
+          continue;
+        }
+        const invalidMutationIntent = invalidMutationIntentDiagnostic({
+          capabilityId: String(preflight.capabilityId),
+          toolName,
+          toolInput,
+          workflowReadyStageControl: currentReadyStageControl,
+          acceptedSourceEvidencePaths: [...acceptedSourceEvidencePaths]
+        });
+        if (invalidMutationIntent) {
+          diagnostics.push(invalidMutationIntent);
+          const readyStageControl = currentReadyStageControl;
+          const rejectedDispatch = buildRejectedDispatchResult({
+            toolCallId,
+            toolName,
+            capabilityId: String(preflight.capabilityId),
+            normalizedInputHash,
+            terminalKind: "workflow-invalid-mutation-intent.rejected",
+            text: invalidMutationIntent.message,
+            diagnostics: [invalidMutationIntent],
+            correctiveAction: "Provide a real source mutation with a non-placeholder diff, refresh exact local evidence once, or report a bounded blocker.",
+            recommendedNextAction: "real source mutation, focused evidence refresh, or bounded blocker",
+            trace,
+            limitBytes: limits.maxOutputBytes,
+            continuation: "continue",
+            iteration: iterations
+          });
+          recordRejectedToolFeedback(toolDecisionBoard, rejectedDispatch.decisionRecord);
+          const invalidMutationEvent = agentLoopEvent("model.tool.result", sessionId, turnId, trace, {
+            ...rejectedDispatch.eventData,
+            evidence: await recordToolResultEvidence(deps, {
+              ...rejectedDispatch.evidenceInput,
+              terminalKind: "workflow-invalid-mutation-intent.rejected"
+            })
+          }, request.agentId, invalidMutationIntent);
+          await recordRuntimeAdapterEvent(deps, invalidMutationEvent);
+          yield invalidMutationEvent;
+          messages.push({ role: "tool", content: rejectedDispatch.feedback.preview.text, toolCallId, toolName });
+          if (readyStageControl && readyStageKindMatches(readyStageControl, ["produce", "materialize", "repair"])) {
+            const missKey = readyStageRequiredActionMissKey(readyStageControl);
+            if (readyStageControlProjectedFromReviewedEvidence(readyStageControl)) {
+              readyStageMutationInputStalls.set(missKey, (readyStageMutationInputStalls.get(missKey) ?? 0) + 1);
+            }
+            const mutationInputStallCount = readyStageMutationInputStalls.get(missKey) ?? 0;
+            const editAlreadyFailedForStage = readyStageEditRepairFailures.has(missKey);
+            const patchAlreadyFailedForStage = readyStagePatchRepairFailures.has(missKey);
+            const patchRecoveryAvailable = readyStageAllowsCapability(readyStageControl, "core.patch.apply");
+            const editRecoveryAvailable = readyStageAllowsCapability(readyStageControl, "core.file.edit");
+            const currentGateOverride = iterationRequest.profilePolicy?.workflowGateOverride ?? activeWorkflowGateOverride;
+            const invalidMutationAfterRefreshedEvidence =
+              currentGateOverride?.terminalKind === "workflow-mutation-repair.refreshed";
+            const patchOnlyAfterInvalidMutation =
+              String(preflight.capabilityId) === "core.patch.apply" &&
+              currentGateOverride?.requiredNextAction === "core.patch.apply" &&
+              currentGateOverride?.terminalKind === "workflow-invalid-mutation-intent.rejected";
+            const exactEditRecoveryAfterMutationFailure =
+              editAlreadyFailedForStage &&
+              String(preflight.capabilityId) === "core.file.edit" &&
+              editRecoveryAvailable;
+            if (
+              mutationInputStallCount >= 2 &&
+              !editAlreadyFailedForStage &&
+              !patchAlreadyFailedForStage &&
+              (!patchRecoveryAvailable || (!invalidMutationAfterRefreshedEvidence && !patchOnlyAfterInvalidMutation))
+            ) {
+              const stallError = kernelError(
+                "KERNEL_POLICY_DENIED",
+                "WORKFLOW_MUTATION_INPUT_STALLED: reviewed evidence already projected this mutation stage, but repeated preflight mutation intents carried no real source change; stop spending turns and report a bounded mutation blocker.",
+                {
+                  workflowReadyStageControl: readyStageControl,
+                  requestedCapabilityId: String(preflight.capabilityId),
+                  iteration: iterations,
+                  mutationInputStallCount,
+                  terminalKind: "workflow-invalid-mutation-intent.rejected"
+                }
+              );
+              diagnostics.push(stallError);
+              yield* emitFailureWithRepair("rejected", "workflow-mutation-input-stalled", stallError, invalidMutationEvent);
+              terminalEmitted = true;
+              return;
+            }
+            const currentGateAllowsEvidenceRefresh = currentGateOverride === undefined ||
+              workflowGateRequiredActionAllowsCapability(currentGateOverride.requiredNextAction, "core.file.read") ||
+              workflowGateRequiredActionAllowsCapability(currentGateOverride.requiredNextAction, "core.search.text");
+            const reviewedEvidenceAlreadyProjected = readyStageControlProjectedFromReviewedEvidence(readyStageControl);
+            const reviewedStageAllowsFocusedRefresh = reviewedEvidenceAlreadyProjected &&
+              currentGateAllowsEvidenceRefresh &&
+              readyStageAllowsCapability(readyStageControl, "core.file.read") &&
+              mutationInputStallCount <= 1;
+            const patchOnlyAfterRepeatedReviewedNoOp = reviewedEvidenceAlreadyProjected &&
+              patchRecoveryAvailable &&
+              invalidMutationAfterRefreshedEvidence &&
+              !patchAlreadyFailedForStage &&
+              mutationInputStallCount >= 2;
+            const noOpFileEditInReviewedStage = reviewedEvidenceAlreadyProjected &&
+              String(preflight.capabilityId) === "core.file.edit" &&
+              editRecoveryAvailable &&
+              invalidMutationIntentHasReason(invalidMutationIntent, "expected and replacement are identical");
+            const keepExactEditRecovery = reviewedEvidenceAlreadyProjected && exactEditRecoveryAfterMutationFailure;
+            const requiredNextAction = currentGateAllowsEvidenceRefresh && !reviewedEvidenceAlreadyProjected
+              ? "focused-read-or-source-edit-or-bounded-blocker"
+              : reviewedStageAllowsFocusedRefresh
+                ? "focused-read-or-source-edit-or-bounded-blocker"
+              : patchOnlyAfterInvalidMutation && editRecoveryAvailable
+                ? "core.patch.apply|core.file.edit"
+              : exactEditRecoveryAfterMutationFailure
+                ? "core.patch.apply|core.file.edit"
+              : patchOnlyAfterRepeatedReviewedNoOp
+                ? "core.patch.apply"
+              : noOpFileEditInReviewedStage
+                ? "core.file.edit"
+              : keepExactEditRecovery
+                ? "core.file.edit"
+              : patchRecoveryAvailable
+                ? "core.patch.apply"
+                : String(readyStageControl.requiredNextAction ?? currentGateOverride?.requiredNextAction ?? "core.file.edit");
+            const gateOverride = convergenceWorkflowGateOverride({
+              requiredNextAction,
+              rejectedCapabilityId: String(preflight.capabilityId),
+              rejectedToolName: toolName,
+              terminalKind: "workflow-invalid-mutation-intent.rejected",
+              toolCallId
+            });
+            activeWorkflowGateOverride = gateOverride;
+            activeProfilePolicy = activeProfilePolicy ? { ...activeProfilePolicy, workflowGateOverride: gateOverride } : activeProfilePolicy;
+            messages.push(invalidMutationIntentCorrectionMessage(readyStageControl, invalidMutationIntent, toolInput));
+          }
           continue;
         }
         const toolBeforeResult = yield* fireHooks("tool-execution.before", {
@@ -1498,34 +1958,46 @@ export async function* runAgentLoop(
             redaction: { class: "internal" }
           };
           diagnostics.push(blockError);
-          const deniedFeedback = buildToolResultFeedback({
+          const deniedDispatch = buildDeniedDispatchResult({
             toolCallId,
             toolName,
             capabilityId: String(preflight.capabilityId),
-            status: "denied",
+            normalizedInputHash,
+            terminalKind: "hook.blocked",
             text: blockError.message,
             diagnostics: [blockError],
+            correctiveAction: "Request permission, choose a different projected tool, or report a bounded blocker.",
+            recommendedNextAction: "permission change, different projected tool, or bounded blocker",
             trace,
             limitBytes: limits.maxOutputBytes,
-            continuation: "continue"
+            continuation: "continue",
+            iteration: iterations,
+            metadata: { hook: "tool-execution.before" }
           });
-          const deniedEvent = agentLoopEvent("model.tool.result", sessionId, turnId, trace, {
+          recordToolDecision(toolDecisionBoard, {
+            kind: "policy",
+            status: "denied",
             toolCallId,
             toolName,
-            result: deniedFeedback.preview.text,
-            terminalKind: "hook.blocked",
-            feedback: deniedFeedback,
+            capabilityId: String(preflight.capabilityId),
+            normalizedInputHash,
+            reasonCode: "hook.blocked",
+            ...(deniedDispatch.feedback.correctiveAction ? { correctiveAction: deniedDispatch.feedback.correctiveAction } : {}),
+            ...(deniedDispatch.feedback.recommendedNextAction ? { recommendedNextAction: deniedDispatch.feedback.recommendedNextAction } : {}),
+            iteration: iterations,
+            metadata: { hook: "tool-execution.before" }
+          });
+          recordRejectedToolFeedback(toolDecisionBoard, deniedDispatch.decisionRecord);
+          const deniedEvent = agentLoopEvent("model.tool.result", sessionId, turnId, trace, {
+            ...deniedDispatch.eventData,
             evidence: await recordToolResultEvidence(deps, {
-              toolCallId,
-              toolName,
-              capabilityId: String(preflight.capabilityId),
-              terminalKind: "hook.blocked",
-              feedback: deniedFeedback
+              ...deniedDispatch.evidenceInput,
+              terminalKind: "hook.blocked"
             })
           }, request.agentId, blockError);
           await recordRuntimeAdapterEvent(deps, deniedEvent);
           yield deniedEvent;
-          messages.push({ role: "tool", content: deniedFeedback.preview.text, toolCallId, toolName });
+          messages.push({ role: "tool", content: deniedDispatch.feedback.preview.text, toolCallId, toolName });
           continue;
         }
         const toolManifest = visibleCapabilities.find((capability) => capability.id === preflight.capabilityId);
@@ -1533,9 +2005,17 @@ export async function* runAgentLoop(
           capabilityId: preflight.capabilityId,
           caller: request.caller,
           input: toolInput,
+          metadata: {
+            activeModel: request.profile.model,
+            activeModelProvider: typeof request.profile.provider === "string" && request.profile.provider.trim().length > 0
+              ? request.profile.provider.trim()
+              : String(request.profile.providerId),
+            activeModelProviderId: String(request.profile.providerId),
+            activeProfileId: request.profile.id
+          },
           sessionId,
           turnId,
-          timeoutMs: toolTimeoutFor(toolInput, limits.toolTimeoutMs, toolManifest?.timeoutMs),
+          timeoutMs: toolTimeoutFor(toolInput, limits.toolTimeoutMs, toolManifest?.timeoutMs, request.timeoutMs),
           trace
         };
         const toolEvents = await collectRuntimeEvents(kernel.execute({
@@ -1547,10 +2027,15 @@ export async function* runAgentLoop(
           yield event;
         }
         const terminal = lastRuntimeEvent(toolEvents, (event) => event.kind === "capability.completed" || event.kind === "capability.failed" || event.kind === "capability.cancelled" || event.kind === "execution.rejected");
-        recordSweBenchVerificationGateToolCompletion(sweBenchVerificationGate, toolName, toolInput, terminal);
+        if (terminal?.kind === "capability.completed") {
+          const sourcePath = sourceEvidencePathFromToolInput(String(preflight.capabilityId), toolInput);
+          if (sourcePath) acceptedSourceEvidencePaths.add(sourcePath);
+        }
         const toolResultText = modelToolResultText(terminal);
         const feedbackStatus = executionFeedbackStatus(terminal);
         const recoverableToolFailure = isRecoverableToolError(terminal?.error);
+        const correctiveAction = correctiveActionForToolFeedback(feedbackStatus);
+        const recommendedNextAction = recommendedNextActionForToolFeedback(feedbackStatus);
         const executionFeedback = buildToolResultFeedback({
           toolCallId,
           toolName,
@@ -1558,16 +2043,88 @@ export async function* runAgentLoop(
           status: feedbackStatus,
           text: toolResultText,
           diagnostics: terminal?.error ? [terminal.error] : [],
+          ...(correctiveAction ? { correctiveAction } : {}),
+          ...(recommendedNextAction ? { recommendedNextAction } : {}),
           trace,
           limitBytes: limits.maxOutputBytes,
           ...(terminal?.kind === "capability.completed" || recoverableToolFailure ? { continuation: "continue" as const } : {})
         });
+        if (feedbackStatus === "denied") {
+          recordToolDecision(toolDecisionBoard, {
+            kind: "policy",
+            status: "denied",
+            toolCallId,
+            toolName,
+            capabilityId: String(preflight.capabilityId),
+            normalizedInputHash,
+            reasonCode: terminal?.error?.code ?? terminal?.kind ?? "policy.denied",
+            ...(executionFeedback.correctiveAction ? { correctiveAction: executionFeedback.correctiveAction } : {}),
+            ...(executionFeedback.recommendedNextAction ? { recommendedNextAction: executionFeedback.recommendedNextAction } : {}),
+            iteration: iterations,
+            metadata: {
+              terminalKind: terminal?.kind ?? "unknown"
+            }
+          });
+        }
+        recordToolDecision(toolDecisionBoard, {
+          kind: "execution",
+          status: feedbackStatusToDecisionStatus(feedbackStatus),
+          toolCallId,
+          toolName,
+          capabilityId: String(preflight.capabilityId),
+          normalizedInputHash,
+          reasonCode: terminal?.kind ?? "unknown",
+          ...(executionFeedback.correctiveAction ? { correctiveAction: executionFeedback.correctiveAction } : {}),
+          ...(executionFeedback.recommendedNextAction ? { recommendedNextAction: executionFeedback.recommendedNextAction } : {}),
+          iteration: iterations,
+          metadata: {
+            continuation: executionFeedback.continuation,
+            terminalKind: terminal?.kind ?? "unknown"
+          }
+        });
+        if (recoverableToolFailure && feedbackStatus !== "success") {
+          recordRejectedIntent(toolDecisionBoard, {
+            toolCallId,
+            toolName,
+            capabilityId: String(preflight.capabilityId),
+            normalizedInputHash,
+            terminalKind: terminal?.kind ?? "capability.failed",
+            correctiveAction: executionFeedback.correctiveAction,
+            recommendedNextAction: executionFeedback.recommendedNextAction,
+            iteration: iterations
+          });
+        }
         messages.push({ role: "tool", content: executionFeedback.preview.text, toolCallId, toolName });
         const resultEvent = agentLoopEvent("model.tool.result", sessionId, turnId, trace, {
           toolCallId,
           toolName,
           result: boundedModelText(toolResultText, limits.maxOutputBytes),
           terminalKind: terminal?.kind ?? "unknown",
+          dispatchSummary: buildDispatchTerminalSummary({
+            batchId: `dispatch:${toolCallId}`,
+            toolCallId,
+            toolName,
+            capabilityId: String(preflight.capabilityId),
+            terminalStatus: terminal?.kind === "capability.completed"
+              ? "completed"
+              : terminal?.kind === "capability.cancelled"
+                ? terminal.error?.code === "KERNEL_SCHEDULER_TIMEOUT"
+                  ? "timed-out"
+                  : "cancelled"
+                : terminal?.kind === "execution.rejected"
+                  ? "rejected"
+                  : terminal?.error?.code === "KERNEL_SCHEDULER_TIMEOUT"
+                    ? "timed-out"
+                    : "failed",
+            inProgressToolCallIds: [toolCallId],
+            elapsedMs: 0,
+            evidenceIds: [`tool-result:${toolCallId}`],
+            diagnostics: terminal?.error ? [terminal.error] : [],
+            convergence: {
+              kind: "continue",
+              reasonCode: terminal?.kind ?? "unknown"
+            }
+          }),
           feedback: executionFeedback,
           evidence: await recordToolResultEvidence(deps, {
             toolCallId,
@@ -1579,15 +2136,17 @@ export async function* runAgentLoop(
         }, request.agentId, recoverableToolFailure ? undefined : terminal?.error);
         await recordRuntimeAdapterEvent(deps, resultEvent);
         yield resultEvent;
-        const gateOverrideProgressed = shouldClearWorkflowGateOverride(activeProfilePolicy?.workflowGateOverride ?? activeWorkflowGateOverride, toolName, toolInput, terminal);
+        const currentProfilePolicy = activeProfilePolicy ?? iterationRequest.profilePolicy;
+        const activeGateOverride = currentProfilePolicy?.workflowGateOverride ?? activeWorkflowGateOverride;
         const workflowProgress = advanceWorkflowStageFromToolEvidence({
-          ...(activeProfilePolicy ? { profilePolicy: activeProfilePolicy } : {}),
+          ...(currentProfilePolicy ? { profilePolicy: currentProfilePolicy } : {}),
           capabilityId: String(preflight.capabilityId),
           toolCallId,
           toolInput,
           terminal,
           at: terminal?.createdAt ?? resultEvent.createdAt
         });
+        const workflowAdvanced = workflowProgress !== undefined;
         if (workflowProgress) {
           activeProfilePolicy = clearWorkflowGateOverride(workflowProgress.profilePolicy);
           activeWorkflowGateOverride = activeProfilePolicy.workflowGateOverride;
@@ -1596,7 +2155,13 @@ export async function* runAgentLoop(
               workflowId: workflowProgress.profilePolicy.workflowGraphId,
               graphId: workflowProgress.profilePolicy.stagedTaskWorkflow?.graphId ?? workflowProgress.profilePolicy.workflowGraphId,
               stageId: stageEvent.stageId,
-              status: stageEvent.kind === "stage.started" ? "running" : stageEvent.kind === "stage.succeeded" ? "succeeded" : "failed",
+              status: stageEvent.kind === "stage.started"
+                ? "running"
+                : stageEvent.kind === "stage.succeeded"
+                  ? "succeeded"
+                  : stageEvent.kind === "stage.evaluation.required"
+                    ? "evaluation-required"
+                    : "failed",
               capabilityId: String(preflight.capabilityId),
               toolCallId,
               stageEvent,
@@ -1606,11 +2171,177 @@ export async function* runAgentLoop(
             await recordRuntimeAdapterEvent(deps, workflowStep);
             yield workflowStep;
           }
-        } else if (gateOverrideProgressed) {
-          activeWorkflowGateOverride = undefined;
-          if (activeProfilePolicy) {
-            activeProfilePolicy = clearWorkflowGateOverride(activeProfilePolicy);
+          const externalHarnessReturn = externalHarnessReturnGateAfterLocalVerification(activeProfilePolicy, workflowProgress.stage.kind);
+          if (externalHarnessReturn) {
+            const consumed = agentLoopEvent("agent.loop.budget.consumed", sessionId, turnId, trace, externalHarnessReturn, request.agentId);
+            await recordRuntimeAdapterEvent(deps, consumed);
+            yield consumed;
+            const summary = {
+              ...summarizeAgentLoop("completed", request, sessionId, turnId, trace, assistantText, iterations, toolCalls, diagnostics, summaryMode()),
+              reason: "external-score-ready",
+              workflow: {
+                profileId: activeProfilePolicy.profileId,
+                workflowGraphId: activeProfilePolicy.workflowGraphId,
+                graphId: activeProfilePolicy.stagedTaskWorkflow?.graphId,
+                stageStates: activeProfilePolicy.stagedTaskWorkflow?.runState.stageStates.map((stage) => ({
+                  stageId: stage.stageId,
+                  status: stage.status,
+                  outputRefs: stage.outputRefs
+                })) ?? []
+              }
+            };
+            yield* recordLosslessAssistantMessage(deps, {
+              sessionId,
+              turnId,
+              trace,
+              content: assistantText,
+              ...(losslessUserNodeId ? { userNodeId: losslessUserNodeId } : {}),
+              ...(request.agentId ? { agentId: request.agentId } : {})
+            });
+            const completed = agentLoopEvent("turn.completed", sessionId, turnId, trace, summary, request.agentId);
+            await recordRuntimeAdapterEvent(deps, completed);
+            yield completed;
+            const loopTerminal = agentLoopEvent("agent.loop.completed", sessionId, turnId, trace, summary, request.agentId);
+            await recordRuntimeAdapterEvent(deps, loopTerminal);
+            yield loopTerminal;
+            terminalEmitted = true;
+            return;
           }
+          if (activeProfilePolicy && shouldClosePrimaryWorkflowAfterProgress(activeProfilePolicy, workflowProgress.stage.kind)) {
+            const verification = await runFinalVerification({
+              deps,
+              request,
+              sessionId,
+              turnId,
+              trace,
+              phasePlan,
+              modeSummary,
+              assistantText,
+              toolEvents: toolEvidenceEvents,
+              diagnostics,
+              iteration: iterations
+            });
+            outputContractVerification = verification.outputContract ?? outputContractVerification;
+            modeSummary = verification.modeSummary;
+            for (const event of verification.events) yield event;
+            if (verification.repairRequested || verification.terminalStatus === "failed") {
+              const verifierError = finalVerifierFailureError(verification.verifierResult, verification.outputContract);
+              diagnostics.push(verifierError);
+              if (iterations < limits.maxModelIterations) {
+                const repairQueued = yield* emitFailureWithRepair("failed", "final-verifier-failed", verifierError, lastVerifierEvent(verification.events));
+                if (repairQueued) {
+                  activeWorkflowGateOverride = outputContractRepairWorkflowGateOverride(verification.outputContract) ?? activeWorkflowGateOverride;
+                  assistantText = "";
+                  continue;
+                }
+              }
+              terminalEmitted = true;
+              return;
+            }
+            const outcomeReasoning = await emitVisibleReasoning({
+              actor: "runtime",
+              stepKind: "outcome",
+              status: "completed",
+              summary: "Primary staged workflow completed all stages; outer loop will not request additional model actions.",
+              phase: "outcome",
+              certainty: "verified",
+              evidence: [visibleReasoningEvidence("trace", {
+                kind: "tool-evidence",
+                id: `workflow-completed:${activeProfilePolicy.stagedTaskWorkflow?.graphId ?? activeProfilePolicy.workflowGraphId}`,
+                label: "workflow stages completed",
+                sessionId,
+                turnId,
+                metadata: {
+                  profileId: activeProfilePolicy.profileId,
+                  workflowGraphId: activeProfilePolicy.workflowGraphId,
+                  graphId: activeProfilePolicy.stagedTaskWorkflow?.graphId
+                }
+              }, "workflow stages completed")]
+            });
+            yield outcomeReasoning;
+            const projectedReasoning = await emitVisibleReasoningProjection();
+            yield projectedReasoning;
+            const terminalToolCompletedWorkflow = activeProfilePolicy.stageAcceptanceMode === "supervisor" &&
+              terminal?.kind === "capability.completed" &&
+              terminalEvidenceStatusCompleted(terminal) &&
+              terminal.error === undefined;
+            const summary = {
+              ...summarizeAgentLoop("completed", request, sessionId, turnId, trace, assistantText, iterations, toolCalls, diagnostics, summaryMode()),
+              reason: terminalToolCompletedWorkflow ? "terminal-tool-completed" : "workflow-stages-completed",
+              ...(terminalToolCompletedWorkflow
+                ? {
+                  terminalTool: {
+                    toolCallId,
+                    toolName,
+                    capabilityId: String(preflight.capabilityId),
+                    terminalKind: terminal?.kind ?? "unknown",
+                    feedbackStatus: executionFeedback.status
+                  }
+                }
+                : {}),
+              workflow: {
+                profileId: activeProfilePolicy.profileId,
+                workflowGraphId: activeProfilePolicy.workflowGraphId,
+                graphId: activeProfilePolicy.stagedTaskWorkflow?.graphId,
+                stageStates: activeProfilePolicy.stagedTaskWorkflow?.runState.stageStates.map((stage) => ({
+                  stageId: stage.stageId,
+                  status: stage.status,
+                  outputRefs: stage.outputRefs
+                })) ?? []
+              }
+            };
+            yield* recordLosslessAssistantMessage(deps, {
+              sessionId,
+              turnId,
+              trace,
+              content: assistantText,
+              ...(losslessUserNodeId ? { userNodeId: losslessUserNodeId } : {}),
+              ...(request.agentId ? { agentId: request.agentId } : {})
+            });
+            const completed = agentLoopEvent("turn.completed", sessionId, turnId, trace, summary, request.agentId);
+            await recordRuntimeAdapterEvent(deps, completed);
+            yield completed;
+            const loopTerminal = agentLoopEvent("agent.loop.completed", sessionId, turnId, trace, summary, request.agentId);
+            await recordRuntimeAdapterEvent(deps, loopTerminal);
+            yield loopTerminal;
+            terminalEmitted = true;
+            return;
+          }
+        }
+        if (
+          !workflowAdvanced &&
+          activeGateOverride !== undefined &&
+          (
+            activeGateOverride.terminalKind === "workflow-mutation-repair.required" ||
+            activeGateOverride.terminalKind === "workflow-mutation-repair.refreshed" ||
+            activeGateOverride.terminalKind === "workflow-standard-test-repair.refreshed"
+          ) &&
+          readyStageKindMatches(currentReadyStageControl, ["verify", "score"]) &&
+          isMutationCapabilityId(String(preflight.capabilityId)) &&
+          terminal?.kind === "capability.completed" &&
+          terminalEvidenceStatusCompleted(terminal)
+        ) {
+          const gateOverride = convergenceWorkflowGateOverride({
+            requiredNextAction: "standard-test-command",
+            rejectedCapabilityId: String(preflight.capabilityId),
+            rejectedToolName: toolName,
+            terminalKind: "workflow-standard-test-required",
+            toolCallId
+          });
+          activeWorkflowGateOverride = gateOverride;
+          activeProfilePolicy = activeProfilePolicy
+            ? { ...clearWorkflowGateOverride(activeProfilePolicy), workflowGateOverride: gateOverride }
+            : activeProfilePolicy;
+          messages.push({
+            role: "system",
+            content: [
+              "WORKFLOW_STANDARD_TEST_REQUIRED: a source mutation completed during failed-test repair.",
+              "Required next action: standard-test-command.",
+              "Run the narrowest applicable standard repository test command before making more source edits."
+            ].join("\n")
+          });
+          restartModelAfterWorkflowCorrection = true;
+          break;
         }
         const toolResultReasoning = await emitVisibleReasoning({
           actor: "runtime",
@@ -1660,12 +2391,419 @@ export async function* runAgentLoop(
           terminalKind: terminal?.kind ?? "unknown",
           feedbackStatus: executionFeedback.status
         });
-        if (isTerminalToolCompletion(String(preflight.capabilityId), terminal)) {
+        if (
+          (
+            activeGateOverride?.terminalKind === "workflow-mutation-repair.required" ||
+            activeGateOverride?.terminalKind === "workflow-invalid-mutation-intent.rejected" ||
+            activeGateOverride?.terminalKind === "workflow-mutation-repair.refreshed"
+          ) &&
+          workflowGateRequiredActionAllowsCapability(activeGateOverride.requiredNextAction, String(preflight.capabilityId)) &&
+          isFocusedEvidenceRefreshCapabilityId(String(preflight.capabilityId)) &&
+          terminal?.kind === "capability.completed" &&
+          focusedEvidenceRefreshCompleted(String(preflight.capabilityId), terminal, toolInput) &&
+          readyStageKindMatches(currentReadyStageControl, ["produce", "materialize", "repair"])
+        ) {
+          if (
+            readyStageControlProjectedFromReviewedEvidence(currentReadyStageControl) &&
+            currentReadyStageControl !== undefined
+          ) {
+            readyStageMutationRepairHadFocusedRefresh.add(readyStageRequiredActionMissKey(currentReadyStageControl));
+          }
+          const requiredNextAction = String(preflight.capabilityId) === "core.search.text" ||
+            (
+              activeGateOverride?.terminalKind === "workflow-invalid-mutation-intent.rejected" &&
+              readyStageControlProjectedFromReviewedEvidence(currentReadyStageControl)
+            )
+            ? "focused-read-or-source-edit-or-bounded-blocker"
+            : String(currentReadyStageControl?.requiredNextAction ?? "source-edit-or-test-or-bounded-blocker");
+          const gateOverride = convergenceWorkflowGateOverride({
+            requiredNextAction,
+            rejectedCapabilityId: String(preflight.capabilityId),
+            rejectedToolName: toolName,
+            terminalKind: "workflow-mutation-repair.refreshed",
+            toolCallId
+          });
+          activeWorkflowGateOverride = gateOverride;
+          activeProfilePolicy = activeProfilePolicy ? { ...activeProfilePolicy, workflowGateOverride: gateOverride } : activeProfilePolicy;
+        }
+        if (
+          activeGateOverride?.terminalKind === "workflow-standard-test-failed" &&
+          workflowGateRequiredActionAllowsCapability(activeGateOverride.requiredNextAction, String(preflight.capabilityId)) &&
+          isFocusedEvidenceRefreshCapabilityId(String(preflight.capabilityId)) &&
+          terminal?.kind === "capability.completed" &&
+          focusedEvidenceRefreshCompleted(String(preflight.capabilityId), terminal, toolInput)
+        ) {
+          const gateOverride = convergenceWorkflowGateOverride({
+            requiredNextAction: "source-edit-or-test-or-bounded-blocker",
+            rejectedCapabilityId: String(preflight.capabilityId),
+            rejectedToolName: toolName,
+            terminalKind: "workflow-standard-test-repair.refreshed",
+            toolCallId
+          });
+          activeWorkflowGateOverride = gateOverride;
+          activeProfilePolicy = activeProfilePolicy ? { ...activeProfilePolicy, workflowGateOverride: gateOverride } : activeProfilePolicy;
+          messages.push({
+            role: "user",
+            content: [
+              "WORKFLOW_STANDARD_TEST_REPAIR_EVIDENCE_REFRESHED.",
+              "A focused read/search refreshed evidence after a failed standard test.",
+              "Required next action: source-edit-or-test-or-bounded-blocker.",
+              "Apply a source mutation, rerun a standard test, or report a bounded blocker. Do not keep inspecting without a new proof obligation."
+            ].join("\n")
+          });
+        }
+        const evaluationReproductionCompleted = terminal?.kind === "capability.completed" &&
+          terminalEvidenceStatusCompleted(terminal) &&
+          isAllowedEvaluationReproductionToolInput({
+            ...(iterationRequest.profilePolicy ? { profilePolicy: iterationRequest.profilePolicy } : {}),
+            capabilityId: String(preflight.capabilityId),
+            toolInput
+          });
+        if (evaluationReproductionCompleted) {
+          const gateOverride = convergenceWorkflowGateOverride({
+            requiredNextAction: "focused-read-or-source-edit-or-test-or-return-control",
+            rejectedCapabilityId: String(preflight.capabilityId),
+            rejectedToolName: toolName,
+            terminalKind: "workflow-evaluation-reproduction.completed",
+            toolCallId
+          });
+          activeWorkflowGateOverride = gateOverride;
+          activeProfilePolicy = activeProfilePolicy
+            ? { ...clearWorkflowGateOverride(activeProfilePolicy), workflowGateOverride: gateOverride }
+            : activeProfilePolicy;
+          messages.push({
+            role: "user",
+            content: [
+              "WORKFLOW_EVALUATION_REPRODUCTION_COMPLETED.",
+              "The bounded evaluation reproduction command ran without mutating the workspace.",
+              "Required next action: focused-read-or-source-edit-or-test-or-return-control.",
+              "Evaluate the reproduction output: if the reported behavior still reproduces, inspect focused source context and apply a minimal source edit or patch; otherwise run the narrowest standard repository test.",
+              "Do not use core.test.run for source inspection commands; use focused read/search tools for inspection and mutation tools for fixes."
+            ].join("\n")
+          });
+          restartModelAfterWorkflowCorrection = true;
+          break;
+        }
+        const progressCapabilityRequested = readyStageProgressCapabilitySatisfied(String(preflight.capabilityId), currentReadyStageControl);
+        const standardVerifyCommandMissing = requiresStandardVerifyCommandBeforeTerminal(
+          String(preflight.capabilityId),
+          terminal,
+          currentReadyStageControl,
+          toolInput
+        );
+        const progressCapabilitySucceeded = progressCapabilityRequested
+          && terminal?.kind === "capability.completed"
+          && terminalEvidenceStatusCompleted(terminal)
+          && !standardVerifyCommandMissing;
+        const terminalToolFailed = isTerminalToolFailure(String(preflight.capabilityId), terminal, currentReadyStageControl);
+        const failedProgressCapability = progressCapabilityRequested
+          && terminal !== undefined
+          && !terminalToolFailed
+          && (
+            readyStageKindMatches(currentReadyStageControl, ["verify", "score"]) ||
+            (readyStageKindMatches(currentReadyStageControl, ["produce", "materialize", "repair"]) && recoverableToolFailure)
+          )
+          && !progressCapabilitySucceeded;
+        const failedStandardVerifyCommand = failedProgressCapability
+          && readyStageKindMatches(currentReadyStageControl, ["verify"])
+          && terminal?.kind === "capability.completed"
+          && !standardVerifyCommandMissing;
+        const repeatedProgressEvidence = progressCapabilitySucceeded
+          && repeatedReadyStageProgressEvidence(readyStageProgressEvidenceCounts, {
+            control: currentReadyStageControl,
+            capabilityId: String(preflight.capabilityId),
+            toolInput,
+            normalizedInputHash
+          });
+        if (progressCapabilitySucceeded && !repeatedProgressEvidence) {
+          iterationProgressCapabilitySatisfied = true;
+        }
+        const gateOverrideSatisfied = workflowGateOverrideAllowsCapability(
+          iterationRequest.profilePolicy?.workflowGateOverride,
+          String(preflight.capabilityId)
+        );
+        const gateMutationFailure = gateOverrideSatisfied &&
+          isMutationCapabilityId(String(preflight.capabilityId)) &&
+          terminal !== undefined &&
+          terminal.kind !== "capability.completed" &&
+          recoverableToolFailure;
+        const nonProgressStageMiss = (
+          !workflowAdvanced &&
+          !gateOverrideSatisfied &&
+          (
+            (!iterationProgressCapabilitySatisfied && readyStageNonProgressCapabilityMiss(String(preflight.capabilityId), currentReadyStageControl))
+            || repeatedProgressEvidence
+          )
+        ) || (failedProgressCapability && !failedStandardVerifyCommand) || gateMutationFailure;
+        if (nonProgressStageMiss && terminal !== undefined) {
+          const readyStageControl = currentReadyStageControl;
+          if (!readyStageControl) continue;
+          const activeGateForMiss = iterationRequest.profilePolicy?.workflowGateOverride;
+          const effectiveReadyStageControl = gateMutationFailure &&
+            activeGateForMiss &&
+            readyStageKindMatches(readyStageControl, ["verify", "score"])
+            ? {
+                ...readyStageControl,
+                requiredNextAction: activeGateForMiss.requiredNextAction,
+                gateRequiredNextAction: activeGateForMiss.requiredNextAction,
+                underlyingRequiredNextAction: readyStageControl.requiredNextAction,
+                terminalKind: activeGateForMiss.terminalKind
+              }
+            : readyStageControl;
+          const missKey = readyStageRequiredActionMissKey(effectiveReadyStageControl);
+          const recoverableMutationFailure = (failedProgressCapability || gateMutationFailure) &&
+            recoverableToolFailure &&
+            (
+              readyStageKindMatches(readyStageControl, ["produce", "materialize", "repair"]) ||
+              workflowGateRequiredActionAllowsCapability(
+                iterationRequest.profilePolicy?.workflowGateOverride?.requiredNextAction ?? "",
+                String(preflight.capabilityId)
+              )
+            );
+          const mutationRepairMissKey = recoverableMutationFailure
+            ? `${missKey}:${String(preflight.capabilityId)}`
+            : missKey;
+          const missCount = recoverableMutationFailure
+            ? readyStageMutationRepairMisses.get(mutationRepairMissKey) ?? 0
+            : readyStageRequiredActionMisses.get(missKey) ?? 0;
+          const convergence = readyStageRequiredActionConvergence({
+            missCount,
+            correctionLimit: READY_STAGE_REQUIRED_ACTION_CORRECTION_LIMIT,
+            iteration: iterations,
+            maxModelIterations: limits.maxModelIterations,
+            workflowReadyStageControl: effectiveReadyStageControl,
+            requestedCapabilityId: String(preflight.capabilityId)
+          });
+          const correctionAttempt = Number(convergence.metadata?.correctionAttempt ?? missCount + 1);
+          const retryPolicy = String(convergence.metadata?.retryPolicy ?? "fail-closed");
+          const canCorrect = convergence.kind === "retry-with-feedback";
+          const error = kernelError(
+            "KERNEL_POLICY_DENIED",
+            repeatedProgressEvidence
+              ? `WORKFLOW_REQUIRED_ACTION_MISSED: model repeated ${String(preflight.capabilityId)} for evidence already inspected in ${String(effectiveReadyStageControl.stageId ?? "the active stage")}; choose the next workflow action or report a bounded blocker.`
+              : standardVerifyCommandMissing
+                ? `WORKFLOW_REQUIRED_ACTION_MISSED: model requested ${String(preflight.capabilityId)} for ${String(effectiveReadyStageControl.stageId ?? "the active stage")} with a non-standard verification command; run a standard repository test command.`
+                : failedProgressCapability
+                ? `WORKFLOW_REQUIRED_ACTION_MISSED: model requested ${String(preflight.capabilityId)} for ${String(effectiveReadyStageControl.stageId ?? "the active stage")} but the tool did not complete successfully; choose a bounded retry, narrower verification, or report the blocker.`
+              : `WORKFLOW_REQUIRED_ACTION_MISSED: model requested ${String(preflight.capabilityId)} but the active stage requires ${String(effectiveReadyStageControl.requiredNextAction ?? "")}.`,
+            {
+              workflowReadyStageControl: effectiveReadyStageControl,
+              requestedCapabilityId: String(preflight.capabilityId),
+              iteration: iterations,
+              repeatedProgressEvidence,
+              failedProgressCapability,
+              standardVerifyCommandMissing,
+              feedbackStatus: executionFeedback.status,
+              terminalKind: terminal.kind
+            }
+          );
+          diagnostics.push(error);
+          const missed = agentLoopEvent("workflow.required-action.missed", sessionId, turnId, trace, {
+            ...effectiveReadyStageControl,
+            requestedCapabilityId: String(preflight.capabilityId),
+            iteration: iterations,
+            modelRequestCount: iterations,
+            toolCallCount: toolCalls,
+            correctionAttempt,
+            retryPolicy,
+            failedProgressCapability,
+            standardVerifyCommandMissing,
+            feedbackStatus: executionFeedback.status,
+            terminalKind: terminal.kind
+          }, request.agentId, error);
+          await recordRuntimeAdapterEvent(deps, missed);
+          yield missed;
+          if (recoverableMutationFailure) {
+            if (String(preflight.capabilityId) === "core.file.edit") {
+              readyStageEditRepairFailures.add(missKey);
+            }
+            if (String(preflight.capabilityId) === "core.patch.apply") {
+              readyStagePatchRepairFailures.add(missKey);
+            }
+            const reviewedEvidenceAlreadyProjected = readyStageControlProjectedFromReviewedEvidence(readyStageControl);
+            const mutationInputStallCount = reviewedEvidenceAlreadyProjected
+              ? (readyStageMutationInputStalls.get(missKey) ?? 0) + 1
+              : 0;
+            if (reviewedEvidenceAlreadyProjected) {
+              readyStageMutationInputStalls.set(missKey, mutationInputStallCount);
+            }
+            readyStageMutationRepairMisses.set(mutationRepairMissKey, missCount + 1);
+            const mutationInputStallLimit = readyStageMutationRepairHadFocusedRefresh.has(missKey) ? 5 : 4;
+            if (mutationInputStallCount >= mutationInputStallLimit) {
+              const stallError = kernelError(
+                "KERNEL_POLICY_DENIED",
+                "WORKFLOW_MUTATION_INPUT_STALLED: reviewed evidence already projected this mutation stage, but repeated edit/patch inputs failed or carried no real source change; stop spending turns and report a bounded mutation blocker.",
+                {
+                  workflowReadyStageControl: readyStageControl,
+                  requestedCapabilityId: String(preflight.capabilityId),
+                  iteration: iterations,
+                  mutationInputStallCount,
+                  failedProgressCapability,
+                  feedbackStatus: executionFeedback.status,
+                  terminalKind: terminal.kind
+                }
+              );
+              diagnostics.push(stallError);
+              yield* emitFailureWithRepair("rejected", "workflow-mutation-input-stalled", stallError, missed);
+              terminalEmitted = true;
+              return;
+            }
+          } else {
+            readyStageRequiredActionMisses.set(missKey, missCount + 1);
+          }
+          if (canCorrect) {
+            if (recoverableMutationFailure) {
+              const activeRequiredNextAction = iterationRequest.profilePolicy?.workflowGateOverride?.requiredNextAction ?? "";
+              const patchRecoveryAvailable = readyStageAllowsCapability(readyStageControl, "core.patch.apply") ||
+                workflowGateRequiredActionAllowsCapability(activeRequiredNextAction, "core.patch.apply");
+              const patchOnlyAfterInvalidMutation =
+                activeRequiredNextAction === "core.patch.apply" &&
+                iterationRequest.profilePolicy?.workflowGateOverride?.terminalKind === "workflow-invalid-mutation-intent.rejected";
+              const reviewedEvidenceAlreadyProjected = readyStageControlProjectedFromReviewedEvidence(readyStageControl);
+              const editAlreadyFailedForStage = readyStageEditRepairFailures.has(missKey);
+              const patchAlreadyFailedForStage = readyStagePatchRepairFailures.has(missKey);
+              const exactEditRecoveryAvailable = String(preflight.capabilityId) === "core.file.edit" &&
+                (
+                  patchAlreadyFailedForStage ||
+                  readyStageMutationRepairHadFocusedRefresh.has(missKey) ||
+                  (!patchRecoveryAvailable && reviewedEvidenceAlreadyProjected)
+                ) &&
+                (
+                  readyStageAllowsCapability(readyStageControl, "core.file.edit") ||
+                  workflowGateRequiredActionAllowsCapability(activeRequiredNextAction, "core.file.edit")
+                );
+              const effectiveMutationMissCount = gateMutationFailure && String(preflight.capabilityId) !== "core.patch.apply"
+                ? Math.max(missCount, 1)
+                : missCount;
+              const mutationRepairRequiredNextAction = exactEditRecoveryAvailable && patchRecoveryAvailable
+                ? "core.patch.apply|core.file.edit"
+                : exactEditRecoveryAvailable
+                  ? "core.file.edit"
+                : patchRecoveryAvailable &&
+                String(preflight.capabilityId) === "core.patch.apply" &&
+                effectiveMutationMissCount >= 1
+                ? "core.patch.apply"
+                : patchRecoveryAvailable &&
+                  String(preflight.capabilityId) === "core.patch.apply" &&
+                  patchOnlyAfterInvalidMutation
+                ? "core.patch.apply|core.file.edit"
+                : patchRecoveryAvailable && effectiveMutationMissCount >= 2
+                ? "core.patch.apply"
+                : effectiveMutationMissCount >= 1
+                  ? patchRecoveryAvailable ? "core.patch.apply|core.file.edit" : "core.file.edit"
+                  : reviewedEvidenceAlreadyProjected && (String(preflight.capabilityId) === "core.patch.apply" || patchAlreadyFailedForStage || (editAlreadyFailedForStage && effectiveMutationMissCount >= 1))
+                    ? patchRecoveryAvailable ? "core.patch.apply|core.file.edit" : "core.file.edit"
+                    : "focused-read-or-source-edit-or-bounded-blocker";
+              const gateOverride = convergenceWorkflowGateOverride({
+                requiredNextAction: mutationRepairRequiredNextAction,
+                rejectedCapabilityId: String(preflight.capabilityId),
+                rejectedToolName: toolName,
+                terminalKind: "workflow-mutation-repair.required",
+                toolCallId
+              });
+              activeWorkflowGateOverride = gateOverride;
+              activeProfilePolicy = activeProfilePolicy ? { ...activeProfilePolicy, workflowGateOverride: gateOverride } : activeProfilePolicy;
+              messages.push(mutationRepairCorrectionMessage(readyStageControl, error, executionFeedback.diagnostics));
+            } else if (
+              repeatedProgressEvidence ||
+              readyStageKindMatches(readyStageControl, ["produce", "materialize", "repair"]) ||
+              standardVerifyCommandMissing
+            ) {
+              const gateOverride = convergenceWorkflowGateOverride({
+                requiredNextAction: standardVerifyCommandMissing
+                  ? "standard-test-command"
+                  : String(readyStageControl.requiredNextAction ?? "source-edit-or-test-or-bounded-blocker"),
+                rejectedCapabilityId: String(preflight.capabilityId),
+                rejectedToolName: toolName,
+                terminalKind: standardVerifyCommandMissing ? "workflow-standard-test-required" : "workflow-required-action.rejected",
+                toolCallId
+              });
+              activeWorkflowGateOverride = gateOverride;
+              activeProfilePolicy = activeProfilePolicy ? { ...activeProfilePolicy, workflowGateOverride: gateOverride } : activeProfilePolicy;
+            }
+            if (!activeWorkflowGateOverride) {
+              const gateOverride = convergenceWorkflowGateOverride({
+                requiredNextAction: String(readyStageControl.requiredNextAction ?? "workflow-progress-capability-or-bounded-blocker"),
+                rejectedCapabilityId: String(preflight.capabilityId),
+                rejectedToolName: toolName,
+                terminalKind: "workflow-required-action.rejected",
+                toolCallId
+              });
+              activeWorkflowGateOverride = gateOverride;
+              activeProfilePolicy = activeProfilePolicy ? { ...activeProfilePolicy, workflowGateOverride: gateOverride } : activeProfilePolicy;
+            }
+            if (!recoverableMutationFailure) {
+              messages.push(readyStageRequiredActionCorrectionMessage(readyStageControl, missCount + 1, error));
+            }
+            restartModelAfterWorkflowCorrection = true;
+            break;
+          }
+          yield* emitFailureWithRepair("rejected", "workflow-required-action-missed", error, missed);
+          terminalEmitted = true;
+          return;
+        }
+        if (failedStandardVerifyCommand) {
+          const gateOverride = convergenceWorkflowGateOverride({
+            requiredNextAction: "focused-read-or-source-edit-or-test-or-return-control",
+            rejectedCapabilityId: String(preflight.capabilityId),
+            rejectedToolName: toolName,
+            terminalKind: "workflow-standard-test-failed",
+            toolCallId
+          });
+          activeWorkflowGateOverride = gateOverride;
+          activeProfilePolicy = activeProfilePolicy
+            ? { ...clearWorkflowGateOverride(activeProfilePolicy), workflowGateOverride: gateOverride }
+            : activeProfilePolicy;
+          messages.push({
+            role: "user",
+            content: [
+              "WORKFLOW_STANDARD_TEST_FAILED.",
+              "A standard repository test command ran and produced failure evidence.",
+              "Required next action: focused-read-or-source-edit-or-test-or-return-control.",
+              "Inspect the failure evidence with focused read/search tools, repair the workspace with mutation tools, rerun a standard test, or report a bounded blocker.",
+              "Do not use core.test.run for source inspection commands; use focused read/search tools for inspection and mutation tools for fixes."
+            ].join("\n")
+          });
+          restartModelAfterWorkflowCorrection = true;
+          break;
+        }
+        if (standardVerifyCommandMissing) {
+          const gateOverride = convergenceWorkflowGateOverride({
+            requiredNextAction: "standard-test-command",
+            rejectedCapabilityId: String(preflight.capabilityId),
+            rejectedToolName: toolName,
+            terminalKind: "workflow-standard-test-required",
+            toolCallId
+          });
+          activeWorkflowGateOverride = gateOverride;
+          activeProfilePolicy = activeProfilePolicy ? { ...activeProfilePolicy, workflowGateOverride: gateOverride } : activeProfilePolicy;
+          messages.push({
+            role: "system",
+            content: [
+              "WORKFLOW_STANDARD_TEST_REQUIRED: the verification evidence completed, but terminal verify requires a standard repository test command before closing.",
+              "Required next action: standard-test-command.",
+              "Use the narrowest applicable standard test runner such as pytest, python -m pytest, python -m unittest, tox, nox, or the repository package test command."
+            ].join("\n")
+          });
+          restartModelAfterWorkflowCorrection = true;
+          break;
+        }
+        if (isTerminalToolCompletion(String(preflight.capabilityId), terminal, currentReadyStageControl, toolInput)) {
+          const convergence = terminalToolConvergence({
+            capabilityId: String(preflight.capabilityId),
+            toolName,
+            terminalKind: terminal?.kind ?? "unknown",
+            feedbackStatus: executionFeedback.status
+          });
+          const terminalReason = convergence.reasonCode;
+          const terminalFailed = terminalReason === "terminal-tool-failed";
           const outcomeReasoning = await emitVisibleReasoning({
             actor: "runtime",
             stepKind: "outcome",
-            status: "completed",
-            summary: `Terminal tool ${toolName} completed the governed task; outer loop will not request additional model actions.`,
+            status: terminalFailed ? "blocked" : "completed",
+            summary: terminalFailed
+              ? `Terminal tool ${toolName} failed the governed task; outer loop will not request additional model actions.`
+              : `Terminal tool ${toolName} completed the governed task; outer loop will not request additional model actions.`,
             phase: "outcome",
             certainty: "verified",
             evidence: [visibleReasoningEvidence("tool-evidence", {
@@ -1686,8 +2824,8 @@ export async function* runAgentLoop(
           const projectedReasoning = await emitVisibleReasoningProjection();
           yield projectedReasoning;
           const summary = {
-            ...summarizeAgentLoop("completed", request, sessionId, turnId, trace, assistantText, iterations, toolCalls, diagnostics, summaryMode()),
-            reason: "terminal-tool-completed",
+            ...summarizeAgentLoop(terminalFailed ? "failed" : "completed", request, sessionId, turnId, trace, assistantText, iterations, toolCalls, diagnostics, summaryMode()),
+            reason: terminalReason,
             terminalTool: {
               toolCallId,
               toolName,
@@ -1707,7 +2845,37 @@ export async function* runAgentLoop(
           const completed = agentLoopEvent("turn.completed", sessionId, turnId, trace, summary, request.agentId);
           await recordRuntimeAdapterEvent(deps, completed);
           yield completed;
-          const loopTerminal = agentLoopEvent("agent.loop.completed", sessionId, turnId, trace, summary, request.agentId);
+          const loopTerminal = terminalFailed
+            ? agentLoopEvent("agent.loop.failed", sessionId, turnId, trace, summary, request.agentId, terminal?.error)
+            : agentLoopEvent("agent.loop.completed", sessionId, turnId, trace, summary, request.agentId);
+          await recordRuntimeAdapterEvent(deps, loopTerminal);
+          yield loopTerminal;
+          terminalEmitted = true;
+          return;
+        }
+        if (terminalToolFailed) {
+          const convergence = terminalToolConvergence({
+            capabilityId: String(preflight.capabilityId),
+            toolName,
+            terminalKind: terminal?.kind ?? "unknown",
+            feedbackStatus: executionFeedback.status
+          });
+          diagnostics.push(...(terminal?.error ? [terminal.error] : []));
+          const summary = {
+            ...summarizeAgentLoop("failed", request, sessionId, turnId, trace, assistantText, iterations, toolCalls, diagnostics, summaryMode()),
+            reason: convergence.reasonCode,
+            terminalTool: {
+              toolCallId,
+              toolName,
+              capabilityId: String(preflight.capabilityId),
+              terminalKind: terminal?.kind ?? "unknown",
+              feedbackStatus: executionFeedback.status
+            }
+          };
+          const completed = agentLoopEvent("turn.completed", sessionId, turnId, trace, summary, request.agentId);
+          await recordRuntimeAdapterEvent(deps, completed);
+          yield completed;
+          const loopTerminal = agentLoopEvent("agent.loop.failed", sessionId, turnId, trace, summary, request.agentId, terminal?.error);
           await recordRuntimeAdapterEvent(deps, loopTerminal);
           yield loopTerminal;
           terminalEmitted = true;
@@ -1758,11 +2926,20 @@ export async function* runAgentLoop(
         yield failed;
         const repairQueued = yield* emitFailureWithRepair("failed", "model-provider-error", modelEvent.error, failed);
         if (repairQueued && iterations < limits.maxModelIterations) {
+          modelDispatchInterrupted = true;
           break;
         }
         terminalEmitted = true;
         return;
       }
+    }
+    if (restartModelAfterWorkflowCorrection) {
+      yield* fireHooks("model-call.after", {
+        iteration: iterations,
+        toolRequested: requestedTool,
+        messageCount: messages.length
+      });
+      continue;
     }
     if (iterationReasoning.length > 0) {
       const modelSummaryReasoning = await emitVisibleReasoning({
@@ -1785,108 +2962,49 @@ export async function* runAgentLoop(
       toolRequested: requestedTool,
       messageCount: messages.length
     });
-    const sweBenchGateEvent = await maybeInsertSweBenchVerificationGate();
-    if (sweBenchGateEvent) {
-      yield sweBenchGateEvent;
-      if (sweBenchGateEvent.data.gate === "SWE_BENCH_READY_FOR_HARNESS_GATE") {
-        const outcomeReasoning = await emitVisibleReasoning({
-          actor: "runtime",
-          stepKind: "outcome",
-          status: "completed",
-          summary: "SWE-bench child run has source edit, successful test, and patch evidence; returning control for official harness scoring.",
-          phase: "verification",
-          certainty: "verified",
-          evidence: [visibleReasoningEvidence("trace", {
-            kind: "turn",
-            id: `${sweBenchGateEvent.kind}:${sweBenchGateEvent.createdAt}`,
-            label: "SWE-bench ready for harness gate",
-            sessionId,
-            turnId,
-            metadata: { gate: sweBenchGateEvent.data.gate }
-          }, "SWE-bench ready for harness gate")]
-        });
-        yield outcomeReasoning;
-        const projectedReasoning = await emitVisibleReasoningProjection();
-        yield projectedReasoning;
-        const summary = {
-          ...summarizeAgentLoop("completed", request, sessionId, turnId, trace, assistantText, iterations, toolCalls, diagnostics, summaryMode()),
-          reason: "swe-bench-ready-for-harness",
-          terminalGate: {
-            gate: "SWE_BENCH_READY_FOR_HARNESS_GATE",
-            modelRequestCount: sweBenchGateEvent.data.modelRequestCount,
-            toolCallCount: sweBenchGateEvent.data.toolCallCount,
-            sourceMutationCount: sweBenchGateEvent.data.sourceMutationCount,
-            testCommandCount: sweBenchGateEvent.data.testCommandCount,
-            successfulTestCommandCount: sweBenchGateEvent.data.successfulTestCommandCount,
-            diffInspectionCount: sweBenchGateEvent.data.diffInspectionCount
-          }
-        };
-        yield* recordLosslessAssistantMessage(deps, {
-          sessionId,
-          turnId,
-          trace,
-          content: assistantText,
-          ...(losslessUserNodeId ? { userNodeId: losslessUserNodeId } : {}),
-          ...(request.agentId ? { agentId: request.agentId } : {})
-        });
-        const completed = agentLoopEvent("turn.completed", sessionId, turnId, trace, summary, request.agentId);
-        await recordRuntimeAdapterEvent(deps, completed);
-        yield completed;
-        const loopTerminal = agentLoopEvent("agent.loop.completed", sessionId, turnId, trace, summary, request.agentId);
-        await recordRuntimeAdapterEvent(deps, loopTerminal);
-        yield loopTerminal;
-        terminalEmitted = true;
-        return;
-      }
-      if (sweBenchGateEvent.data.gate === "SWE_BENCH_ENVIRONMENT_BLOCKER_GATE") {
-        const outcomeReasoning = await emitVisibleReasoning({
-          actor: "runtime",
-          stepKind: "outcome",
-          status: "completed",
-          summary: "SWE-bench environment blocker gate reached; returning control to the governed harness with the current diff instead of requesting more environment setup actions.",
-          phase: "verification",
-          certainty: "verified",
-          evidence: [visibleReasoningEvidence("trace", {
-            kind: "turn",
-            id: `${sweBenchGateEvent.kind}:${sweBenchGateEvent.createdAt}`,
-            label: "SWE-bench environment blocker gate",
-            sessionId,
-            turnId,
-            metadata: { gate: sweBenchGateEvent.data.gate }
-          }, "SWE-bench environment blocker gate")]
-        });
-        yield outcomeReasoning;
-        const projectedReasoning = await emitVisibleReasoningProjection();
-        yield projectedReasoning;
-        const summary = {
-          ...summarizeAgentLoop("completed", request, sessionId, turnId, trace, assistantText, iterations, toolCalls, diagnostics, summaryMode()),
-          reason: "swe-bench-environment-blocker",
-          terminalGate: {
-            gate: "SWE_BENCH_ENVIRONMENT_BLOCKER_GATE",
-            shellCommandCount: sweBenchGateEvent.data.shellCommandCount,
-            postVerificationShellCommandCount: sweBenchGateEvent.data.postVerificationShellCommandCount,
-            testCommandCount: sweBenchGateEvent.data.testCommandCount,
-            sourceMutationCount: sweBenchGateEvent.data.sourceMutationCount
-          }
-        };
-        yield* recordLosslessAssistantMessage(deps, {
-          sessionId,
-          turnId,
-          trace,
-          content: assistantText,
-          ...(losslessUserNodeId ? { userNodeId: losslessUserNodeId } : {}),
-          ...(request.agentId ? { agentId: request.agentId } : {})
-        });
-        const completed = agentLoopEvent("turn.completed", sessionId, turnId, trace, summary, request.agentId);
-        await recordRuntimeAdapterEvent(deps, completed);
-        yield completed;
-        const loopTerminal = agentLoopEvent("agent.loop.completed", sessionId, turnId, trace, summary, request.agentId);
-        await recordRuntimeAdapterEvent(deps, loopTerminal);
-        yield loopTerminal;
-        terminalEmitted = true;
-        return;
-      }
+    if (modelDispatchInterrupted && repairContinuationRequested && iterations < limits.maxModelIterations) {
       continue;
+    }
+    if (!requestedTool && currentReadyStageControl) {
+      const missKey = readyStageRequiredActionMissKey(currentReadyStageControl);
+      const missCount = readyStageRequiredActionMisses.get(missKey) ?? 0;
+      const convergence = readyStageRequiredActionConvergence({
+        missCount,
+        correctionLimit: READY_STAGE_REQUIRED_ACTION_CORRECTION_LIMIT,
+        iteration: iterations,
+        maxModelIterations: limits.maxModelIterations,
+        workflowReadyStageControl: currentReadyStageControl
+      });
+      const correctionAttempt = Number(convergence.metadata?.correctionAttempt ?? missCount + 1);
+      const retryPolicy = String(convergence.metadata?.retryPolicy ?? "fail-closed");
+      const canCorrect = convergence.kind === "retry-with-feedback";
+      const error = kernelError(
+        "KERNEL_POLICY_DENIED",
+        `WORKFLOW_REQUIRED_ACTION_MISSED: model response did not request the required workflow action ${String(currentReadyStageControl.requiredNextAction ?? "")}.`,
+        {
+          workflowReadyStageControl: currentReadyStageControl,
+          iteration: iterations
+        }
+      );
+      diagnostics.push(error);
+      const missed = agentLoopEvent("workflow.required-action.missed", sessionId, turnId, trace, {
+        ...currentReadyStageControl,
+        iteration: iterations,
+        modelRequestCount: iterations,
+        toolCallCount: toolCalls,
+        correctionAttempt,
+        retryPolicy
+      }, request.agentId, error);
+      await recordRuntimeAdapterEvent(deps, missed);
+      yield missed;
+      readyStageRequiredActionMisses.set(missKey, missCount + 1);
+      if (canCorrect) {
+        messages.push(readyStageRequiredActionCorrectionMessage(currentReadyStageControl, missCount + 1, error));
+        continue;
+      }
+      yield* emitFailureWithRepair("rejected", "workflow-required-action-missed", error, missed);
+      terminalEmitted = true;
+      return;
     }
     if (repairContinuationRequested && iterations < limits.maxModelIterations) {
       continue;
@@ -1923,11 +3041,11 @@ export async function* runAgentLoop(
           evidenceRevisionAttempted = true;
           assistantText = "";
           messages.push({
-            role: "tool",
-            toolCallId: `evidence-revision:${stableHash(grounding.unsupportedClaims.map((claim) => claim.claimFingerprint).join("|"))}`,
-            toolName: "evidence-first.claim-grounding",
+            role: "user",
             content: [
+              "evidence-first.claim-grounding",
               "Evidence-first revision required:",
+              `Revision id: evidence-revision:${stableHash(grounding.unsupportedClaims.map((claim) => claim.claimFingerprint).join("|"))}.`,
               `Unsupported strict claims: ${grounding.unsupportedClaims.map((claim) => `${claim.code}:${claim.claimPreview}`).join("; ")}`,
               "Revise once by removing unsupported claims, rewriting them as unknown, or labeling explicit assumptions. Preserve the original user task."
             ].join("\n")
@@ -1996,11 +3114,12 @@ export async function* runAgentLoop(
         yield verificationReasoning;
       }
       if (verification.repairRequested || verification.terminalStatus === "failed") {
-        const verifierError = finalVerifierFailureError(verification.verifierResult, verification.outputContract);
+          const verifierError = finalVerifierFailureError(verification.verifierResult, verification.outputContract);
         diagnostics.push(verifierError);
         if (iterations < limits.maxModelIterations) {
           const repairQueued = yield* emitFailureWithRepair("failed", "final-verifier-failed", verifierError, lastVerifierEvent(verification.events));
           if (repairQueued) {
+            activeWorkflowGateOverride = outputContractRepairWorkflowGateOverride(verification.outputContract) ?? activeWorkflowGateOverride;
             assistantText = "";
             continue;
           }
@@ -2055,8 +3174,209 @@ export async function* runAgentLoop(
   }
 }
 
-function isTerminalToolCompletion(capabilityId: string, terminal?: RuntimeEvent): boolean {
-  return terminal?.kind === "capability.completed" && TERMINAL_TOOL_CAPABILITY_IDS.has(capabilityId);
+function isTerminalToolCompletion(
+  capabilityId: string,
+  terminal: RuntimeEvent | undefined,
+  readyStageControl: JsonObject | undefined,
+  toolInput: JsonObject
+): boolean {
+  if (terminal?.kind !== "capability.completed" || terminal.error) return false;
+  if (!terminalEvidenceStatusCompleted(terminal)) return false;
+  if (!readyStageControl) return false;
+  const terminalClosePolicy = typeof readyStageControl.terminalClosePolicy === "string"
+    ? readyStageControl.terminalClosePolicy
+    : "";
+  if (!terminalClosePolicy.startsWith("close-")) return false;
+  const progressCapabilityIds = Array.isArray(readyStageControl.progressCapabilityIds)
+    ? readyStageControl.progressCapabilityIds.map(String)
+    : [];
+  const allowedCapabilityIds = Array.isArray(readyStageControl.allowedCapabilityIds)
+    ? readyStageControl.allowedCapabilityIds.map(String)
+    : [];
+  const terminalCapabilityIds = progressCapabilityIds.length > 0 ? progressCapabilityIds : allowedCapabilityIds;
+  if (
+    readyStageKindMatches(readyStageControl, ["verify", "score"]) &&
+    (capabilityId === "core.test.run" || capabilityId === "core.shell.run") &&
+    !isStandardTestCommand(toolCommandText(toolInput))
+  ) {
+    return false;
+  }
+  return terminalCapabilityIds.includes(capabilityId);
+}
+
+function isTerminalToolFailure(
+  capabilityId: string,
+  terminal: RuntimeEvent | undefined,
+  readyStageControl: JsonObject | undefined
+): boolean {
+  if (!terminal || terminal.kind !== "capability.failed") return false;
+  if (!readyStageControl) return false;
+  const terminalClosePolicy = typeof readyStageControl.terminalClosePolicy === "string"
+    ? readyStageControl.terminalClosePolicy
+    : "";
+  if (!terminalClosePolicy.startsWith("close-")) return false;
+  const progressCapabilityIds = Array.isArray(readyStageControl.progressCapabilityIds)
+    ? readyStageControl.progressCapabilityIds.map(String)
+    : [];
+  const allowedCapabilityIds = Array.isArray(readyStageControl.allowedCapabilityIds)
+    ? readyStageControl.allowedCapabilityIds.map(String)
+    : [];
+  const terminalCapabilityIds = progressCapabilityIds.length > 0 ? progressCapabilityIds : allowedCapabilityIds;
+  return terminalCapabilityIds.includes(capabilityId);
+}
+
+function requiresStandardVerifyCommandBeforeTerminal(
+  capabilityId: string,
+  terminal: RuntimeEvent | undefined,
+  readyStageControl: JsonObject | undefined,
+  toolInput: JsonObject
+): boolean {
+  if (terminal?.kind !== "capability.completed" || terminal.error) return false;
+  if (!terminalEvidenceStatusCompleted(terminal)) return false;
+  if (!readyStageKindMatches(readyStageControl, ["verify", "score"])) return false;
+  if (capabilityId !== "core.test.run" && capabilityId !== "core.shell.run") return false;
+  return !isStandardTestCommand(toolCommandText(toolInput));
+}
+
+function terminalEvidenceStatusCompleted(terminal: RuntimeEvent): boolean {
+  const output = jsonObjectValue(terminal.data.output);
+  const evidence = jsonObjectValue(output?.evidence);
+  return evidence?.status === "completed";
+}
+
+function focusedEvidenceRefreshCompleted(capabilityId: string, terminal: RuntimeEvent, toolInput: JsonObject): boolean {
+  if (!terminalEvidenceStatusCompleted(terminal)) return false;
+  if (capabilityId === "core.search.text") return !terminalEvidenceEmpty(terminal);
+  if (capabilityId === "core.file.read") return !terminalEvidenceEmpty(terminal) && !terminalEvidenceTruncatedForRead(toolInput, terminal);
+  return true;
+}
+
+function terminalEvidenceTruncatedForRead(toolInput: JsonObject, terminal: RuntimeEvent | undefined): boolean {
+  if (!terminal) return false;
+  const output = jsonObjectValue(terminal.data.output);
+  const evidence = jsonObjectValue(output?.evidence);
+  if (!evidence) return false;
+  const preview = jsonObjectValue(evidence.preview);
+  if (preview?.truncated === true) return !boundedReadPreviewCoversRequestedWindow(toolInput, preview);
+  const metadata = jsonObjectValue(evidence.metadata);
+  if (metadata?.truncatedLines !== true) return false;
+  if (!boundedReadRequested(toolInput)) return true;
+  return !terminalEvidencePreviewHasContent(preview);
+}
+
+function boundedReadRequested(input: JsonObject): boolean {
+  return nonNegativeNumberField(input, "offset") !== undefined || nonNegativeNumberField(input, "limit") !== undefined;
+}
+
+function boundedReadPreviewCoversRequestedWindow(input: JsonObject, preview: JsonObject): boolean {
+  const limit = nonNegativeNumberField(input, "limit");
+  if (limit === undefined || limit === 0) return false;
+  const lineCount = preview.lineCount;
+  return typeof lineCount === "number" && Number.isFinite(lineCount) && lineCount >= limit;
+}
+
+function terminalEvidencePreviewHasContent(preview: JsonObject | undefined): boolean {
+  if (!preview) return false;
+  if (typeof preview.text === "string" && preview.text.trim().length > 0) return true;
+  if (typeof preview.lineCount === "number" && preview.lineCount > 0) return true;
+  if (typeof preview.byteLength === "number" && preview.byteLength > 0) return true;
+  return false;
+}
+
+function nonNegativeNumberField(input: JsonObject, key: string): number | undefined {
+  const value = input[key];
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function terminalEvidenceEmpty(terminal: RuntimeEvent | undefined): boolean {
+  if (!terminal) return false;
+  const output = jsonObjectValue(terminal.data.output);
+  const evidence = jsonObjectValue(output?.evidence);
+  if (!evidence) return false;
+  const preview = jsonObjectValue(evidence.preview);
+  if (preview) {
+    if (typeof preview.text === "string" && preview.text.trim().length === 0) return true;
+    if (preview.lineCount === 0 || preview.byteLength === 0) return true;
+  }
+  const metadata = jsonObjectValue(evidence.metadata);
+  if (metadata) {
+    if (
+      metadata.lineCount === 0 ||
+      metadata.resultCount === 0 ||
+      metadata.matchCount === 0 ||
+      metadata.count === 0 ||
+      metadata.byteLength === 0
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function toolCommandText(input: JsonObject | undefined): string {
+  if (!input) return "";
+  const command = typeof input.command === "string" ? input.command : "";
+  if (!command) return "";
+  const args = Array.isArray(input.args) ? input.args.filter((value): value is string => typeof value === "string") : [];
+  return [command, ...args].join(" ");
+}
+
+function readyStageKindMatches(control: JsonObject | undefined, kinds: readonly string[]): boolean {
+  const stageKind = typeof control?.stageKind === "string" ? control.stageKind : "";
+  return kinds.includes(stageKind);
+}
+
+function failureClassForLoopTerminal(reason: string, status: AgentLoopSummary["status"]): string {
+  if (reason === "model-iteration-limit") return "loop-budget-exhausted";
+  if (reason.includes("workflow-required-action")) return "workflow-required-action-missed";
+  if (reason.includes("workflow-stage-budget")) return "workflow-stage-budget-exhausted";
+  if (reason.includes("tool")) return "tool-terminal";
+  if (status === "rejected") return "runtime-rejected";
+  return "runtime-failed";
+}
+
+function attributionForLoopTerminal(
+  reason: string,
+  error: RedactedError | undefined
+): import("@deepseek/platform-contracts").FailureAnalysisAttribution {
+  if (reason === "model-iteration-limit") return "framework-scheduling";
+  if (reason.includes("workflow")) return "framework-scheduling";
+  if (reason.includes("tool") || error?.code === "KERNEL_CAPABILITY_NOT_FOUND") return "tool-availability";
+  if (error?.code === "KERNEL_SCHEDULER_TIMEOUT") return "environment";
+  if (error?.code === "KERNEL_POLICY_DENIED") return "framework-scheduling";
+  return "inconclusive";
+}
+
+function evidenceQueriesForLoopTerminal(reason: string): readonly string[] {
+  if (reason === "model-iteration-limit") {
+    return [
+      "count model iterations",
+      "count tool calls",
+      "check whether stage progress capability was satisfied",
+      "check whether failure happened before required artifact production"
+    ];
+  }
+  if (reason.includes("workflow")) {
+    return [
+      "inspect active workflow stage",
+      "compare requested action with required next action",
+      "check accepted evidence refs"
+    ];
+  }
+  return [
+    "inspect terminal event",
+    "inspect diagnostics",
+    "check accepted evidence refs"
+  ];
+}
+
+function nextActionForLoopTerminal(reason: string): import("@deepseek/platform-contracts").FailureAnalysisNextAction {
+  if (reason === "model-iteration-limit") return "repair";
+  if (reason === "workflow-mutation-input-stalled") return "repair";
+  if (reason.includes("workflow-required-action")) return "repair";
+  if (reason.includes("workflow-stage-budget")) return "prove-attribution";
+  if (reason.includes("tool")) return "focused-evidence-query";
+  return "search-evidence";
 }
 
 function taskDecisionRuntimeStatus(envelope: TaskDecisionEnvelope): string {
@@ -2162,7 +3482,7 @@ interface RestoredHistoryGroup {
 }
 
 async function restoreSessionHistory(deps: RuntimeDependencies, sessionId: SessionId): Promise<RestoredSessionHistory> {
-  const events = await deps.sessions.events(sessionId);
+  const events = await inheritedSessionEvents(deps, sessionId);
   if (events.length === 0) {
     return { messages: [], sessionEventCount: 0, restoredNodeIds: [], restoredSourceClasses: [], diagnostics: [] };
   }
@@ -2245,6 +3565,28 @@ async function restoreSessionHistory(deps: RuntimeDependencies, sessionId: Sessi
   };
 }
 
+async function inheritedSessionEvents(
+  deps: RuntimeDependencies,
+  sessionId: SessionId,
+  visited: ReadonlySet<string> = new Set(),
+  ownMaxSequence?: number
+): Promise<readonly SessionEvent[]> {
+  if (visited.has(sessionId)) return [];
+  const currentVisited = new Set(visited);
+  currentVisited.add(sessionId);
+  const events = await deps.sessions.events(sessionId);
+  const ownEvents = ownMaxSequence === undefined
+    ? events
+    : events.filter((event) => event.sequence <= ownMaxSequence);
+  const metadata = await deps.sessions.metadata(sessionId);
+  if (!metadata.ok || !metadata.value) return ownEvents;
+  const parentSessionId = metadata.value.lineage.parentSessionId;
+  const forkPointSequence = metadata.value.lineage.forkPointSequence;
+  if (!parentSessionId || typeof forkPointSequence !== "number" || !Number.isFinite(forkPointSequence)) return ownEvents;
+  const parentEvents = await inheritedSessionEvents(deps, parentSessionId, currentVisited, forkPointSequence);
+  return [...parentEvents, ...ownEvents];
+}
+
 function providerRequestReplayEvidence(
   messages: readonly ModelChatMessage[],
   restored: RestoredSessionHistory,
@@ -2286,6 +3628,10 @@ function providerRequestReplayEvidence(
   };
 }
 
+function providerCacheMessages(messages: readonly ModelChatMessage[]): readonly ModelChatMessage[] {
+  return messages;
+}
+
 function latestUserMessageIndex(messages: readonly ModelChatMessage[]): number {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     if (messages[index]?.role === "user") return index;
@@ -2305,21 +3651,11 @@ function jsonObjectValue(value: unknown): JsonObject | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? value as JsonObject : undefined;
 }
 
-function isRecoverableToolError(error: RedactedError | undefined): boolean {
-  if (!error) return false;
-  if (error.code === "KERNEL_SCHEDULER_TIMEOUT") return true;
-  if (error.code !== "KERNEL_EXECUTOR_FAILED") return false;
-  const details = jsonObjectValue(error.details);
-  return typeof details?.originalCode === "string" && details.originalCode.length > 0;
-}
-
-function toolTimeoutFor(input: unknown, maxToolTimeoutMs: number, manifestTimeoutMs?: number): number {
-  const upperBound = typeof manifestTimeoutMs === "number" && Number.isFinite(manifestTimeoutMs) && manifestTimeoutMs > 0
-    ? Math.floor(manifestTimeoutMs)
-    : maxToolTimeoutMs;
-  const requested = jsonObjectValue(input)?.timeoutMs;
-  if (typeof requested !== "number" || !Number.isFinite(requested) || requested <= 0) return upperBound;
-  return Math.min(Math.floor(requested), upperBound);
+function stringField(input: JsonObject, key: string): string | undefined {
+  const value = input[key];
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
 }
 
 function hasEligibleRepairCheckpoint(deps: RuntimeDependencies, sessionId: SessionId, turnId: TurnId): boolean {
@@ -2346,464 +3682,403 @@ function repairFeedbackMessage(
   classification: SelfRepairFailureClassification,
   error: RedactedError | undefined
 ): ModelChatMessage {
+  const detailDiagnostics = repairDiagnosticLines(error);
   return {
     role: "tool",
     toolCallId: plan.attemptId,
     toolName: "agent.self-repair",
     content: [
+      "agent.self-repair",
       "Self-repair feedback:",
+      `Repair attempt: ${plan.attemptId}.`,
       `Failure source: ${classification.failureSource}.`,
       `Affected scope: ${classification.affectedScope}.`,
       `Repair action: ${plan.actionType}.`,
       `Verification: ${plan.expectedVerification.join(", ") || "next model iteration"}.`,
       error ? `Diagnostic: ${error.code}: ${error.message}` : "Diagnostic: unavailable.",
+      ...detailDiagnostics,
       "Make the smallest bounded correction, use only visible governed tools, then stop or verify."
     ].join("\n")
   };
 }
 
-interface SweBenchVerificationGateState {
-  readonly enabled: boolean;
-  readonly runCapabilityRoutingEnabled: boolean;
-  sourceInspectionToolCount: number;
-  shellCommandCount: number;
-  testCommandCount: number;
-  successfulTestCommandCount: number;
-  sourceMutationCount: number;
-  diffInspectionCount: number;
-  postVerificationShellCommandCount: number;
-  inspectedSourcePaths: Set<string>;
-  mutatedSourcePaths: Set<string>;
-  completedSourceReadWindows: Set<string>;
-  completedSourceInspectionSignatures: string[];
-  focusedSourceReadAfterGateCount: number;
-  sourceInspectionGateDefianceCount: number;
-  duplicateSourceInspectionGateInserted: boolean;
-  providerHistoryBounded: boolean;
-  sourceInspectionGateInserted: boolean;
-  postEditVerificationGateInserted: boolean;
-  inserted: boolean;
-  environmentBlockerInserted: boolean;
-  preRunNonTerminalToolCount: number;
-  runCapabilityInvoked: boolean;
-  runCapabilityRoutingGateInserted: boolean;
-  pendingRepoLocalRunnerCommand?: string;
-  pendingRepoLocalRunnerPath?: string;
-  repoLocalRunnerGateInserted: boolean;
-  repoLocalRunnerAttempted: boolean;
+function repairDiagnosticLines(error: RedactedError | undefined): readonly string[] {
+  const details = jsonObjectValue(error?.details);
+  const diagnostics = Array.isArray(details?.diagnostics) ? details.diagnostics : [];
+  return diagnostics
+    .map((diagnostic) => jsonObjectValue(diagnostic))
+    .filter((diagnostic): diagnostic is JsonObject => diagnostic !== undefined)
+    .map((diagnostic) => {
+      const code = stringField(diagnostic, "code");
+      const message = stringField(diagnostic, "message");
+      return code && message ? `Contract diagnostic: ${code}: ${message}` : undefined;
+    })
+    .filter((line): line is string => typeof line === "string")
+    .slice(0, 5);
 }
 
-function providerHistoryForRequest(
-  messages: readonly ModelChatMessage[],
-  sweBenchState: SweBenchVerificationGateState
-): readonly ModelChatMessage[] {
-  if (!sweBenchState.providerHistoryBounded) return messages;
-  return sweBenchBoundedHistoryTail(messages);
-}
-
-function sweBenchBoundedHistoryTail(messages: readonly ModelChatMessage[]): readonly ModelChatMessage[] {
-  const firstUserIndex = messages.findIndex((message) => message.role === "user");
-  const prefix = firstUserIndex >= 0 ? [messages[firstUserIndex] as ModelChatMessage] : [];
-  const tail = messages.slice(firstUserIndex >= 0 ? firstUserIndex + 1 : 0);
-  const latestControlUserIndex = latestUserMessageIndex(tail);
-  const retained: { readonly index: number; readonly message: ModelChatMessage }[] = [];
-  if (latestControlUserIndex >= 0 && tail[latestControlUserIndex]) {
-    retained.push({ index: latestControlUserIndex, message: tail[latestControlUserIndex] as ModelChatMessage });
+function profilePolicyWithRuntimeWorkflowGateOverride(
+  profilePolicy: AgentLoopProfilePolicyMetadata | undefined,
+  override: AgentLoopProfileWorkflowGateOverride | undefined
+): AgentLoopProfilePolicyMetadata | undefined {
+  if (!override) return profilePolicy;
+  if (!profilePolicy) {
+    return {
+      schemaVersion: "1.0.0",
+      profileId: "runtime/workflow-gate-override.v1",
+      role: "runtime-gate-workflow",
+      workflowGraphId: "runtime/workflow-gate-override",
+      workflowPriority: "primary",
+      orchestrationMode: "staged-capability-workflow",
+      workflowCapabilityIds: [],
+      toolProjectionSource: "runtime-gate",
+      workflowGateOverride: override,
+      antiTailoring: false,
+      executionBoundary: "runtime-gate-override",
+      redaction: { class: "internal" }
+    };
   }
-  let retainedToolResults = 0;
-  let latestRetainedToolIndex: number | undefined;
-  for (let index = tail.length - 1; index >= 0; index -= 1) {
-    const message = tail[index];
-    if (!message) continue;
-    if (message.role === "tool") {
-      if (retainedToolResults >= SWE_BENCH_PROVIDER_HISTORY_TOOL_TAIL_LIMIT) continue;
-      retainedToolResults += 1;
-      latestRetainedToolIndex = index;
-      const previous = tail[index - 1];
-      if (previous?.role === "assistant" && (previous.toolCalls?.length ?? 0) > 0) {
-        retained.push({ index: index - 1, message: previous });
-      }
-      retained.push({ index, message: compactSweBenchProviderToolFeedback(message) });
-      break;
-    }
-    if (message.role === "assistant" && (message.toolCalls?.length ?? 0) > 0) {
-      if (retainedToolResults >= SWE_BENCH_PROVIDER_HISTORY_TOOL_TAIL_LIMIT) continue;
-      retainedToolResults += 1;
-      retained.push({ index, message });
-      break;
-    }
-  }
-  const latestRetainedTool = latestRetainedToolIndex !== undefined ? tail[latestRetainedToolIndex] : undefined;
-  if (latestRetainedToolIndex !== undefined && latestRetainedTool && isSweBenchSourceInspectionRejectionMessage(latestRetainedTool)) {
-    const priorSourceEvidence = recentSuccessfulSourceInspectionPair(tail, latestRetainedToolIndex);
-    for (const entry of priorSourceEvidence) {
-      if (!retained.some((retainedEntry) => retainedEntry.index === entry.index)) retained.push(entry);
-    }
-  }
-  const boundedTail = retained
-    .sort((left, right) => left.index - right.index)
-    .map((entry) => entry.message);
-  return [...prefix, ...boundedTail];
+  return { ...profilePolicy, workflowGateOverride: override };
 }
 
-function recentSuccessfulSourceInspectionPair(
-  tail: readonly ModelChatMessage[],
-  beforeIndex: number
-): readonly { readonly index: number; readonly message: ModelChatMessage }[] {
-  for (let index = beforeIndex - 1; index >= 0; index -= 1) {
-    const message = tail[index];
-    if (!message || message.role !== "tool") continue;
-    if (isSweBenchSourceInspectionRejectionMessage(message)) continue;
-    if (!isSourceInspectionTool(String(message.toolName ?? ""))) continue;
-    const pair: { readonly index: number; readonly message: ModelChatMessage }[] = [];
-    const previous = tail[index - 1];
-    if (previous?.role === "assistant" && (previous.toolCalls?.length ?? 0) > 0) {
-      pair.push({ index: index - 1, message: previous });
-    }
-    pair.push({ index, message: compactSweBenchProviderToolFeedback(message) });
-    return pair;
-  }
-  return [];
-}
-
-function isSweBenchSourceInspectionRejectionMessage(message: ModelChatMessage): boolean {
-  return message.role === "tool" && (
-    message.content.includes("SWE_BENCH_SOURCE_INSPECTION_DUPLICATE_GATE_ENFORCED") ||
-    message.content.includes("SWE_BENCH_SOURCE_INSPECTION_GATE_ENFORCED")
-  );
-}
-
-function compactSweBenchProviderToolFeedback(message: ModelChatMessage): ModelChatMessage {
-  const byteLength = Buffer.byteLength(message.content, "utf8");
-  if (byteLength <= SWE_BENCH_PROVIDER_TOOL_FEEDBACK_LIMIT_BYTES) return message;
-  const text = boundedModelText(message.content, SWE_BENCH_PROVIDER_TOOL_FEEDBACK_LIMIT_BYTES);
-  return {
-    ...message,
-    content: [
-      `Provider-visible tool feedback truncated to ${SWE_BENCH_PROVIDER_TOOL_FEEDBACK_LIMIT_BYTES} bytes from ${byteLength} bytes.`,
-      "Full output remains available in lossless trace and model.tool.result evidence.",
-      "",
-      text
-    ].join("\n")
-  };
-}
-
-function createSweBenchVerificationGateState(prompt: string): SweBenchVerificationGateState {
-  const inheritedPatch = promptCarriesInheritedSweBenchPatch(prompt);
-  const enabled = prompt.includes("Managed SWE-bench execution profile");
-  const runCapabilityRoutingEnabled = isUserLevelSweBenchLiteTaskPrompt(prompt);
-  return {
-    enabled,
-    runCapabilityRoutingEnabled,
-    sourceInspectionToolCount: 0,
-    shellCommandCount: 0,
-    testCommandCount: 0,
-    successfulTestCommandCount: 0,
-    sourceMutationCount: inheritedPatch ? 1 : 0,
-    diffInspectionCount: 0,
-    postVerificationShellCommandCount: 0,
-    inspectedSourcePaths: new Set<string>(),
-    mutatedSourcePaths: new Set<string>(),
-    completedSourceReadWindows: new Set<string>(),
-    completedSourceInspectionSignatures: [],
-    focusedSourceReadAfterGateCount: 0,
-    sourceInspectionGateDefianceCount: 0,
-    duplicateSourceInspectionGateInserted: false,
-    providerHistoryBounded: enabled || runCapabilityRoutingEnabled || isSweBenchPrompt(prompt),
-    sourceInspectionGateInserted: false,
-    postEditVerificationGateInserted: false,
-    inserted: false,
-    environmentBlockerInserted: false,
-    preRunNonTerminalToolCount: 0,
-    runCapabilityInvoked: false,
-    runCapabilityRoutingGateInserted: false,
-    repoLocalRunnerGateInserted: false,
-    repoLocalRunnerAttempted: false
-  };
-}
-
-function isSweBenchPrompt(prompt: string): boolean {
-  return /swe[- ]?bench/i.test(prompt);
-}
-
-function isUserLevelSweBenchLiteTaskPrompt(prompt: string): boolean {
-  const normalized = prompt
-    .replace(/[０-９]/g, (char) => String(char.charCodeAt(0) - 0xff10))
-    .toLowerCase();
-  if (!/swe[- ]?bench\s+lite/.test(normalized)) return false;
-  return (
-    /第\s*\d{1,3}\s*(?:到|至|-|~)?\s*第?\s*\d{0,3}\s*(?:题|个|项|task|tasks|instance|instances)/i.test(normalized)
-    || /\b(?:task|tasks|instance|instances)\s*#?\s*\d{1,3}\b/i.test(normalized)
-    || /\b\d{1,3}\s*(?:st|nd|rd|th)?\s*(?:task|tasks|instance|instances)\b/i.test(normalized)
-  );
-}
-
-function promptCarriesInheritedSweBenchPatch(prompt: string): boolean {
-  return /Previous patch status:\s*non-empty patchBytes=[1-9]\d*/i.test(prompt);
-}
-
-function recordSweBenchVerificationGateToolIntent(state: SweBenchVerificationGateState, toolName: string, input: JsonObject): void {
-  if (state.runCapabilityRoutingEnabled && !state.runCapabilityInvoked) {
-    if (toolName === "core.swe.bench.run") {
-      state.runCapabilityInvoked = true;
-    } else {
-      state.preRunNonTerminalToolCount += 1;
-    }
-  }
-  if (!state.enabled) return;
-  if (isSourceInspectionTool(toolName)) {
-    state.sourceInspectionToolCount += 1;
-    const inspectedPath = sourceInspectionReadPath(toolName, input);
-    if (inspectedPath) state.inspectedSourcePaths.add(inspectedPath);
-    return;
-  }
-  if (isSourceMutationTool(toolName)) {
-    return;
-  }
-  if (isPatchReviewTool(toolName)) {
-    state.diffInspectionCount += 1;
-    return;
-  }
-  if (toolName === "core.test.run" || toolName === "test.run") {
-    const commandText = shellCommandText(input);
-    if (isPendingRepoLocalRunnerCommand(state, commandText)) state.repoLocalRunnerAttempted = true;
-    if (commandText) state.testCommandCount += 1;
-    return;
-  }
-  if (toolName !== "core.shell.run") return;
-  const commandText = shellCommandText(input);
-  if (!commandText) return;
-  if (isPendingRepoLocalRunnerCommand(state, commandText)) state.repoLocalRunnerAttempted = true;
-  state.shellCommandCount += 1;
-  if (isStandardTestCommand(commandText)) state.testCommandCount += 1;
-  if (state.sourceMutationCount > 0 && state.testCommandCount > 0 && !isStandardTestCommand(commandText)) {
-    state.postVerificationShellCommandCount += 1;
-  }
-}
-
-function recordSweBenchVerificationGateToolCompletion(
-  state: SweBenchVerificationGateState,
-  toolName: string,
-  input: JsonObject,
-  terminal: RuntimeEvent | undefined
-): void {
-  if (!state.enabled) return;
-  if (isSourceInspectionTool(toolName) && terminal?.kind === "capability.completed") {
-    const signature = sourceInspectionSignature(toolName, input);
-    if (signature) state.completedSourceInspectionSignatures = [...state.completedSourceInspectionSignatures, signature].slice(-4);
-  }
-  if (toolName === "core.file.read" && terminal?.kind === "capability.completed") {
-    const completedWindowKey = sourceReadWindowKey(toolName, input);
-    if (completedWindowKey) state.completedSourceReadWindows.add(completedWindowKey);
-  }
-  if ((toolName === "core.test.run" || toolName === "test.run" || (toolName === "core.shell.run" && isStandardTestCommand(shellCommandText(input)))) && testCommandCompletedSuccessfully(terminal)) {
-    state.successfulTestCommandCount += 1;
-  }
-  const repoLocalRunner = repoLocalRunnerActionFromTestFailure(terminal);
-  if (repoLocalRunner && !state.repoLocalRunnerAttempted) {
-    state.pendingRepoLocalRunnerCommand = repoLocalRunner.command;
-    state.pendingRepoLocalRunnerPath = repoLocalRunner.path;
-  }
-  if (!isSourceMutationTool(toolName) || terminal?.kind !== "capability.completed") return;
-  state.sourceMutationCount += 1;
-  const mutatedPath = sourceToolPath(input);
-  if (mutatedPath) state.mutatedSourcePaths.add(mutatedPath);
-}
-
-function repoLocalRunnerActionFromTestFailure(terminal: RuntimeEvent | undefined): { readonly command: string; readonly path: string } | undefined {
-  const output = jsonObjectValue(terminal?.data.output);
-  const evidence = jsonObjectValue(output?.evidence);
-  const metadata = jsonObjectValue(evidence?.metadata);
-  const testFailure = jsonObjectValue(metadata?.testFailure);
-  const command = stringValue(testFailure?.alternateCommand);
-  const path = stringValue(testFailure?.alternateRunnerPath);
-  if (!command || !path) return undefined;
-  return { command, path };
-}
-
-function isPendingRepoLocalRunnerCommand(state: SweBenchVerificationGateState, commandText: string): boolean {
-  if (!commandText || !state.pendingRepoLocalRunnerCommand || !state.pendingRepoLocalRunnerPath) return false;
-  return commandUsesRepoLocalRunner(commandText, state.pendingRepoLocalRunnerCommand, state.pendingRepoLocalRunnerPath);
-}
-
-function commandUsesRepoLocalRunner(commandText: string, alternateCommand: string, runnerPath: string): boolean {
-  const normalized = normalizeShellCommandText(commandText);
-  const normalizedAlternate = normalizeShellCommandText(alternateCommand);
-  const normalizedPath = normalizeShellCommandText(runnerPath);
-  if (normalizedAlternate && normalized.includes(normalizedAlternate)) return true;
-  if (!normalizedPath) return false;
-  return new RegExp(`(?:^|[\\s;&|])(?:[\\w./:-]*python[\\w./:-]*)\\s+${escapeRegExp(normalizedPath)}(?:\\s|$)`).test(normalized);
-}
-
-function normalizeShellCommandText(value: string): string {
-  return value.replace(/\\/g, "/").replace(/\s+/g, " ").trim().toLowerCase();
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function shouldInsertSweBenchSourceInspectionGate(state: SweBenchVerificationGateState): boolean {
-  return (
-    state.enabled &&
-    !state.sourceInspectionGateInserted &&
-    state.sourceInspectionToolCount >= SWE_BENCH_SOURCE_INSPECTION_GATE_TOOL_THRESHOLD &&
-    state.sourceMutationCount === 0 &&
-    state.testCommandCount === 0
-  );
-}
-
-function shouldInsertSweBenchVerificationGate(state: SweBenchVerificationGateState): boolean {
-  return (
-    state.enabled &&
-    !state.inserted &&
-    state.shellCommandCount >= SWE_BENCH_VERIFICATION_GATE_SHELL_THRESHOLD &&
-    state.testCommandCount === 0
-  );
-}
-
-function shouldInsertSweBenchPostEditVerificationGate(state: SweBenchVerificationGateState): boolean {
-  return (
-    state.enabled &&
-    !state.postEditVerificationGateInserted &&
-    state.sourceMutationCount > 0 &&
-    state.testCommandCount === 0
-  );
-}
-
-function shouldInsertSweBenchRepoLocalRunnerGate(state: SweBenchVerificationGateState): boolean {
-  return (
-    state.enabled &&
-    !state.repoLocalRunnerGateInserted &&
-    !state.repoLocalRunnerAttempted &&
-    state.sourceMutationCount > 0 &&
-    state.testCommandCount > 0 &&
-    state.successfulTestCommandCount === 0 &&
-    Boolean(state.pendingRepoLocalRunnerCommand && state.pendingRepoLocalRunnerPath)
-  );
-}
-
-function shouldInsertSweBenchEnvironmentBlockerGate(state: SweBenchVerificationGateState): boolean {
-  return (
-    state.enabled &&
-    !state.environmentBlockerInserted &&
-    state.sourceMutationCount > 0 &&
-    state.testCommandCount > 0 &&
-    state.successfulTestCommandCount === 0 &&
-    state.postVerificationShellCommandCount >= SWE_BENCH_ENVIRONMENT_BLOCKER_SHELL_THRESHOLD
-  );
-}
-
-function shouldInsertSweBenchRunCapabilityRoutingGate(state: SweBenchVerificationGateState): boolean {
-  return (
-    state.runCapabilityRoutingEnabled &&
-    !state.runCapabilityInvoked &&
-    !state.runCapabilityRoutingGateInserted &&
-    state.preRunNonTerminalToolCount >= SWE_BENCH_RUN_ROUTING_GATE_TOOL_THRESHOLD
-  );
-}
-
-function shouldStopAtSweBenchRequestBudget(state: SweBenchVerificationGateState, modelRequestCount: number): boolean {
-  return (
-    state.enabled && modelRequestCount >= SWE_BENCH_MODEL_REQUEST_BUDGET
-  ) || shouldStopAtSweBenchRunCapabilityRoutingBudget(state, modelRequestCount);
-}
-
-function shouldStopAtSweBenchRunCapabilityRoutingBudget(state: SweBenchVerificationGateState, modelRequestCount: number): boolean {
-  return (
-    state.runCapabilityRoutingEnabled &&
-    !state.runCapabilityInvoked &&
-    modelRequestCount >= SWE_BENCH_MODEL_REQUEST_BUDGET
-  );
-}
-
-function recordSweBenchGatePolicyRejection(state: SweBenchVerificationGateState, terminalKind: string): void {
-  if (terminalKind === "swe-bench-source-inspection-gate.rejected") {
-    state.sourceInspectionGateDefianceCount += 1;
-  }
-  if (terminalKind === "swe-bench-source-inspection-duplicate.rejected") {
-    if (state.duplicateSourceInspectionGateInserted) {
-      state.sourceInspectionGateDefianceCount += 1;
-    }
-    state.duplicateSourceInspectionGateInserted = true;
-  }
-}
-
-function shouldStopAtSweBenchSourceInspectionDefiance(state: SweBenchVerificationGateState, terminalKind: string): boolean {
-  const sourceInspectionRejection =
-    terminalKind === "swe-bench-source-inspection-gate.rejected" ||
-    terminalKind === "swe-bench-source-inspection-duplicate.rejected";
-  return (
-    state.enabled &&
-    sourceInspectionRejection &&
-    state.sourceMutationCount === 0 &&
-    state.testCommandCount === 0 &&
-    state.sourceInspectionGateDefianceCount >= SWE_BENCH_SOURCE_INSPECTION_GATE_DEFIANCE_LIMIT
-  );
-}
-
-function shouldCompleteSweBenchReadyForHarness(state: SweBenchVerificationGateState): boolean {
-  return state.enabled && state.sourceMutationCount > 0 && state.successfulTestCommandCount > 0;
-}
-
-function shouldInsertSweBenchReadyForHarnessGate(state: SweBenchVerificationGateState): boolean {
-  return shouldCompleteSweBenchReadyForHarness(state);
-}
-
-function testCommandCompletedSuccessfully(terminal: RuntimeEvent | undefined): boolean {
-  if (terminal?.kind !== "capability.completed") return false;
-  const output = jsonObjectValue(terminal.data.output);
-  const evidence = jsonObjectValue(output?.evidence);
-  if (!evidence) return false;
-  const status = typeof evidence.status === "string" ? evidence.status : "";
-  const metadata = jsonObjectValue(evidence.metadata);
-  return status === "completed" && metadata?.exitCode === 0;
-}
-
-interface SweBenchGatePolicyRejection {
-  readonly error: RedactedError;
-  readonly terminalKind: string;
-}
-
-function workflowGateOverrideFromRejection(input: {
+function convergenceWorkflowGateOverride(input: {
+  readonly requiredNextAction: string;
+  readonly rejectedToolName: string;
+  readonly rejectedCapabilityId: string;
   readonly terminalKind: string;
   readonly toolCallId: string;
-  readonly toolName: string;
-  readonly capabilityId: string;
-  readonly error: RedactedError;
-}): AgentLoopProfileWorkflowGateOverride | undefined {
-  const details = jsonObjectValue(input.error.details);
-  if (!details) return undefined;
-  const requiredNextAction = stringField(details, "requiredNextAction");
-  const gate = stringField(details, "gate");
-  if (!requiredNextAction || !gate) return undefined;
+}): AgentLoopProfileWorkflowGateOverride {
   return {
-    gate,
-    requiredNextAction: providerFacingWorkflowGateAction(requiredNextAction),
-    rejectedToolName: input.toolName,
-    rejectedCapabilityId: input.capabilityId,
+    gate: "runtime-convergence",
+    requiredNextAction: input.requiredNextAction,
+    rejectedToolName: input.rejectedToolName,
+    rejectedCapabilityId: input.rejectedCapabilityId,
     terminalKind: input.terminalKind,
     toolCallId: input.toolCallId
   };
 }
 
-function applyWorkflowGateOverride(
-  profilePolicy: AgentLoopProfilePolicyMetadata | undefined,
-  input: {
-    readonly terminalKind: string;
-    readonly toolCallId: string;
-    readonly toolName: string;
-    readonly capabilityId: string;
-    readonly error: RedactedError;
+function workflowGateOverrideAllowsCapability(
+  override: AgentLoopProfileWorkflowGateOverride | undefined,
+  capabilityId: string
+): boolean {
+  if (!override) return false;
+  return workflowGateRequiredActionAllowsCapability(override.requiredNextAction, capabilityId);
+}
+
+function readyStageAllowsCapability(control: JsonObject | undefined, capabilityId: string): boolean {
+  const allowed = Array.isArray(control?.allowedCapabilityIds)
+    ? control.allowedCapabilityIds.map(String)
+    : [];
+  const progress = Array.isArray(control?.progressCapabilityIds)
+    ? control.progressCapabilityIds.map(String)
+    : [];
+  return allowed.includes(capabilityId) || progress.includes(capabilityId);
+}
+
+function readyStageControlProjectedFromReviewedEvidence(control: JsonObject | undefined): boolean {
+  return control?.projectedFromReviewedStage === true;
+}
+
+function workflowGateRequiredActionAllowsCapability(requiredNextAction: string, capabilityId: string): boolean {
+  const alternatives = requiredNextAction.split("|").map((part) => part.trim()).filter(Boolean);
+  if (alternatives.length > 1) return alternatives.some((alternative) => workflowGateRequiredActionAllowsCapability(alternative, capabilityId));
+  if (requiredNextAction === "focused-read-or-source-edit-or-bounded-blocker") {
+    return isFocusedEvidenceRefreshCapabilityId(capabilityId) || isMutationCapabilityId(capabilityId);
   }
-): AgentLoopProfilePolicyMetadata | undefined {
-  if (!profilePolicy?.stagedTaskWorkflow) return profilePolicy;
-  const override = workflowGateOverrideFromRejection(input);
-  if (!override) return profilePolicy;
+  if (requiredNextAction === "focused-read-or-source-edit-or-test-or-return-control") {
+    return isFocusedEvidenceRefreshCapabilityId(capabilityId) || isMutationCapabilityId(capabilityId) || isTestCapabilityId(capabilityId);
+  }
+  if (requiredNextAction === "source-edit-or-test-or-bounded-blocker" || requiredNextAction === "source-edit-or-test-or-blocker") {
+    return isMutationCapabilityId(capabilityId) || isTestCapabilityId(capabilityId);
+  }
+  if (requiredNextAction === "standard-test-command") {
+    return capabilityId === "core.test.run";
+  }
+  if (requiredNextAction === "standard-test-command-or-bounded-blocker") {
+    return capabilityId === "core.test.run" || capabilityId === "core.shell.run";
+  }
+  if (requiredNextAction.startsWith("core.")) return capabilityId === requiredNextAction;
+  return false;
+}
+
+function isFocusedEvidenceRefreshCapabilityId(capabilityId: string): boolean {
+  return capabilityId === "core.file.read" || capabilityId === "core.search.text";
+}
+
+function unboundedSourceReadDiagnostic(input: {
+  readonly capabilityId: string;
+  readonly toolName: string;
+  readonly toolInput: JsonObject;
+  readonly workflowReadyStageControl: JsonObject | undefined;
+}): RedactedError | undefined {
+  if (input.capabilityId !== "core.file.read") return undefined;
+  if (!readyStageKindMatches(input.workflowReadyStageControl, ["collect-evidence"])) return undefined;
+  const path = typeof input.toolInput.path === "string" ? input.toolInput.path : "";
+  if (!isSourceFilePath(path)) return undefined;
+  const hasOffset = typeof input.toolInput.offset === "number";
+  const hasLimit = typeof input.toolInput.limit === "number";
+  if (hasOffset && hasLimit) return undefined;
+  return kernelError(
+    "KERNEL_POLICY_DENIED",
+    "WORKFLOW_UNBOUNDED_SOURCE_READ: governed evidence collection for source files must use a bounded read with offset and limit.",
+    {
+      toolName: input.toolName,
+      capabilityId: input.capabilityId,
+      path,
+      workflowReadyStageControl: input.workflowReadyStageControl
+    }
+  );
+}
+
+function isSourceFilePath(path: string): boolean {
+  return /\.(c|cc|cpp|cs|go|h|hpp|java|js|jsx|kt|mjs|py|rb|rs|scala|swift|ts|tsx)$/i.test(path);
+}
+
+function invalidMutationIntentDiagnostic(input: {
+  readonly capabilityId: string;
+  readonly toolName: string;
+  readonly toolInput: JsonObject;
+  readonly workflowReadyStageControl: JsonObject | undefined;
+  readonly acceptedSourceEvidencePaths?: readonly string[];
+}): RedactedError | undefined {
+  if (!isMutationCapabilityId(input.capabilityId)) return undefined;
+  if (!readyStageKindMatches(input.workflowReadyStageControl, ["produce", "materialize", "repair"])) return undefined;
+  const expected = typeof input.toolInput.expected === "string" ? input.toolInput.expected : undefined;
+  const replacement = typeof input.toolInput.replacement === "string" ? input.toolInput.replacement : undefined;
+  const content = typeof input.toolInput.content === "string" ? input.toolInput.content : undefined;
+  const patch = typeof input.toolInput.patch === "string" ? input.toolInput.patch : undefined;
+  const reasons: string[] = [];
+  if (expected !== undefined && replacement !== undefined && expected === replacement) reasons.push("expected and replacement are identical");
+  if (expected !== undefined && isPlaceholderMutationText(expected)) reasons.push("expected text is a placeholder");
+  if (replacement !== undefined && isPlaceholderMutationText(replacement)) reasons.push("replacement text is a placeholder");
+  if (content !== undefined && isPlaceholderMutationText(content)) reasons.push("write content is a placeholder");
+  if (patch !== undefined && patchHasPlaceholderMutation(patch)) reasons.push("patch content is a placeholder");
+  if (patch !== undefined && !patchHasUnifiedDiffShape(patch)) reasons.push("patch content is not a unified diff");
+  const unrelatedTargets = mutationTargetsOutsideAcceptedEvidence(input.toolInput, input.acceptedSourceEvidencePaths ?? []);
+  if (unrelatedTargets.length > 0) reasons.push(`patch target is outside accepted source evidence: ${unrelatedTargets.join(", ")}`);
+  if (reasons.length === 0) return undefined;
+  return kernelError(
+    "KERNEL_POLICY_DENIED",
+    `WORKFLOW_INVALID_MUTATION_INTENT: placeholder mutation intent rejected before execution; ${reasons.join("; ")}.`,
+    {
+      toolName: input.toolName,
+      capabilityId: input.capabilityId,
+      reasons,
+      acceptedSourceEvidencePaths: input.acceptedSourceEvidencePaths ?? [],
+      mutationTargetPaths: mutationTargetPaths(input.toolInput),
+      workflowReadyStageControl: input.workflowReadyStageControl
+    }
+  );
+}
+
+function sourceEvidencePathFromToolInput(capabilityId: string, input: JsonObject): string | undefined {
+  if (capabilityId !== "core.file.read") return undefined;
+  const path = typeof input.path === "string" ? normalizeEvidencePath(input.path) : undefined;
+  return path && !path.startsWith(".") ? path : undefined;
+}
+
+function mutationTargetsOutsideAcceptedEvidence(input: JsonObject, acceptedPaths: readonly string[]): readonly string[] {
+  const accepted = new Set(acceptedPaths.map(normalizeEvidencePath).filter(Boolean));
+  if (accepted.size === 0) return [];
+  const targets = mutationTargetPaths(input);
+  return targets.filter((target) => !accepted.has(target));
+}
+
+function mutationTargetPaths(input: JsonObject): readonly string[] {
+  const paths: string[] = [];
+  if (typeof input.path === "string") paths.push(input.path);
+  if (typeof input.file === "string") paths.push(input.file);
+  if (typeof input.patch === "string") {
+    for (const line of input.patch.replace(/\r\n/g, "\n").split("\n")) {
+      if (!line.startsWith("+++ ")) continue;
+      const path = normalizePatchTargetPath(line.slice(4).trim());
+      if (path && path !== "/dev/null") paths.push(path);
+    }
+  }
+  return [...new Set(paths.map(normalizeEvidencePath).filter(Boolean))];
+}
+
+function normalizePatchTargetPath(path: string): string {
+  if (path.startsWith("b/") || path.startsWith("a/")) return path.slice(2);
+  return path;
+}
+
+function normalizeEvidencePath(path: string): string {
+  return path.replace(/\\/g, "/").replace(/^\.\//, "").replace(/^\/+/, "");
+}
+
+function isPlaceholderMutationText(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return true;
+  return normalized === "placeholder" ||
+    normalized === "todo" ||
+    normalized === "tbd" ||
+    normalized === "fixme" ||
+    normalized === "..." ||
+    normalized === "<placeholder>" ||
+    normalized === "/* placeholder */" ||
+    normalized === "# placeholder";
+}
+
+function patchHasPlaceholderMutation(value: string): boolean {
+  if (isPlaceholderMutationText(value)) return true;
+  const mutationLines = value
+    .split(/\r?\n/)
+    .filter((line) =>
+      (line.startsWith("+") && !line.startsWith("+++")) ||
+      (line.startsWith("-") && !line.startsWith("---"))
+    )
+    .map((line) => line.slice(1).trim())
+    .filter(Boolean);
+  return mutationLines.length > 0 && mutationLines.every(isPlaceholderMutationText);
+}
+
+function patchHasUnifiedDiffShape(value: string): boolean {
+  return /^---\s+[ab]\//m.test(value) &&
+    /^\+\+\+\s+[ab]\//m.test(value) &&
+    /^@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@/m.test(value);
+}
+
+function invalidMutationIntentCorrectionMessage(
+  control: JsonObject,
+  error: RedactedError,
+  toolInput: JsonObject
+): ModelChatMessage {
+  const details = error.details && typeof error.details === "object" && !Array.isArray(error.details)
+    ? error.details as JsonObject
+    : {};
+  const reasons = Array.isArray(details.reasons) ? details.reasons.map(String) : [];
+  const acceptedPaths = Array.isArray(details.acceptedSourceEvidencePaths) ? details.acceptedSourceEvidencePaths.map(String) : [];
+  const targetPaths = Array.isArray(details.mutationTargetPaths) ? details.mutationTargetPaths.map(String) : [];
+  const evidencePaths = [...new Set([...acceptedPaths, ...targetPaths])];
+  const rejectedInput = rejectedMutationInputSummary(toolInput);
   return {
-    ...profilePolicy,
-    workflowGateOverride: override
+    role: "user",
+    content: [
+      "WORKFLOW_INVALID_MUTATION_INTENT_REJECTED.",
+      `Active stage: ${String(control.stageId ?? "unknown")}.`,
+      `Diagnostic: ${error.code}: ${error.message}`,
+      ...(reasons.length > 0 ? [`Rejected reasons: ${reasons.join("; ")}.`] : []),
+      ...(rejectedInput ? [
+        "Rejected mutation input:",
+        rejectedInput
+      ] : []),
+      evidencePaths.length > 0
+        ? `Current accepted source evidence: ${evidencePaths.join(", ")}.`
+        : "Current accepted source evidence: unavailable; refresh exact local evidence before guessing expected text.",
+      "A mutation tool call must carry a real source change. Do not use placeholder text, no-op replacements, or mutation tools to request more reading.",
+      "For core.file.edit, expected and replacement must differ; copy expected exactly from current evidence and make replacement the intended changed text.",
+      "For core.patch.apply, provide a complete unified diff whose removed lines match current evidence and whose added lines are the intended changed text.",
+      "Next action: refresh exact local evidence with one visible focused read/search tool, call a visible edit/patch tool with a real diff, or report a bounded blocker."
+    ].join("\n")
   };
+}
+
+function rejectedMutationInputSummary(input: JsonObject): string | undefined {
+  const fields: Record<string, string> = {};
+  for (const key of ["path", "file", "expected", "replacement", "content", "patch"] as const) {
+    const value = input[key];
+    if (typeof value !== "string") continue;
+    fields[key] = boundedModelText(value, 1_200);
+  }
+  return Object.keys(fields).length > 0 ? JSON.stringify(fields, undefined, 2) : undefined;
+}
+
+function invalidMutationIntentHasReason(error: RedactedError, reason: string): boolean {
+  const details = error.details;
+  if (!details || typeof details !== "object" || Array.isArray(details)) return false;
+  const reasons = (details as JsonObject).reasons;
+  return Array.isArray(reasons) && reasons.map(String).includes(reason);
+}
+
+function mutationRepairCorrectionMessage(
+  control: JsonObject,
+  error: RedactedError,
+  diagnostics: readonly RedactedError[] = []
+): ModelChatMessage {
+  const progressCapabilityIds = Array.isArray(control.progressCapabilityIds)
+    ? control.progressCapabilityIds.map(String).join(", ")
+    : "";
+  const mutationContext = mutationRepairContextSummary(diagnostics);
+  return {
+    role: "user",
+    content: [
+      "WORKFLOW_MUTATION_REPAIR_REQUIRED.",
+      `Active stage: ${String(control.stageId ?? "unknown")}.`,
+      "A source mutation tool was selected but failed before changing the workspace.",
+      `Diagnostic: ${error.code}: ${error.message}`,
+      ...(mutationContext ? [
+        mutationContext.heading,
+        mutationContext.summary,
+        mutationContext.source === "actualAtDeclaredLocation"
+          ? "For file.edit, copy actualAtDeclaredLocation verbatim into expected and change only the replacement lines. Use nearestContext only if the intended target is elsewhere."
+          : "For file.edit, copy the exact current context verbatim into expected and change only the replacement lines."
+      ] : []),
+      progressCapabilityIds ? `Mutation progress capabilities: ${progressCapabilityIds}.` : "Mutation progress capabilities: unavailable.",
+      "Next action: use the failed tool feedback and either refresh exact local evidence with a visible focused read/search tool or call a visible source edit/patch tool with corrected input.",
+      "Do not broaden discovery or repeat the same stale edit/patch input."
+    ].join("\n")
+  };
+}
+
+function mutationRepairContextSummary(
+  diagnostics: readonly RedactedError[]
+): { readonly source: "actualAtDeclaredLocation" | "nearestContext"; readonly heading: string; readonly summary: string } | undefined {
+  for (const diagnostic of diagnostics) {
+    const details = diagnostic.details;
+    if (!details || typeof details !== "object" || Array.isArray(details)) continue;
+    const object = details as JsonObject;
+    const context = typeof object.actualAtDeclaredLocation === "string" ? object.actualAtDeclaredLocation.trimEnd() : "";
+    if (!context) continue;
+    return {
+      source: "actualAtDeclaredLocation",
+      heading: "Current actualAtDeclaredLocation from failed mutation:",
+      summary: mutationContextDetails(
+        object,
+        context,
+        typeof object.hunkOldStart === "number" ? object.hunkOldStart : undefined,
+        context.split(/\r?\n/).length,
+        "Exact current context at declared hunk location:"
+      )
+    };
+  }
+  for (const diagnostic of diagnostics) {
+    const details = diagnostic.details;
+    if (!details || typeof details !== "object" || Array.isArray(details)) continue;
+    const object = details as JsonObject;
+    const context = typeof object.nearestContext === "string" ? object.nearestContext.trimEnd() : "";
+    if (!context) continue;
+    return {
+      source: "nearestContext",
+      heading: "Current nearestContext from failed mutation:",
+      summary: mutationContextDetails(
+        object,
+        context,
+        typeof object.nearestContextStartLine === "number" ? object.nearestContextStartLine : undefined,
+        typeof object.nearestContextLineCount === "number" ? object.nearestContextLineCount : undefined,
+        "Nearest current context:"
+      )
+    };
+  }
+  return undefined;
+}
+
+function mutationContextDetails(
+  details: JsonObject,
+  context: string,
+  startLine: number | undefined,
+  lineCount: number | undefined,
+  label: string
+): string {
+  const path = typeof details.path === "string" && details.path.trim() ? details.path.trim() : undefined;
+  return [
+    path ? `Path: ${path}` : undefined,
+    startLine !== undefined ? `Start line: ${startLine}` : undefined,
+    lineCount !== undefined ? `Line count: ${lineCount}` : undefined,
+    label,
+    context
+  ].filter((line): line is string => Boolean(line)).join("\n");
 }
 
 function clearWorkflowGateOverride(profilePolicy: AgentLoopProfilePolicyMetadata): AgentLoopProfilePolicyMetadata {
@@ -2812,434 +4087,497 @@ function clearWorkflowGateOverride(profilePolicy: AgentLoopProfilePolicyMetadata
   return rest;
 }
 
-function runtimeWorkflowGateOverridePolicy(override: AgentLoopProfileWorkflowGateOverride): AgentLoopProfilePolicyMetadata {
+function readyStageControlForProfilePolicy(profilePolicy: AgentLoopProfilePolicyMetadata | undefined): JsonObject | undefined {
+  const workflow = profilePolicy?.stagedTaskWorkflow;
+  if (!profilePolicy || !workflow || profilePolicy.workflowPriority !== "primary") return undefined;
+  const acceptanceMode = stageAcceptanceModeForReadyStageControl(profilePolicy);
+  const readyStageState = workflow.runState.stageStates.find((stage) => stage.status === "ready") ??
+    workflow.runState.stageStates.find((stage) =>
+      acceptanceMode === "supervisor" &&
+      stage.status === "running" &&
+      stage.evaluation?.status === "needs-review"
+    );
+  if (!readyStageState) return undefined;
+  const readyStage = workflow.graph.stages.find((stage) => stage.stageId === readyStageState.stageId);
+  if (!readyStage) return undefined;
+  const controlStage = readyStageControlStageForReviewedEvidence({
+    stages: workflow.graph.stages,
+    refs: workflow.runState.refs,
+    readyStage,
+    readyStageState,
+    acceptanceMode
+  }) ?? readyStage;
+  const projectedFromReviewedStage = controlStage.stageId !== readyStage.stageId;
+  const allowedCapabilityIds = (controlStage.allowedTools ?? []).map(String);
+  const progressCapabilityIds = readyStageProgressCapabilityIdsForControl({
+    stages: workflow.graph.stages,
+    refs: workflow.runState.refs,
+    readyStage: controlStage,
+    readyStageState,
+    acceptanceMode,
+    allowedCapabilityIds,
+    projectedFromReviewedStage
+  });
+  const terminalStage = !workflow.graph.stages.some((stage) => (stage.dependsOn ?? []).map(String).includes(controlStage.stageId));
   return {
     schemaVersion: "1.0.0",
-    profileId: "runtime/workflow-gate-override.v1",
-    role: "runtime-gate-workflow",
-    workflowGraphId: "runtime/workflow-gate-override",
-    workflowPriority: "primary",
-    orchestrationMode: "staged-capability-workflow",
-    workflowCapabilityIds: [],
-    toolProjectionSource: "runtime-gate",
-    workflowGateOverride: override,
-    antiTailoring: false,
-    executionBoundary: "runtime-gate-override",
+    profileId: profilePolicy.profileId,
+    workflowGraphId: profilePolicy.workflowGraphId,
+    graphId: workflow.graphId,
+    stageId: controlStage.stageId,
+    stageKind: controlStage.kind,
+    budgetStageId: readyStage.stageId,
+    budgetStageKind: readyStage.kind,
+    projectedFromReviewedStage,
+    executorKind: controlStage.executorKind,
+    requiredNextAction: requiredNextActionForStage(controlStage.kind, progressCapabilityIds),
+    allowedCapabilityIds,
+    progressCapabilityIds,
+    stageAcceptanceMode: acceptanceMode,
+    terminalClosePolicy: terminalClosePolicyForControlStage(controlStage.kind, terminalStage, acceptanceMode),
     redaction: { class: "internal" }
   };
 }
 
-function providerFacingWorkflowGateAction(requiredNextAction: string): string {
-  if (requiredNextAction === "source-edit-or-test-or-blocker") {
-    return "source-edit-or-test-or-bounded-blocker";
+function readyStageControlStageForReviewedEvidence(input: {
+  readonly stages: readonly { readonly stageId: string; readonly kind: string; readonly dependsOn?: readonly string[]; readonly allowedTools?: readonly string[] }[];
+  readonly refs?: readonly { readonly refId: string; readonly type?: string }[];
+  readonly readyStage: { readonly stageId: string; readonly kind: string; readonly allowedTools?: readonly string[] };
+  readonly readyStageState: { readonly status: string; readonly inputRefs?: readonly string[]; readonly outputRefs: readonly string[]; readonly evaluation?: { readonly status?: string } };
+  readonly acceptanceMode: "automatic" | "supervisor";
+}): { readonly stageId: string; readonly kind: string; readonly executorKind?: string; readonly dependsOn?: readonly string[]; readonly allowedTools?: readonly string[] } | undefined {
+  if (
+    input.acceptanceMode !== "supervisor" ||
+    input.readyStageState.status !== "running" ||
+    input.readyStageState.evaluation?.status !== "needs-review"
+  ) {
+    return undefined;
   }
-  return requiredNextAction;
+  const currentAllowedCapabilityIds = (input.readyStage.allowedTools ?? []).map(String);
+  const currentProgress = new Set(progressCapabilityIdsForWorkflowStage(input.readyStage.kind, currentAllowedCapabilityIds));
+  if (readyStageNeedsDiagnosticEvidenceReview(input.readyStage.kind, input.readyStageState.inputRefs ?? [], input.refs ?? [])) {
+    return undefined;
+  }
+  if (readyStageOwnProgressShouldWin(input.readyStage.kind, currentProgress) && input.readyStageState.outputRefs.length === 0) {
+    return undefined;
+  }
+  return input.stages.find((stage) => (stage.dependsOn ?? []).map(String).includes(input.readyStage.stageId));
 }
 
-function shouldClearWorkflowGateOverride(
-  override: AgentLoopProfilePolicyMetadata["workflowGateOverride"] | undefined,
-  toolName: string,
-  toolInput: JsonObject,
-  terminal: RuntimeEvent | undefined
+function readyStageNeedsDiagnosticEvidenceReview(
+  stageKind: string | undefined,
+  inputRefs: readonly string[],
+  refs: readonly { readonly refId: string; readonly type?: string }[]
 ): boolean {
-  if (!override || terminal?.kind !== "capability.completed") return false;
-  const commandText = shellCommandText(toolInput);
-  if (override.requiredNextAction === "source-edit-or-test-or-bounded-blocker") {
-    return isSourceMutationTool(toolName) ||
-      toolName === "core.test.run" ||
-      toolName === "test.run" ||
-      (toolName === "core.shell.run" && isStandardTestCommand(commandText));
-  }
-  if (override.requiredNextAction === "standard-test-command-or-bounded-blocker" || override.requiredNextAction === "standard-test-command") {
-    return toolName === "core.test.run" ||
-      toolName === "test.run" ||
-      (toolName === "core.shell.run" && isStandardTestCommand(commandText));
-  }
-  return false;
+  if (stageKind !== "collect-evidence") return false;
+  const refsById = new Map(refs.map((ref) => [ref.refId, ref]));
+  return inputRefs.some((refId) => refsById.get(refId)?.type === "diagnostic");
 }
 
-function sweBenchGatePolicyRejection(state: SweBenchVerificationGateState, toolName: string, input: JsonObject): SweBenchGatePolicyRejection | undefined {
-  const commandText = toolCommandTextForSweBenchGate(toolName, input);
-  const isShellRunTool = toolName === "core.shell.run";
-  const isTestTool = toolName === "core.test.run" || toolName === "test.run";
-  if (
-    state.runCapabilityRoutingEnabled &&
-    state.runCapabilityRoutingGateInserted &&
-    !state.runCapabilityInvoked &&
-    toolName !== "core.swe.bench.run"
-  ) {
-    return {
-      terminalKind: "swe-bench-run-capability-routing-gate.rejected",
-      error: kernelError(
-        "KERNEL_POLICY_DENIED",
-        "SWE_BENCH_RUN_CAPABILITY_ROUTING_GATE_ENFORCED: the previous SWE_BENCH_RUN_CAPABILITY_ROUTING_GATE requires invoking core.swe.bench.run for this numbered SWE-bench Lite task, or reporting a bounded blocker without more non-run tool calls.",
-        {
-          gate: "SWE_BENCH_RUN_CAPABILITY_ROUTING_GATE",
-          requiredNextAction: "core.swe.bench.run-or-bounded-blocker",
-          rejectedToolName: toolName,
-          rejectedInput: input
-        }
-      )
-    };
+function terminalClosePolicyForControlStage(
+  stageKind: string | undefined,
+  terminalStage: boolean,
+  acceptanceMode: "automatic" | "supervisor"
+): "automatic" | "supervisor" | "close-on-progress-capability" {
+  if (!terminalStage) return acceptanceMode === "supervisor" ? "supervisor" : "automatic";
+  if (acceptanceMode === "supervisor" && (stageKind === "produce" || stageKind === "materialize" || stageKind === "repair")) {
+    return "supervisor";
+  }
+  return "close-on-progress-capability";
+}
+
+function readyStageProgressCapabilityIdsForControl(input: {
+  readonly stages: readonly { readonly stageId: string; readonly kind: string; readonly dependsOn?: readonly string[]; readonly allowedTools?: readonly string[] }[];
+  readonly refs?: readonly { readonly refId: string; readonly type?: string }[];
+  readonly readyStage: { readonly stageId: string; readonly kind: string };
+  readonly readyStageState: { readonly status: string; readonly inputRefs?: readonly string[]; readonly outputRefs: readonly string[]; readonly evaluation?: { readonly status?: string } };
+  readonly acceptanceMode: "automatic" | "supervisor";
+  readonly allowedCapabilityIds: readonly string[];
+  readonly projectedFromReviewedStage?: boolean;
+}): readonly string[] {
+  const currentProgress = new Set(progressCapabilityIdsForWorkflowStage(input.readyStage.kind, input.allowedCapabilityIds));
+  if (input.projectedFromReviewedStage) {
+    return [...currentProgress];
   }
   if (
-    state.enabled &&
-    !state.sourceInspectionGateInserted &&
-    state.duplicateSourceInspectionGateInserted &&
-    state.sourceMutationCount === 0 &&
-    state.testCommandCount === 0 &&
-    (isSourceInspectionTool(toolName) || (toolName === "core.shell.run" && (!commandText || !isStandardTestCommand(commandText))))
+    input.acceptanceMode === "supervisor" &&
+    input.readyStageState.status === "running" &&
+    input.readyStageState.evaluation?.status === "needs-review"
   ) {
-    return {
-      terminalKind: "swe-bench-source-inspection-duplicate.rejected",
-      error: kernelError(
-        "KERNEL_POLICY_DENIED",
-        "SWE_BENCH_SOURCE_INSPECTION_DUPLICATE_GATE_ENFORCED: this managed SWE-bench run already has enough source-inspection evidence after a duplicate read/search request. Reuse the existing evidence and make the smallest source edit, run a standard test command, or report a bounded blocker instead of continuing read-location exploration.",
-        {
-          gate: "SWE_BENCH_SOURCE_INSPECTION_DUPLICATE_GATE",
-          requiredNextAction: "source-edit-or-test-or-blocker",
-          rejectedToolName: toolName,
-          ...(commandText ? { rejectedCommand: commandText } : {}),
-          rejectedInput: input
-        }
-      )
-    };
-  }
-  if (
-    state.enabled &&
-    !state.sourceInspectionGateInserted &&
-    state.sourceMutationCount === 0 &&
-    state.testCommandCount === 0 &&
-    isSourceInspectionTool(toolName) &&
-    isDuplicateSourceInspectionRequest(state, toolName, input)
-  ) {
-    const signature = sourceInspectionSignature(toolName, input);
-    return {
-      terminalKind: "swe-bench-source-inspection-duplicate.rejected",
-      error: kernelError(
-        "KERNEL_POLICY_DENIED",
-        "SWE_BENCH_SOURCE_INSPECTION_DUPLICATE_GATE_ENFORCED: this managed SWE-bench run already has the same source-inspection evidence. Reuse the existing evidence and make the smallest source edit, run a standard test command, or report a bounded blocker instead of rereading the same location.",
-        {
-          gate: "SWE_BENCH_SOURCE_INSPECTION_DUPLICATE_GATE",
-          requiredNextAction: "source-edit-or-test-or-blocker",
-          rejectedToolName: toolName,
-          ...(signature ? { duplicateSignature: signature } : {}),
-          rejectedInput: input
-        }
-      )
-    };
-  }
-  if (
-    state.enabled &&
-    state.sourceInspectionGateInserted &&
-    state.sourceMutationCount === 0 &&
-    state.testCommandCount === 0 &&
-    (isSourceInspectionTool(toolName) || (toolName === "core.shell.run" && (!commandText || !isStandardTestCommand(commandText))))
-  ) {
-    if (isFocusedSourceReadAfterInspectionGate(state, toolName, input)) {
-      state.focusedSourceReadAfterGateCount += 1;
-      return undefined;
+    if (readyStageNeedsDiagnosticEvidenceReview(input.readyStage.kind, input.readyStageState.inputRefs ?? [], input.refs ?? [])) {
+      return [...currentProgress];
     }
-    return {
-      terminalKind: "swe-bench-source-inspection-gate.rejected",
-      error: kernelError(
-        "KERNEL_POLICY_DENIED",
-        "SWE_BENCH_SOURCE_INSPECTION_GATE_ENFORCED: the previous SWE_BENCH_SOURCE_INSPECTION_GATE requires concrete progress before more read/search/list exploration or non-test shell setup. Make the smallest source edit, run a standard test command, or report a bounded blocker.",
-        {
-          gate: "SWE_BENCH_SOURCE_INSPECTION_GATE",
-          requiredNextAction: "source-edit-or-test-or-blocker",
-          rejectedToolName: toolName,
-          ...(commandText ? { rejectedCommand: commandText } : {}),
-          rejectedInput: input
-        }
-      )
-    };
+    if (readyStageOwnProgressShouldWin(input.readyStage.kind, currentProgress) && input.readyStageState.outputRefs.length === 0) {
+      return [...currentProgress];
+    }
+    const progress = new Set<string>();
+    for (const stage of input.stages) {
+      if (!(stage.dependsOn ?? []).map(String).includes(input.readyStage.stageId)) continue;
+      for (const capabilityId of progressCapabilityIdsForWorkflowStage(stage.kind, (stage.allowedTools ?? []).map(String))) {
+        progress.add(capabilityId);
+      }
+    }
+    if (progress.size > 0 || input.readyStage.kind === "collect-evidence") {
+      return [...progress];
+    }
   }
-  if (
-    state.enabled &&
-    state.postEditVerificationGateInserted &&
-    state.testCommandCount === 0 &&
-    (isSourceInspectionTool(toolName) || (toolName === "core.shell.run" && (!commandText || !isStandardTestCommand(commandText))))
-  ) {
-    return {
-      terminalKind: "swe-bench-post-edit-verification-gate.rejected",
-      error: kernelError(
-        "KERNEL_POLICY_DENIED",
-        "SWE_BENCH_POST_EDIT_VERIFICATION_GATE_ENFORCED: the previous SWE_BENCH_POST_EDIT_VERIFICATION_GATE requires the next action to be a standard test command or bounded blocker report. Run pytest, python -m pytest, python -m unittest, tox, nox, npm test, or the repository package test runner before more read/search/list or setup actions.",
-        {
-          gate: "SWE_BENCH_POST_EDIT_VERIFICATION_GATE",
-          requiredNextAction: "standard-test-command-or-bounded-blocker",
-          rejectedToolName: toolName,
-          ...(commandText ? { rejectedCommand: commandText } : {}),
-          rejectedInput: input
-        }
-      )
-    };
-  }
-  if (isBroadSourceInspectionAfterTest(state, toolName, input)) {
-    return {
-      terminalKind: "swe-bench-post-test-source-read.rejected",
-      error: kernelError(
-        "KERNEL_POLICY_DENIED",
-        "SWE_BENCH_POST_TEST_CONVERGENCE_GATE_ENFORCED: this managed SWE-bench run already has source edit and test evidence. Avoid broad source exploration after tests; use a focused same-file read with offset/limit, make the smallest source adjustment, run another standard test, or return control for official harness scoring.",
-        {
-          gate: "SWE_BENCH_POST_TEST_CONVERGENCE_GATE",
-          requiredNextAction: "focused-read-or-source-edit-or-test-or-return-control",
-          rejectedToolName: toolName,
-          rejectedInput: input
-        }
-      )
-    };
-  }
-  if (!state.enabled) return undefined;
-  if (!commandText) return undefined;
-  if (
-    state.repoLocalRunnerGateInserted &&
-    !state.repoLocalRunnerAttempted &&
-    state.pendingRepoLocalRunnerCommand &&
-    state.pendingRepoLocalRunnerPath &&
-    !commandUsesRepoLocalRunner(commandText, state.pendingRepoLocalRunnerCommand, state.pendingRepoLocalRunnerPath) &&
-    (isTestTool || isStandardTestCommand(commandText) || isSweBenchEnvironmentSetupCommand(commandText))
-  ) {
-    return {
-      terminalKind: "swe-bench-repo-local-runner-gate.rejected",
-      error: kernelError(
-        "KERNEL_POLICY_DENIED",
-        `SWE_BENCH_REPO_LOCAL_RUNNER_GATE_ENFORCED: the previous SWE_BENCH_REPO_LOCAL_RUNNER_GATE requires trying the repo-local Python test runner before repeating tests or setup probes. Rerun the focused test from the checkout root with: ${state.pendingRepoLocalRunnerCommand}.`,
-        {
-          gate: "SWE_BENCH_REPO_LOCAL_RUNNER_GATE",
-          requiredNextAction: "repo-local-python-test-runner",
-          alternateCommand: state.pendingRepoLocalRunnerCommand,
-          alternateRunnerPath: state.pendingRepoLocalRunnerPath,
-          rejectedToolName: toolName,
-          rejectedCommand: commandText
-        }
-      )
-    };
-  }
-  if (!isShellRunTool) return undefined;
-  if (state.postEditVerificationGateInserted && state.testCommandCount === 0 && !isStandardTestCommand(commandText)) {
-    return {
-      terminalKind: "swe-bench-post-edit-verification-gate.rejected",
-      error: kernelError(
-        "KERNEL_POLICY_DENIED",
-        "SWE_BENCH_POST_EDIT_VERIFICATION_GATE_ENFORCED: the previous SWE_BENCH_POST_EDIT_VERIFICATION_GATE requires the next action to be a standard test command or bounded blocker report. Run pytest, python -m pytest, python -m unittest, tox, nox, npm test, or the repository package test runner before more read/search/list or setup actions.",
-        {
-          gate: "SWE_BENCH_POST_EDIT_VERIFICATION_GATE",
-          requiredNextAction: "standard-test-command-or-bounded-blocker",
-          rejectedToolName: toolName,
-          rejectedCommand: commandText
-        }
-      )
-    };
-  }
-  if (state.inserted && state.testCommandCount === 0 && !isStandardTestCommand(commandText)) {
-    return {
-      terminalKind: "swe-bench-verification-gate.rejected",
-      error: kernelError(
-        "KERNEL_POLICY_DENIED",
-        "SWE_BENCH_VERIFICATION_GATE_ENFORCED: the previous SWE_BENCH_VERIFICATION_GATE requires the next shell action to be a standard test command. Run pytest, python -m pytest, python -m unittest, tox, nox, npm test, or the repository package test runner before more setup/probing shell commands.",
-        {
-          gate: "SWE_BENCH_VERIFICATION_GATE",
-          requiredNextAction: "standard-test-command",
-          rejectedToolName: toolName,
-          rejectedCommand: commandText
-        }
-      )
-    };
-  }
-  if (state.environmentBlockerInserted && isSweBenchEnvironmentSetupCommand(commandText)) {
-    return {
-      terminalKind: "swe-bench-environment-blocker-gate.rejected",
-      error: kernelError(
-        "KERNEL_POLICY_DENIED",
-        "SWE_BENCH_ENVIRONMENT_BLOCKER_GATE_ENFORCED: the previous SWE_BENCH_ENVIRONMENT_BLOCKER_GATE rejected another dependency setup/probing shell command. Return control with the current diff, run a standard test if needed, or report the local environment blocker instead of spending more shell iterations on setup.",
-        {
-          gate: "SWE_BENCH_ENVIRONMENT_BLOCKER_GATE",
-          rejectedAction: "environment-setup-or-dependency-probe",
-          rejectedToolName: toolName,
-          rejectedCommand: commandText
-        }
-      )
-    };
-  }
-  return undefined;
+  return [...currentProgress];
 }
 
-function isNonFatalSweBenchGateRejection(terminalKind: string): boolean {
-  return terminalKind === "swe-bench-post-test-source-read.rejected" || terminalKind === "swe-bench-source-inspection-duplicate.rejected";
-}
-
-function isSourceMutationTool(toolName: string): boolean {
-  return toolName === "core.file.edit" || toolName === "core.file.write" || toolName === "core.patch.apply";
-}
-
-function isSourceInspectionTool(toolName: string): boolean {
-  return toolName === "core.file.read" || toolName === "core.file.list" || toolName === "core.search.text" || toolName === "core.workspace.glob";
-}
-
-function isPatchReviewTool(toolName: string): boolean {
-  return toolName === "core.git.diff" || toolName === "git.diff";
-}
-
-function isFocusedSourceReadAfterInspectionGate(state: SweBenchVerificationGateState, toolName: string, input: JsonObject): boolean {
-  const path = sourceInspectionReadPath(toolName, input);
-  const windowKey = sourceReadWindowKey(toolName, input);
-  return path !== undefined &&
-    windowKey !== undefined &&
-    state.inspectedSourcePaths.has(path) &&
-    !state.completedSourceReadWindows.has(windowKey) &&
-    state.focusedSourceReadAfterGateCount < SWE_BENCH_SOURCE_INSPECTION_GATE_FOCUSED_READ_LIMIT;
-}
-
-function isDuplicateSourceInspectionRequest(state: SweBenchVerificationGateState, toolName: string, input: JsonObject): boolean {
-  const signature = sourceInspectionSignature(toolName, input);
-  if (signature === undefined || !isDuplicateEligibleSourceInspection(toolName, input)) return false;
-  return state.completedSourceInspectionSignatures.slice(-2).includes(signature) || isOverlappingCompletedSourceReadWindow(state, toolName, input);
-}
-
-function sourceInspectionSignature(toolName: string, input: JsonObject): string | undefined {
-  if (toolName === "core.file.read") {
-    const path = sourceToolPath(input);
-    if (!path) return undefined;
-    const offset = numberField(input, "offset");
-    const limit = numberField(input, "limit");
-    return `read:${path}:${offset ?? "whole"}:${limit ?? "all"}`;
-  }
-  if (toolName === "core.file.list") {
-    const path = sourceToolPath(input);
-    return path ? `list:${path}` : undefined;
-  }
-  if (toolName === "core.search.text") {
-    const pattern = stringField(input, "pattern");
-    if (!pattern) return undefined;
-    return [
-      "search",
-      pattern,
-      stringField(input, "glob") ?? "",
-      stringField(input, "outputMode") ?? "",
-      numberField(input, "contextLines") ?? ""
-    ].join(":");
-  }
-  if (toolName === "core.workspace.glob") {
-    const pattern = stringField(input, "pattern");
-    return pattern ? `glob:${pattern}` : undefined;
-  }
-  return undefined;
-}
-
-function isDuplicateEligibleSourceInspection(toolName: string, input: JsonObject): boolean {
-  return toolName === "core.search.text" || (toolName === "core.file.read" && boundedSourceReadWindow(input));
-}
-
-function sourceInspectionReadPath(toolName: string, input: JsonObject): string | undefined {
-  if (toolName !== "core.file.read") return undefined;
-  return sourceToolPath(input);
-}
-
-function sourceReadWindowKey(toolName: string, input: JsonObject): string | undefined {
-  const window = sourceReadWindow(toolName, input);
-  return window ? `${window.path}:${window.offset}:${window.limit}` : undefined;
-}
-
-interface SourceReadWindow {
-  readonly path: string;
-  readonly offset: number;
-  readonly limit: number;
-  readonly end: number;
-}
-
-function sourceReadWindow(toolName: string, input: JsonObject): SourceReadWindow | undefined {
-  const path = sourceInspectionReadPath(toolName, input);
-  if (!path || !boundedSourceReadWindow(input)) return undefined;
-  const offset = numberField(input, "offset");
-  const limit = numberField(input, "limit");
-  if (offset === undefined || limit === undefined) return undefined;
-  return { path, offset, limit, end: offset + limit };
-}
-
-function sourceReadWindowFromKey(key: string): SourceReadWindow | undefined {
-  const serialized = key.startsWith("read:") ? key.slice("read:".length) : key;
-  const match = /^(.*):(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)$/.exec(serialized);
-  if (!match) return undefined;
-  const path = match[1];
-  const offset = Number(match[2]);
-  const limit = Number(match[3]);
-  if (!path || !Number.isFinite(offset) || !Number.isFinite(limit) || limit <= 0) return undefined;
-  return { path, offset, limit, end: offset + limit };
-}
-
-function isOverlappingCompletedSourceReadWindow(state: SweBenchVerificationGateState, toolName: string, input: JsonObject): boolean {
-  const current = sourceReadWindow(toolName, input);
-  if (!current) return false;
-  for (const completedSignature of state.completedSourceInspectionSignatures.slice(-2)) {
-    const completed = sourceReadWindowFromKey(completedSignature);
-    if (!completed || completed.path !== current.path) continue;
-    const overlap = Math.max(0, Math.min(current.end, completed.end) - Math.max(current.offset, completed.offset));
-    if (overlap / current.limit >= SWE_BENCH_SOURCE_READ_DUPLICATE_OVERLAP_RATIO) return true;
+function readyStageOwnProgressShouldWin(stageKind: string | undefined, progressCapabilityIds: ReadonlySet<string>): boolean {
+  if (stageKind !== "produce" && stageKind !== "materialize" && stageKind !== "repair") return false;
+  for (const capabilityId of progressCapabilityIds) {
+    if (isMutationCapabilityId(capabilityId)) return true;
   }
   return false;
 }
 
-function sourceToolPath(input: JsonObject): string | undefined {
-  const path = typeof input.path === "string" ? input.path.trim() : "";
-  if (!path) return undefined;
-  return path.replace(/\\/g, "/").replace(/^\.\//, "");
-}
-
-function boundedSourceReadWindow(input: JsonObject): boolean {
-  const offset = numberField(input, "offset");
-  const limit = numberField(input, "limit");
-  return offset !== undefined && offset >= 0 && limit !== undefined && limit > 0 && limit <= 200;
-}
-
-function numberField(input: JsonObject, key: string): number | undefined {
-  const value = input[key];
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
-
-function stringField(input: JsonObject, key: string): string | undefined {
-  const value = input[key];
-  if (typeof value !== "string") return undefined;
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : undefined;
-}
-
-function isBroadSourceInspectionAfterTest(state: SweBenchVerificationGateState, toolName: string, input: JsonObject): boolean {
-  if (!state.enabled || state.sourceMutationCount === 0 || state.testCommandCount === 0) return false;
-  if (!isSourceInspectionTool(toolName)) return false;
-  return !isFocusedSourceReadAfterTest(state, toolName, input);
-}
-
-function isFocusedSourceReadAfterTest(state: SweBenchVerificationGateState, toolName: string, input: JsonObject): boolean {
-  const path = sourceInspectionReadPath(toolName, input);
-  if (!path || !state.mutatedSourcePaths.has(path)) return false;
-  return boundedSourceReadWindow(input);
-}
-
-function shellCommandText(input: JsonObject): string {
-  const command = typeof input.command === "string" ? input.command : "";
-  if (!command) return "";
-  const args = Array.isArray(input.args) ? input.args.filter((item): item is string => typeof item === "string") : [];
-  return [command, ...args].join(" ");
-}
-
-function toolCommandTextForSweBenchGate(toolName: string, input: JsonObject): string | undefined {
-  if (toolName === "core.shell.run" || toolName === "core.test.run" || toolName === "test.run") {
-    return shellCommandText(input);
+function stageAcceptanceModeForReadyStageControl(profilePolicy: AgentLoopProfilePolicyMetadata): "automatic" | "supervisor" {
+  if (profilePolicy.stageAcceptanceMode === "automatic" || profilePolicy.stageAcceptanceMode === "supervisor") {
+    return profilePolicy.stageAcceptanceMode;
   }
-  return undefined;
+  return profilePolicy.antiTailoring === true || profilePolicy.role.includes("evaluation")
+    ? "supervisor"
+    : "automatic";
 }
 
-function isSweBenchEnvironmentSetupCommand(command: string): boolean {
-  const normalized = command.toLowerCase();
-  return (
-    /(^|[;&|]\s*)(?:[\w./-]*python[\w./-]*\s+-m\s+)?pip\s+(?:install|download|wheel|sync|compile)(\s|$)/.test(normalized)
-    || /(^|[;&|]\s*)uv\s+(?:pip\s+)?(?:install|sync|add|update)(\s|$)/.test(normalized)
-    || /(^|[;&|]\s*)(?:poetry|pipenv|conda|mamba)\s+(?:install|sync|add|update|create)(\s|$)/.test(normalized)
-    || /(^|[;&|]\s*)(?:npm|pnpm|yarn|bun)\s+(?:install|add|update|ci)(\s|$)/.test(normalized)
-    || /\b(?:source|\.)\s+[^;&|]*venv[^;&|]*activate\b/.test(normalized)
+function requiredNextActionForStage(stageKind: string, progressCapabilityIds: readonly string[]): string {
+  if (
+    stageKind === "collect-evidence" &&
+    progressCapabilityIds.includes("core.file.read") &&
+    progressCapabilityIds.some((capabilityId) => isMutationCapabilityId(capabilityId))
+  ) {
+    return "focused-read-or-source-edit-or-test-or-return-control";
+  }
+  if (progressCapabilityIds.length > 0) return progressCapabilityIds.join("|");
+  if (stageKind === "produce" || stageKind === "materialize" || stageKind === "repair") return "source-edit-or-test-or-bounded-blocker";
+  if (stageKind === "verify" || stageKind === "score") return "standard-test-command-or-bounded-blocker";
+  return "workflow-progress-capability-or-bounded-blocker";
+}
+
+function stalledPrimaryWorkflowError(profilePolicy: AgentLoopProfilePolicyMetadata | undefined): RedactedError | undefined {
+  const workflow = profilePolicy?.stagedTaskWorkflow;
+  if (!profilePolicy || !workflow || profilePolicy.workflowPriority !== "primary") return undefined;
+  const incomplete = workflow.runState.stageStates.some((stage) => stage.status !== "succeeded" && stage.status !== "skipped");
+  const ready = workflow.runState.stageStates.some((stage) => stage.status === "ready");
+  const running = workflow.runState.stageStates.some((stage) => stage.status === "running");
+  if (!incomplete || ready || running) return undefined;
+  return kernelError("KERNEL_QUEUE_BACKPRESSURE", "Primary staged workflow has incomplete stages but no ready stage.", {
+    profileId: profilePolicy.profileId,
+    workflowGraphId: profilePolicy.workflowGraphId,
+    graphId: workflow.graphId,
+    stageStates: workflow.runState.stageStates.map((stage) => ({ stageId: stage.stageId, status: stage.status }))
+  });
+}
+
+function projectionEvidencePolicy(
+  profilePolicy: AgentLoopProfilePolicyMetadata,
+  readyStageControl: JsonObject | undefined
+): JsonObject {
+  return {
+    profileId: profilePolicy.profileId,
+    workflowGraphId: profilePolicy.workflowGraphId,
+    workflowPriority: profilePolicy.workflowPriority,
+    orchestrationMode: profilePolicy.orchestrationMode,
+    workflowCapabilityIds: profilePolicy.workflowCapabilityIds,
+    ...(profilePolicy.workflowGateOverride ? { workflowGateOverride: profilePolicy.workflowGateOverride } : {}),
+    ...(readyStageControl ? { readyStageControl } : {}),
+    redaction: { class: "internal" }
+  };
+}
+
+function repeatedReadyStageProgressEvidence(
+  counts: Map<string, number>,
+  input: {
+    readonly control: JsonObject | undefined;
+    readonly capabilityId: string;
+    readonly toolInput: JsonObject;
+    readonly normalizedInputHash: string;
+  }
+): boolean {
+  const stage = input.control ?? {};
+  if (String(stage.stageAcceptanceMode ?? "") !== "supervisor") return false;
+  if (String(stage.stageKind ?? "") !== "collect-evidence") return false;
+  const key = [
+    String(stage.profileId ?? ""),
+    String(stage.graphId ?? stage.workflowGraphId ?? ""),
+    String(stage.stageId ?? ""),
+    input.capabilityId,
+    readyStageEvidenceTarget(input.toolInput, input.normalizedInputHash)
+  ].join(":");
+  const count = (counts.get(key) ?? 0) + 1;
+  counts.set(key, count);
+  return count > 1;
+}
+
+function readyStageEvidenceTarget(input: JsonObject, fallbackHash: string): string {
+  for (const key of ["path", "file", "query", "pattern", "command", "cwd"]) {
+    const value = input[key];
+    if (typeof value === "string" && value.trim().length > 0) return `${key}:${value.trim()}`;
+  }
+  return `input:${fallbackHash}`;
+}
+
+function workflowProjectionError(
+  profilePolicy: AgentLoopProfilePolicyMetadata | undefined,
+  availableCapabilities: readonly { readonly id: unknown }[],
+  visibleCapabilities: readonly { readonly id: unknown }[],
+  readyStageControl: JsonObject | undefined
+): RedactedError | undefined {
+  if (!profilePolicy || profilePolicy.workflowPriority !== "primary") return undefined;
+  const workflowCapabilityIds = (profilePolicy.workflowCapabilityIds ?? []).map(String);
+  const availableCapabilityIds = new Set(availableCapabilities.map((capability) => String(capability.id)));
+  const visibleCapabilityIds = new Set(visibleCapabilities.map((capability) => String(capability.id)));
+  const gateOverrideCapabilityIds = profilePolicy.workflowGateOverride
+    ? workflowGateOverrideRequiredCapabilityIds(profilePolicy.workflowGateOverride.requiredNextAction)
+    : [];
+  const activeStageCapabilityIds = gateOverrideCapabilityIds.length > 0
+    ? gateOverrideCapabilityIds
+    : activeStageRequiredCapabilityIds(readyStageControl);
+  const requiredCapabilityIds = activeStageCapabilityIds.length > 0 ? activeStageCapabilityIds : workflowCapabilityIds;
+  const executableCapabilityIds = requiredCapabilityIds.filter((capabilityId) => visibleCapabilityIds.has(capabilityId));
+  if (executableCapabilityIds.length > 0) return undefined;
+  if (requiredCapabilityIds.length === 0 && visibleCapabilities.length > 0) return undefined;
+  const unregisteredWorkflowCapabilityIds = requiredCapabilityIds.filter((capabilityId) => !availableCapabilityIds.has(capabilityId));
+  const policyHiddenCapabilityIds = requiredCapabilityIds.filter((capabilityId) =>
+    availableCapabilityIds.has(capabilityId) && !visibleCapabilityIds.has(capabilityId)
   );
+  const diagnosticKind = unregisteredWorkflowCapabilityIds.length > 0 ? "absent-implementation" : "disabled-by-policy";
+  return kernelError("KERNEL_CONFIGURATION_ERROR", "Primary workflow projected no visible capabilities.", {
+    profileId: profilePolicy.profileId,
+    workflowGraphId: profilePolicy.workflowGraphId,
+    workflowCapabilityIds,
+    ...(activeStageCapabilityIds.length > 0 ? { requiredStageCapabilityIds: activeStageCapabilityIds } : {}),
+    availableCapabilityCount: availableCapabilities.length,
+    classification: "blocked-by-cli-capability-gap",
+    diagnosticKind,
+    unregisteredWorkflowCapabilityIds,
+    policyHiddenCapabilityIds,
+    missingCapabilityIds: requiredCapabilityIds
+  });
+}
+
+function activeStageRequiredCapabilityIds(readyStageControl: JsonObject | undefined): readonly string[] {
+  const control = readyStageControl ?? {};
+  const allowedCapabilityIds = Array.isArray(control.allowedCapabilityIds)
+    ? control.allowedCapabilityIds.map(String)
+    : [];
+  const progressCapabilityIds = Array.isArray(control.progressCapabilityIds)
+    ? control.progressCapabilityIds.map(String)
+    : [];
+  return [...new Set([...allowedCapabilityIds, ...progressCapabilityIds])];
+}
+
+function workflowGateOverrideRequiredCapabilityIds(requiredNextAction: string): readonly string[] {
+  const alternatives = requiredNextAction.split("|").map((part) => part.trim()).filter(Boolean);
+  if (alternatives.length > 1) {
+    return [...new Set(alternatives.flatMap((alternative) => workflowGateOverrideRequiredCapabilityIds(alternative)))];
+  }
+  if (requiredNextAction === "standard-test-command") return ["core.test.run"];
+  if (requiredNextAction === "standard-test-command-or-bounded-blocker") return ["core.test.run", "core.shell.run"];
+  if (requiredNextAction === "focused-read-or-source-edit-or-bounded-blocker") {
+    return ["core.file.read", "core.search.text", "core.file.edit", "core.patch.apply"];
+  }
+  if (requiredNextAction === "focused-read-or-source-edit-or-test-or-return-control") {
+    return ["core.file.read", "core.search.text", "core.file.edit", "core.patch.apply", "core.test.run"];
+  }
+  if (requiredNextAction === "source-edit-or-test-or-bounded-blocker" || requiredNextAction === "source-edit-or-test-or-blocker") {
+    return ["core.file.edit", "core.patch.apply", "core.test.run"];
+  }
+  if (requiredNextAction.startsWith("core.")) return [requiredNextAction];
+  return [];
+}
+
+function schedulingNextActionForModelRequest(
+  profilePolicy: AgentLoopProfilePolicyMetadata | undefined,
+  readyStageControl: JsonObject | undefined,
+  visibleCapabilities: readonly { readonly id: unknown }[]
+): PromptSchedulingNextAction | undefined {
+  if (!profilePolicy || profilePolicy.workflowPriority !== "primary") return undefined;
+  const override = profilePolicy.workflowGateOverride;
+  const control = readyStageControl ?? {};
+  const requiredNextAction = String(override?.requiredNextAction ?? control.requiredNextAction ?? "");
+  if (!requiredNextAction) return undefined;
+  const visibleCapabilityIds = new Set(visibleCapabilities.map((capability) => String(capability.id)));
+  const requiredCapabilityIds = override
+    ? workflowGateOverrideRequiredCapabilityIds(requiredNextAction)
+    : activeStageRequiredCapabilityIds(readyStageControl);
+  const allowedCapabilityIds = [...new Set(requiredCapabilityIds.filter((capabilityId) => visibleCapabilityIds.has(capabilityId)))];
+  const correction = typeof override?.correction === "string" ? override.correction : undefined;
+  return {
+    schemaVersion: "1.0.0",
+    actionClass: schedulingActionClassFor(requiredNextAction, String(control.stageKind ?? "")),
+    ...(typeof control.stageId === "string" ? { stageId: control.stageId } : {}),
+    requiredNextAction,
+    allowedCapabilityIds,
+    acceptedEvidenceRefs: schedulingAcceptedEvidenceRefs(profilePolicy),
+    ...(correction ? { correctionText: correction } : {}),
+    redaction: { class: "internal", fields: ["acceptedEvidenceRefs", "correctionText"] }
+  };
+}
+
+function schedulingActionClassFor(
+  requiredNextAction: string,
+  stageKind: string
+): PromptSchedulingNextAction["actionClass"] {
+  if (requiredNextAction === "standard-test-command" || requiredNextAction.includes("core.test.run")) return "standard-verification";
+  if (requiredNextAction.includes("core.git.diff")) return "package";
+  if (
+    requiredNextAction.includes("core.file.edit") ||
+    requiredNextAction.includes("core.patch.apply") ||
+    requiredNextAction.includes("core.file.write") ||
+    stageKind === "produce" ||
+    stageKind === "materialize" ||
+    stageKind === "repair"
+  ) {
+    return "mutation";
+  }
+  if (requiredNextAction.includes("blocker")) return "blocker";
+  if (stageKind === "verify" || stageKind === "score") return "standard-verification";
+  return "focused-evidence";
+}
+
+function schedulingAcceptedEvidenceRefs(profilePolicy: AgentLoopProfilePolicyMetadata): readonly string[] {
+  const sharedSchedulingEvidence = profilePolicy.sharedSchedulingEvidence;
+  if (!sharedSchedulingEvidence || typeof sharedSchedulingEvidence !== "object" || Array.isArray(sharedSchedulingEvidence)) return [];
+  const shared = sharedSchedulingEvidence as JsonObject;
+  const acceptedEvidenceRefs = shared.acceptedEvidenceRefs;
+  if (Array.isArray(acceptedEvidenceRefs)) return acceptedEvidenceRefs.map(String);
+  return [];
+}
+
+function isPrimaryWorkflowComplete(profilePolicy: AgentLoopProfilePolicyMetadata): boolean {
+  const workflow = profilePolicy.stagedTaskWorkflow;
+  if (!workflow || profilePolicy.workflowPriority !== "primary") return false;
+  return workflow.runState.stageStates.length > 0 &&
+    workflow.runState.stageStates.every((stage) => stage.status === "succeeded" || stage.status === "skipped");
+}
+
+function shouldClosePrimaryWorkflowAfterProgress(profilePolicy: AgentLoopProfilePolicyMetadata, completedStageKind: string | undefined): boolean {
+  if (!isPrimaryWorkflowComplete(profilePolicy)) return false;
+  if ((profilePolicy.stageAcceptanceMode ?? "automatic") !== "supervisor") return true;
+  return completedStageKind !== "produce" && completedStageKind !== "materialize" && completedStageKind !== "repair";
+}
+
+function externalHarnessReturnGateAfterLocalVerification(
+  profilePolicy: AgentLoopProfilePolicyMetadata,
+  completedStageKind: string | undefined
+): JsonObject | undefined {
+  if (completedStageKind !== "verify") return undefined;
+  if (!isEvaluationWorkflow(profilePolicy)) return undefined;
+  const workflow = profilePolicy.stagedTaskWorkflow;
+  if (!workflow) return undefined;
+  const completedVerifyStage = workflow.runState.stageStates.find((stage) => {
+    if (stage.status !== "running" || stage.evaluation?.status !== "needs-review") return false;
+    const contract = workflow.graph.stages.find((candidate) => candidate.stageId === stage.stageId);
+    return contract?.kind === "verify";
+  });
+  if (!completedVerifyStage) return undefined;
+  const harnessStage = workflow.graph.stages.find((stage) =>
+    isExternalHarnessStage(stage) &&
+    stage.dependsOn.map(String).includes(completedVerifyStage.stageId)
+  );
+  if (!harnessStage) return undefined;
+  const sourceMutationCount = workflow.runState.stageStates.some((stage) =>
+    stage.status === "succeeded" &&
+    workflow.graph.stages.find((candidate) => candidate.stageId === stage.stageId)?.kind === "produce"
+  ) ? 1 : 0;
+  return {
+    schemaVersion: "1.0.0",
+    budget: {
+      kind: "verification",
+      stopReason: "external-score-ready"
+    },
+    gate: "EXTERNAL_SCORE_READY_GATE",
+    sourceMutationCount,
+    testCommandCount: 1,
+    successfulTestCommandCount: 1,
+    modelRequestCount: 1,
+    workflowReadyStageControl: {
+      profileId: profilePolicy.profileId,
+      workflowGraphId: profilePolicy.workflowGraphId,
+      graphId: workflow.graphId,
+      stageId: harnessStage.stageId,
+      stageKind: "score"
+    },
+    redaction: { class: "internal" }
+  };
+}
+
+function externalHarnessReturnGateForReadyScoreStage(
+  profilePolicy: AgentLoopProfilePolicyMetadata | undefined,
+  readyStageControl: JsonObject | undefined
+): JsonObject | undefined {
+  if (!profilePolicy || !readyStageControl) return undefined;
+  if (!isEvaluationWorkflow(profilePolicy)) return undefined;
+  const workflow = profilePolicy.stagedTaskWorkflow;
+  if (!workflow) return undefined;
+  const scoreStageId = String(readyStageControl.stageId ?? "");
+  const scoreStage = workflow.graph.stages.find((stage) =>
+    stage.stageId === scoreStageId &&
+    isExternalHarnessStage(stage)
+  );
+  if (!scoreStage) return undefined;
+  const scoreState = workflow.runState.stageStates.find((stage) => stage.stageId === scoreStage.stageId);
+  if (scoreState?.status !== "ready") return undefined;
+  const verifiedLocally = scoreStage.dependsOn.some((stageId) => {
+    const stage = workflow.graph.stages.find((candidate) => candidate.stageId === stageId);
+    const state = workflow.runState.stageStates.find((candidate) => candidate.stageId === stageId);
+    return stage?.kind === "verify" &&
+      state?.status === "succeeded" &&
+      state.outputRefs.length > 0;
+  });
+  if (!verifiedLocally) return undefined;
+  const sourceMutationCount = workflow.runState.stageStates.some((stage) =>
+    stage.status === "succeeded" &&
+    workflow.graph.stages.find((candidate) => candidate.stageId === stage.stageId)?.kind === "produce"
+  ) ? 1 : 0;
+  return {
+    schemaVersion: "1.0.0",
+    budget: {
+      kind: "verification",
+      stopReason: "external-score-ready"
+    },
+    gate: "EXTERNAL_SCORE_READY_GATE",
+    sourceMutationCount,
+    testCommandCount: 1,
+    successfulTestCommandCount: 1,
+    modelRequestCount: 1,
+    workflowReadyStageControl: {
+      profileId: profilePolicy.profileId,
+      workflowGraphId: profilePolicy.workflowGraphId,
+      graphId: workflow.graphId,
+      stageId: scoreStage.stageId,
+      stageKind: "score"
+    },
+    redaction: { class: "internal" }
+  };
+}
+
+function isExternalHarnessStage(stage: {
+  readonly stageId: string;
+  readonly kind: string;
+  readonly allowedTools?: readonly string[];
+}): boolean {
+  return (stage.allowedTools ?? []).map(String).includes("core.swe.harness.run") &&
+    (stage.stageId.includes("score") || stage.kind === "score" || stage.kind === "produce");
+}
+
+function isEvaluationWorkflow(profilePolicy: AgentLoopProfilePolicyMetadata): boolean {
+  return profilePolicy.workflowGovernanceMode === "evaluation" ||
+    profilePolicy.role.includes("evaluation") ||
+    profilePolicy.antiTailoring === true;
+}
+
+function outputContractRepairWorkflowGateOverride(outputContract: AgentLoopOutputContractVerification | undefined): AgentLoopProfileWorkflowGateOverride | undefined {
+  const requiredPath = outputContract?.contract.path;
+  if (!requiredPath || outputContract.status !== "fail") return undefined;
+  return {
+    gate: "OUTPUT_CONTRACT_REPAIR_GATE",
+    requiredNextAction: "core.file.write|core.file.edit",
+    terminalKind: "output-contract.repair.required",
+    toolCallId: `output-contract:${stableHash(requiredPath)}`
+  };
 }
 
 function finalVerifierFailureError(verifierResult: AgentVerifierResult | undefined, outputContract: AgentLoopOutputContractVerification | undefined): RedactedError {

@@ -14,6 +14,7 @@ import type {
 import { CLI_PALETTE_SCHEMA_VERSION } from "@deepseek/platform-contracts";
 import type { CliOptions, CliRunOptions } from "../types.js";
 import { createCliAgentRuntime } from "../host/runtime.js";
+import { resolveCliWorkspaceRoot } from "../host/workspace-root.js";
 
 export type JumpNavigatorAction = "file" | "text" | "symbol";
 
@@ -34,10 +35,11 @@ export interface JumpNavigatorResult extends JsonObject {
 }
 
 export async function runJumpNavigatorCommand(options: CliOptions, write: (line: string) => Promise<void>, runOptions: CliRunOptions): Promise<void> {
-  const runtime = await createCliAgentRuntime({ live: options.live, workspaceRoot: process.cwd() }, runOptions);
+  const workspaceRoot = await resolveCliWorkspaceRoot(runOptions);
+  const runtime = await createCliAgentRuntime({ live: options.live, workspaceRoot }, runOptions);
   try {
     const input = jumpInput(options);
-    const result = await resolveJumpNavigator(runtime.deps.platform, process.cwd(), input.action, input.query, runtime.deps.codeIntelligence);
+    const result = await resolveJumpNavigator(runtime.deps.platform, workspaceRoot, input.action, input.query, runtime.deps.codeIntelligence);
     for (const line of renderJumpNavigatorResult(result, options.output)) await write(line);
   } finally {
     await runtime.kernel.shutdown("cli-jump-navigator-completed");

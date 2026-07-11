@@ -13,12 +13,16 @@ export const deepSeekOpenAIProviderConfig: ModelProviderConfig = {
   provider: "deepseek",
   protocol: "openai-chat-completions",
   baseUrl: "https://api.deepseek.com",
-  credentialRef: deepSeekOpenAICredentialRef
+  credentialRef: deepSeekOpenAICredentialRef,
+  cacheHints: {
+    explicitPrefixCacheHints: false
+  }
 };
 
 export const defaultDeepSeekProfile: ModelProfile = {
   id: asId<"modelProfile">("model-deepseek-default"),
   providerId: deepSeekProviderId,
+  provider: "deepseek",
   model: "deepseek-v4-flash",
   temperature: 0
 };

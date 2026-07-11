@@ -534,7 +534,7 @@ function agentNamespacePolicyRequest(input: {
 function requestedWritePaths(request: AgentSpawnRequest): readonly string[] {
   const projection = request.toolProjection ?? "read-only";
   const workOrderProjection = stringValue(request.workOrder?.permissionScope.toolProjection);
-  const writeRequested = projection === "read-write" || projection === "all" || workOrderProjection === "read-write" || workOrderProjection === "all" || (request.workOrder?.allowedTools ?? []).some((tool) => tool === "file.write" || tool === "file.edit");
+  const writeRequested = projection === "read-write" || projection === "safe-all" || projection === "all" || workOrderProjection === "read-write" || workOrderProjection === "safe-all" || workOrderProjection === "all" || (request.workOrder?.allowedTools ?? []).some((tool) => tool === "file.write" || tool === "file.edit");
   return writeRequested ? delegatedPathsFrom(request) : [];
 }
 
@@ -548,7 +548,7 @@ function delegatedPathsFrom(request: AgentSpawnRequest): readonly string[] {
 function delegatedToolsFrom(request: AgentSpawnRequest): readonly string[] {
   return request.workOrder?.allowedTools && request.workOrder.allowedTools.length > 0
     ? request.workOrder.allowedTools
-    : request.toolProjection === "read-write" || request.toolProjection === "all"
+    : request.toolProjection === "read-write" || request.toolProjection === "safe-all" || request.toolProjection === "all"
       ? ["file.read", "file.list", "search.text", "git.status", "git.diff", "file.edit", "file.write", "test.run"]
       : ["file.read", "file.list", "search.text", "git.status", "git.diff"];
 }

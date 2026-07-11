@@ -47,7 +47,6 @@ const familyCapabilityIds = {
   pluginInstallVerify: asId<"capability">("skill-system.plugin-install-verify"),
   commandPaletteSlash: asId<"capability">("command-system.palette-slash"),
   envPrepare: asId<"capability">("core.env.prepare"),
-  sweBenchRun: asId<"capability">("core.swe.bench.run"),
   imageGenerate: asId<"capability">("model-gateway.image-generate"),
   imageEdit: asId<"capability">("model-gateway.image-edit"),
   imageSearchStock: asId<"capability">("model-gateway.image-search-stock"),
@@ -67,10 +66,10 @@ const familyCapabilityIds = {
 } as const;
 
 const domains = [
-  domain("workspace-io", "Workspace I/O", ["file.read", "file.list", "workspace.glob", "asset.view-local"]),
+  domain("workspace-io", "Workspace I/O", ["file.read", "file.list", "file.stat", "json.read", "checksum.hash", "path.resolve", "workspace.glob", "asset.view-local"]),
   domain("search-code-intelligence", "Search and code intelligence", ["search.text", "search.symbol", "code.diagnostics-lsp", "notebook.read"]),
-  domain("mutation-patching", "Mutation and patching", ["file.write", "file.edit", "patch.apply", "revert.undo"]),
-  domain("shell-process", "Shell and process", ["shell.run", "process.output", "process.kill", "repl.execute"]),
+  domain("mutation-patching", "Mutation and patching", ["file.write", "file.edit", "file.copy", "file.move", "file.delete", "directory.create", "file.touch", "json.patch", "archive.create", "archive.extract", "patch.apply", "revert.undo"]),
+  domain("shell-process", "Shell and process", ["shell.run", "process.output", "process.kill", "repl.execute", "env.inspect", "command.lookup"]),
   domain("git-build", "Git and build", ["git.status-diff", "git.history-branch", "build.test-lint-typecheck", "package.manager", "benchmark.run"]),
   domain("planning-control", "Planning and control", ["plan.todo", "mode.plan-auto-review", "user.input", "approval.permission"]),
   domain("pipeline-composition", "Pipeline and composition", ["pipeline.sequence", "pipeline.parallel", "pipeline.artifact-routing", "pipeline.stream"]),
@@ -92,6 +91,18 @@ const families = [
   family("workspace-io", "file.list", "File list", "read", ["read"], ["filesystem"], "built-in", [
     implementedTool("core.file.list", "Core file list", coreToolIds.fileList, "file.list")
   ]),
+  family("workspace-io", "file.stat", "File stat", "read", ["read"], ["filesystem"], "built-in", [
+    implementedTool("core.file.stat", "Core file stat", coreToolIds.fileStat, "file.stat")
+  ]),
+  family("workspace-io", "json.read", "JSON read", "read", ["read"], ["filesystem", "json"], "built-in", [
+    implementedTool("core.json.read", "Core JSON read", coreToolIds.jsonRead, "json.read")
+  ]),
+  family("workspace-io", "checksum.hash", "Checksum hash", "read", ["read"], ["filesystem", "hash"], "built-in", [
+    implementedTool("core.checksum.hash", "Core checksum hash", coreToolIds.checksumHash, "checksum.hash")
+  ]),
+  family("workspace-io", "path.resolve", "Path resolve", "read", ["read"], ["filesystem", "path"], "built-in", [
+    implementedTool("core.path.resolve", "Core path resolve", coreToolIds.pathResolve, "path.resolve")
+  ]),
   family("workspace-io", "workspace.glob", "Workspace glob", "read", ["read"], ["filesystem"], "built-in", [
     implementedTool("core.workspace.glob", "Core workspace glob", coreToolIds.workspaceGlob, "workspace.glob")
   ]),
@@ -106,17 +117,44 @@ const families = [
     implementedTool("code.search.symbol", "Code intelligence symbol search", familyCapabilityIds.searchSymbol)
   ]),
   family("search-code-intelligence", "code.diagnostics-lsp", "Code diagnostics and LSP", "read", ["read"], ["code-index", "lsp"], "host", [
-    implementedTool("code.diagnostics.lsp", "Code diagnostics projection", familyCapabilityIds.codeDiagnosticsLsp, undefined, "host")
+    implementedTool("code.diagnostics.lsp", "Code diagnostics projection", familyCapabilityIds.codeDiagnosticsLsp, undefined, "host"),
+    implementedTool("core.code.diagnostics", "Core code diagnostics", coreToolIds.codeDiagnostics, "code.diagnostics")
   ]),
   family("search-code-intelligence", "notebook.read", "Notebook read", "read", ["read"], ["filesystem", "notebook"], "built-in", [
-    implementedTool("core.notebook.read", "Core notebook read", coreToolIds.notebookRead, "notebook.read")
+    implementedTool("core.notebook.read", "Core notebook read", coreToolIds.notebookRead, "notebook.read"),
+    implementedTool("core.notebook.edit", "Core notebook edit", coreToolIds.notebookEdit, "notebook.edit")
   ]),
 
   family("mutation-patching", "file.write", "File write", "write", ["write", "artifact"], ["filesystem"], "built-in", [
     implementedTool("core.file.write", "Core file write", coreToolIds.fileWrite, "file.write")
   ]),
   family("mutation-patching", "file.edit", "File edit", "write", ["write", "artifact"], ["filesystem"], "built-in", [
-    implementedTool("core.file.edit", "Core exact file edit", coreToolIds.fileEdit, "file.edit")
+    implementedTool("core.file.edit", "Core exact file edit", coreToolIds.fileEdit, "file.edit"),
+    implementedTool("core.text.replace", "Core text replace", coreToolIds.textReplace, "text.replace")
+  ]),
+  family("mutation-patching", "file.copy", "File copy", "write", ["write", "artifact"], ["filesystem"], "built-in", [
+    implementedTool("core.file.copy", "Core file copy", coreToolIds.fileCopy, "file.copy")
+  ]),
+  family("mutation-patching", "file.move", "File move", "write", ["write", "artifact"], ["filesystem"], "built-in", [
+    implementedTool("core.file.move", "Core file move", coreToolIds.fileMove, "file.move")
+  ]),
+  family("mutation-patching", "file.delete", "File delete", "write", ["write", "artifact"], ["filesystem"], "built-in", [
+    implementedTool("core.file.delete", "Core file delete", coreToolIds.fileDelete, "file.delete")
+  ]),
+  family("mutation-patching", "directory.create", "Directory create", "write", ["write", "artifact"], ["filesystem"], "built-in", [
+    implementedTool("core.directory.create", "Core directory create", coreToolIds.directoryCreate, "directory.create")
+  ]),
+  family("mutation-patching", "file.touch", "File touch", "write", ["write", "artifact"], ["filesystem"], "built-in", [
+    implementedTool("core.file.touch", "Core file touch", coreToolIds.fileTouch, "file.touch")
+  ]),
+  family("mutation-patching", "json.patch", "JSON patch", "write", ["write", "artifact"], ["filesystem", "json"], "built-in", [
+    implementedTool("core.json.patch", "Core JSON patch", coreToolIds.jsonPatch, "json.patch")
+  ]),
+  family("mutation-patching", "archive.create", "Archive create", "write", ["write", "artifact"], ["filesystem", "archive"], "built-in", [
+    implementedTool("core.archive.create", "Core archive create", coreToolIds.archiveCreate, "archive.create")
+  ]),
+  family("mutation-patching", "archive.extract", "Archive extract", "write", ["write", "artifact"], ["filesystem", "archive"], "built-in", [
+    implementedTool("core.archive.extract", "Core archive extract", coreToolIds.archiveExtract, "archive.extract")
   ]),
   family("mutation-patching", "patch.apply", "Patch apply", "write", ["write", "artifact", "pipeline"], ["filesystem"], "built-in", [
     implementedTool("core.patch.apply", "Core patch apply", coreToolIds.patchApply, "patch.apply")
@@ -137,6 +175,12 @@ const families = [
   family("shell-process", "repl.execute", "REPL execute", "process", ["process"], ["process", "repl"], "built-in", [
     implementedTool("core.repl.execute", "Core REPL execute", coreToolIds.replExecute, "repl.execute")
   ]),
+  family("shell-process", "env.inspect", "Environment inspect", "read", ["read", "process"], ["process", "environment"], "built-in", [
+    implementedTool("core.env.inspect", "Core environment inspect", coreToolIds.envInspect, "env.inspect")
+  ]),
+  family("shell-process", "command.lookup", "Command lookup", "read", ["read", "process"], ["process", "environment"], "built-in", [
+    implementedTool("core.command.lookup", "Core command lookup", coreToolIds.commandLookup, "command.lookup")
+  ]),
 
   family("git-build", "git.status-diff", "Git status and diff", "read", ["read", "process"], ["git"], "built-in", [
     implementedTool("core.git.status", "Core git status", coreToolIds.gitStatus, "git.status"),
@@ -152,18 +196,18 @@ const families = [
     implementedTool("core.env.prepare", "Core environment prepare", familyCapabilityIds.envPrepare, "env.prepare"),
     implementedTool("core.package.manager", "Core package manager", coreToolIds.packageManager, "package.manager")
   ]),
-  family("git-build", "benchmark.run", "Benchmark run", "process", ["process", "artifact"], ["process", "git", "benchmark"], "host", [
-    implementedTool("core.swe.bench.run", "Core SWE-bench run", familyCapabilityIds.sweBenchRun, "swe.bench.run", "host")
-  ]),
-
+  family("git-build", "benchmark.run", "Benchmark run", "process", ["process", "artifact"], ["process", "git", "benchmark"], "host", []),
   family("planning-control", "plan.todo", "Todo plan", "orchestration", ["model-feedback"], ["session-store"], "built-in", [
     implementedTool("core.todo.plan", "Core todo plan", coreToolIds.todoPlan, "todo.plan")
   ]),
   family("planning-control", "mode.plan-auto-review", "Plan, auto, and review modes", "orchestration", ["approval", "model-feedback"], ["session-store"], "host", [
-    implementedTool("runtime.mode.plan-auto-review", "Runtime plan auto review mode", familyCapabilityIds.modePlanAutoReview, undefined, "host")
+    implementedTool("runtime.mode.plan-auto-review", "Runtime plan auto review mode", familyCapabilityIds.modePlanAutoReview, undefined, "host"),
+    implementedTool("core.mode.plan.enter", "Core plan mode enter", coreToolIds.modePlanEnter, "mode.plan.enter"),
+    implementedTool("core.mode.plan.exit", "Core plan mode exit", coreToolIds.modePlanExit, "mode.plan.exit")
   ]),
   family("planning-control", "user.input", "User input request", "orchestration", ["approval", "model-feedback"], ["interactive-host"], "host", [
-    implementedTool("runtime.user.input", "Runtime user input", familyCapabilityIds.userInput, undefined, "host")
+    implementedTool("runtime.user.input", "Runtime user input", familyCapabilityIds.userInput, undefined, "host"),
+    implementedTool("core.user.input", "Core user input", coreToolIds.userInput, "user.input")
   ]),
   family("planning-control", "approval.permission", "Approval and permission", "orchestration", ["approval"], ["policy"], "host", [
     implementedTool("runtime.approval.permission", "Runtime approval permission", familyCapabilityIds.approvalPermission, undefined, "host")
@@ -176,23 +220,32 @@ const families = [
     implementedTool("runtime.pipeline.parallel", "Runtime parallel pipeline", familyCapabilityIds.pipelineParallel)
   ]),
   family("pipeline-composition", "pipeline.artifact-routing", "Artifact routing pipeline", "orchestration", ["pipeline", "artifact"], ["runtime", "session-store"], "built-in", [
-    implementedTool("runtime.pipeline.artifact-routing", "Runtime artifact routing pipeline", familyCapabilityIds.pipelineArtifactRouting)
+    implementedTool("runtime.pipeline.artifact-routing", "Runtime artifact routing pipeline", familyCapabilityIds.pipelineArtifactRouting),
+    implementedTool("core.brief.package", "Core brief package", coreToolIds.briefPackage, "brief.package"),
+    implementedTool("core.synthetic.output", "Core synthetic output", coreToolIds.syntheticOutput, "synthetic.output")
   ]),
   family("pipeline-composition", "pipeline.stream", "Stream pipeline", "orchestration", ["pipeline", "artifact"], ["runtime", "scheduler"], "built-in", [
     implementedTool("runtime.pipeline.stream", "Runtime stream pipeline", familyCapabilityIds.pipelineStream)
   ]),
 
   family("agents-tasks", "agent.spawn", "Agent spawn", "orchestration", ["model-feedback"], ["runtime", "agent-manager"], "built-in", [
-    implementedTool("core.agent.spawn", "Core agent spawn", coreToolIds.agentSpawn, "agent.spawn")
+    implementedTool("core.agent.spawn", "Core agent spawn", coreToolIds.agentSpawn, "agent.spawn"),
+    implementedTool("core.team.create", "Core team create", coreToolIds.teamCreate, "team.create")
   ]),
   family("agents-tasks", "agent.message-continue", "Agent continue", "orchestration", ["model-feedback"], ["runtime", "agent-manager"], "built-in", [
     implementedTool("core.agent.continue", "Core agent continue", coreToolIds.agentContinue, "agent.continue")
   ]),
   family("agents-tasks", "agent.wait-result", "Agent wait result", "orchestration", ["model-feedback"], ["runtime", "agent-manager"], "built-in", [
-    implementedTool("runtime.agent.wait-result", "Runtime agent wait result", familyCapabilityIds.agentWaitResult)
+    implementedTool("runtime.agent.wait-result", "Runtime agent wait result", familyCapabilityIds.agentWaitResult),
+    implementedTool("core.task.create", "Core task-board create", coreToolIds.taskCreate, "task.create"),
+    implementedTool("core.task.get", "Core task-board get", coreToolIds.taskGet, "task.get"),
+    implementedTool("core.task.list", "Core task-board list", coreToolIds.taskList, "task.list"),
+    implementedTool("core.task.update", "Core task-board update", coreToolIds.taskUpdate, "task.update"),
+    implementedTool("core.task.output", "Core task-board output", coreToolIds.taskOutput, "task.output")
   ]),
   family("agents-tasks", "agent.stop-close", "Agent stop and close", "orchestration", ["model-feedback"], ["runtime", "agent-manager"], "built-in", [
-    implementedTool("core.agent.stop", "Core agent stop", coreToolIds.agentStop, "agent.stop")
+    implementedTool("core.agent.stop", "Core agent stop", coreToolIds.agentStop, "agent.stop"),
+    implementedTool("core.team.delete", "Core team delete", coreToolIds.teamDelete, "team.delete")
   ]),
 
   family("web-public-data", "web.search", "Web search", "network", ["network", "read"], ["network"], "provider", [
@@ -225,10 +278,13 @@ const families = [
     implementedTool("mcp.server.lifecycle", "MCP server lifecycle", familyCapabilityIds.mcpServerLifecycle, undefined, "mcp")
   ]),
   family("mcp-connectors", "mcp.tool-call", "MCP tool call", "external-connector", ["connector"], ["mcp"], "mcp", [
-    implementedTool("mcp.tool.call", "MCP tool call", familyCapabilityIds.mcpToolCall, undefined, "mcp")
+    implementedTool("mcp.tool.call", "MCP tool call", familyCapabilityIds.mcpToolCall, undefined, "mcp"),
+    implementedTool("core.mcp.tool.call", "Core MCP tool call", coreToolIds.mcpToolCall, "mcp.tool.call")
   ]),
   family("mcp-connectors", "mcp.resource-read", "MCP resource read", "external-connector", ["connector", "read"], ["mcp"], "mcp", [
-    implementedTool("mcp.resource.read", "MCP resource read", familyCapabilityIds.mcpResourceRead, undefined, "mcp")
+    implementedTool("mcp.resource.read", "MCP resource read", familyCapabilityIds.mcpResourceRead, undefined, "mcp"),
+    implementedTool("core.mcp.resource.list", "Core MCP resource list", coreToolIds.mcpResourceList, "mcp.resource.list"),
+    implementedTool("core.mcp.resource.read", "Core MCP resource read", coreToolIds.mcpResourceRead, "mcp.resource.read")
   ]),
   family("mcp-connectors", "mcp.prompt", "MCP prompt", "external-connector", ["connector", "model-feedback"], ["mcp"], "mcp", [
     implementedTool("mcp.prompt.render", "MCP prompt render", familyCapabilityIds.mcpPrompt, undefined, "mcp")
@@ -240,13 +296,18 @@ const families = [
   ]),
   family("extensions-local-commands", "hook.list-run", "Hook list and run", "orchestration", ["model-feedback"], ["hook-system"], "built-in", [
     implementedTool("core.hook.list", "Core hook list", coreToolIds.hookList, "hook.list"),
+    implementedTool("core.hook.run", "Core hook run", coreToolIds.hookRun, "hook.run"),
     implementedTool("hook.list-run", "Hook system list and run", familyCapabilityIds.hookListRun, undefined, "host")
   ]),
   family("extensions-local-commands", "plugin.install-verify", "Plugin install and verify", "external-connector", ["connector", "write"], ["plugin-system"], "host", [
+    implementedTool("core.plugin.install", "Core plugin install", coreToolIds.pluginInstall, "plugin.install"),
+    implementedTool("core.plugin.verify", "Core plugin verify", coreToolIds.pluginVerify, "plugin.verify"),
     implementedTool("plugin.install-verify", "Plugin install and verify", familyCapabilityIds.pluginInstallVerify, undefined, "host")
   ]),
   family("extensions-local-commands", "command.palette-slash", "Command palette and slash controls", "orchestration", ["approval", "model-feedback"], ["command-system"], "host", [
-    implementedTool("command.palette-slash", "Command palette and slash projection", familyCapabilityIds.commandPaletteSlash, undefined, "host")
+    implementedTool("core.command.palette", "Core command palette", coreToolIds.commandPalette, "command.palette"),
+    implementedTool("command.palette-slash", "Command palette and slash projection", familyCapabilityIds.commandPaletteSlash, undefined, "host"),
+    implementedTool("core.config.manage", "Core config manage", coreToolIds.configManage, "config.manage")
   ]),
 
   family("media-images", "image.generate", "Image generate", "media", ["media", "artifact"], ["image-provider"], "provider", [
@@ -276,26 +337,36 @@ const families = [
   ]),
 
   family("memory-context-session", "memory.read-write", "Memory read and write", "memory", ["memory", "read", "write"], ["memory-store"], "built-in", [
-    implementedTool("memory.read-write", "Memory scoped read and write", familyCapabilityIds.memoryReadWrite)
+    implementedTool("memory.read-write", "Memory scoped read and write", familyCapabilityIds.memoryReadWrite),
+    implementedTool("core.memory.write", "Core memory write", coreToolIds.memoryWrite, "memory.write"),
+    implementedTool("core.memory.read", "Core memory read", coreToolIds.memoryRead, "memory.read")
   ]),
   family("memory-context-session", "context.project-index", "Project context index", "memory", ["memory", "read"], ["context-index"], "built-in", [
-    implementedTool("context.project-index", "Context project index", familyCapabilityIds.contextProjectIndex)
+    implementedTool("context.project-index", "Context project index", familyCapabilityIds.contextProjectIndex),
+    implementedTool("core.tool.search", "Core tool search", coreToolIds.toolSearch, "tool.search")
   ]),
   family("memory-context-session", "session.resume-fork", "Session resume and fork", "memory", ["memory", "model-feedback"], ["session-store"], "built-in", [
-    implementedTool("session.resume-fork", "Session resume and fork", familyCapabilityIds.sessionResumeFork)
+    implementedTool("session.resume-fork", "Session resume and fork", familyCapabilityIds.sessionResumeFork),
+    implementedTool("core.session.resume", "Core session resume", coreToolIds.sessionResume, "session.resume"),
+    implementedTool("core.session.fork", "Core session fork", coreToolIds.sessionFork, "session.fork")
   ]),
   family("memory-context-session", "compact.summary", "Compact summary", "memory", ["memory", "model-feedback"], ["session-store"], "built-in", [
-    implementedTool("compact.summary", "Compact summary", familyCapabilityIds.compactSummary)
+    implementedTool("compact.summary", "Compact summary", familyCapabilityIds.compactSummary),
+    implementedTool("core.compact.summary", "Core compact summary", coreToolIds.compactSummary, "compact.summary")
   ]),
 
   family("remote-scheduling-observability", "remote.runtime", "Remote runtime", "remote", ["remote", "connector"], ["remote-runtime"], "host", [
-    implementedTool("remote.runtime", "Remote runtime binding", familyCapabilityIds.remoteRuntime, undefined, "host")
+    implementedTool("remote.runtime", "Remote runtime binding", familyCapabilityIds.remoteRuntime, undefined, "host"),
+    implementedTool("core.remote.trigger", "Core remote trigger", coreToolIds.remoteTrigger, "remote.trigger")
   ]),
   family("remote-scheduling-observability", "worktree.environment", "Worktree environment", "remote", ["remote", "write"], ["filesystem", "git"], "host", [
-    implementedTool("worktree.environment", "Worktree environment", familyCapabilityIds.worktreeEnvironment, undefined, "host")
+    implementedTool("worktree.environment", "Worktree environment", familyCapabilityIds.worktreeEnvironment, undefined, "host"),
+    implementedTool("core.worktree.enter", "Core worktree enter", coreToolIds.worktreeEnter, "worktree.enter"),
+    implementedTool("core.worktree.exit", "Core worktree exit", coreToolIds.worktreeExit, "worktree.exit")
   ]),
   family("remote-scheduling-observability", "schedule.sleep-cron", "Schedule, sleep, and cron", "orchestration", ["schedule"], ["scheduler"], "built-in", [
-    implementedTool("schedule.sleep-cron", "Schedule sleep and cron", familyCapabilityIds.scheduleSleepCron)
+    implementedTool("schedule.sleep-cron", "Schedule sleep and cron", familyCapabilityIds.scheduleSleepCron),
+    implementedTool("core.schedule.cron", "Core schedule cron", coreToolIds.scheduleCron, "schedule.cron")
   ]),
   family("remote-scheduling-observability", "observability.trace-budget", "Observability trace and budget", "observability", ["observe"], ["observability"], "built-in", [
     implementedTool("observability.trace-budget", "Observability trace and budget", familyCapabilityIds.observabilityTraceBudget)

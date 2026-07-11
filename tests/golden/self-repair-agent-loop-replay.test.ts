@@ -59,7 +59,7 @@ describe("self-repair agent loop golden replay", () => {
     assert.equal(terminal?.selfRepair?.stopReason, "completed");
     assert.equal(terminal?.selfRepair?.attemptCount, 1);
     assert.equal(terminal?.selfRepair?.successCount, 1);
-    assert.equal(gateway.requests[1]?.messages?.some((message) => message.role === "tool" && message.toolName === "agent.self-repair"), true);
+    assert.equal(hasSelfRepairFeedback(gateway.requests[1]), true);
     await kernel.shutdown();
   });
 });
@@ -69,7 +69,7 @@ class RepairOnceModelGateway implements ModelGateway {
 
   async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
     this.requests.push(request);
-    if (request.messages?.some((message) => message.role === "tool" && message.toolName === "agent.self-repair")) {
+    if (hasSelfRepairFeedback(request)) {
       yield { kind: "delta", text: "Recovered after bounded repair feedback." };
       yield { kind: "finish", reason: "stop" };
       yield { kind: "done" };
@@ -89,4 +89,11 @@ class RepairOnceModelGateway implements ModelGateway {
   async countTokens(text: string): Promise<number> {
     return text.trim() ? text.trim().split(/\s+/).length : 0;
   }
+}
+
+function hasSelfRepairFeedback(request: ModelRequest | undefined): boolean {
+  return request?.messages?.some((message) =>
+    (message.role === "tool" && message.toolName === "agent.self-repair") ||
+    (message.role === "system" && message.content.includes("Self-repair failure evidence"))
+  ) ?? false;
 }

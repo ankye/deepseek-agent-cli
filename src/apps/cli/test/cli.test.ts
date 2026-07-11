@@ -1,10 +1,10 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
-import { AGENT_MODE_COMPATIBILITY, AGENT_MODE_SCHEMA_VERSION, APPROVAL_SCHEMA_VERSION, INTERACTION_MODE_COMPATIBILITY, INTERACTION_MODE_SCHEMA_VERSION, asId } from "@deepseek/platform-contracts";
+import { AGENT_MODE_COMPATIBILITY, AGENT_MODE_SCHEMA_VERSION, APPROVAL_SCHEMA_VERSION, INTERACTION_MODE_COMPATIBILITY, INTERACTION_MODE_SCHEMA_VERSION, TOOL_FAMILY_CATALOG_SCHEMA_VERSION, asId } from "@deepseek/platform-contracts";
 import type { ApprovalId, ApprovalRequest, CapabilityExecutionContext, JsonObject, ModelGateway, ModelRequest, ModelStreamEvent, PlatformRuntime, PolicyDecision, PolicyEngine, PolicyRequest, ProcessResult, ProcessRunObserver, ProcessRunOptions, RuntimeEvent, SessionEvent, SessionId, WorkspaceEditTransaction } from "@deepseek/platform-contracts";
 import { FakePlatformRuntime, NodePlatformRuntime } from "@deepseek/platform-abstraction";
 import { createDefaultRuntimeKernel, registerRuntimeCoreTools } from "@deepseek/runtime";
@@ -14,6 +14,8 @@ import { chatPageIndexPagesFromSnapshot, explainChatPageIndexRecallItem, markSta
 import { boundedText, defineToolManifest, objectSchema, replay } from "@deepseek/core-coding-tools";
 import { createChatPaletteState } from "../src/commands/palette-state.js";
 import { collectCliEvaluation } from "../src/diagnostics/evaluation.js";
+import { classifyCapabilityMatrixRun, collectCapabilityMatrix } from "../src/diagnostics/capability-matrix.js";
+import { liveCredentialLaunchCwdEnvKey } from "@deepseek/credential-auth-management";
 import { collectDeliveryCapabilitySummary } from "../src/diagnostics/delivery-capability.js";
 import { buildEvaluationDeliveryCapabilityEvidence } from "../src/diagnostics/evaluation-delivery-evidence.js";
 import { renderDiagnosticsResult } from "../src/diagnostics/index.js";
@@ -148,12 +150,28 @@ describe("cli host adapter", () => {
       live: true,
       timeoutMs: 1000
     });
+    assert.deepEqual(parseCliArgs(["chat", "--tool-projection", "safe-all", "--tool-opt-in", "network", "--output", "jsonl"]), {
+      command: "chat",
+      prompt: "",
+      output: "jsonl",
+      live: false,
+      toolProjection: "safe-all",
+      toolOptIns: ["network"]
+    });
     assert.deepEqual(parseCliArgs(["chat", "--session", "session-resume", "--output", "jsonl"]), {
       command: "chat",
       prompt: "",
       output: "jsonl",
       live: false,
       sessionId: asId<"session">("session-resume")
+    });
+    assert.deepEqual(parseCliArgs(["session", "board", "session-board", "--output", "json"]), {
+      command: "session",
+      prompt: "",
+      output: "json",
+      live: false,
+      sessionAction: "board",
+      sessionId: asId<"session">("session-board")
     });
     assert.deepEqual(parseCliArgs(["chat", "--tui", "full-screen", "--output", "text"]), {
       command: "chat",
@@ -175,6 +193,20 @@ describe("cli host adapter", () => {
       output: "jsonl",
       live: false,
       toolProjection: "none"
+    });
+    assert.deepEqual(parseCliArgs(["run", "fetch docs", "--tool-opt-in", "network", "--tool-opt-in", "browser,connector", "--output", "jsonl"]), {
+      command: "run",
+      prompt: "fetch docs",
+      output: "jsonl",
+      live: false,
+      toolOptIns: ["network", "browser", "connector"]
+    });
+    assert.deepEqual(parseCliArgs(["run", "inspect workspace", "--workspace-root", "/tmp/task-workspace", "--output", "jsonl"]), {
+      command: "run",
+      prompt: "inspect workspace",
+      output: "jsonl",
+      live: false,
+      workspaceRoot: "/tmp/task-workspace"
     });
     assert.deepEqual(parseCliArgs([
       "run",
@@ -217,6 +249,20 @@ describe("cli host adapter", () => {
         redaction: { class: "internal" }
       }
     });
+    assert.deepEqual(parseCliArgs(["run", "stateful task", "--supervisor-workflow-state", ".deepseek/run-state.json", "--output", "jsonl"]), {
+      command: "run",
+      prompt: "stateful task",
+      output: "jsonl",
+      live: false,
+      supervisorWorkflowStatePath: ".deepseek/run-state.json"
+    });
+    assert.deepEqual(parseCliArgs(["run", "repair task", "--additional-user-context-file", ".deepseek/repair.md", "--output", "jsonl"]), {
+      command: "run",
+      prompt: "repair task",
+      output: "jsonl",
+      live: false,
+      additionalUserContextFile: ".deepseek/repair.md"
+    });
     assert.deepEqual(parseCliArgs(["chat", "--live", "--thinking", "max", "--output", "jsonl"]), {
       command: "chat",
       prompt: "",
@@ -257,6 +303,21 @@ describe("cli host adapter", () => {
         command: "flow",
         action: "inspect",
         prompt: "继续",
+        extraArgs: []
+      }
+    });
+    assert.deepEqual(parseCliArgs(["diagnostics", "capability-matrix", "run", "--task", "T01", "--task", "T05", "--report-dir", ".deepseek/capability-matrix/test", "--dry-run", "--output", "json"]), {
+      command: "diagnostics",
+      diagnosticsCommand: "capability-matrix",
+      prompt: "",
+      output: "json",
+      live: false,
+      diagnosticsInput: {
+        command: "capability-matrix",
+        action: "run",
+        dryRun: true,
+        taskIds: ["T01", "T05"],
+        reportDir: ".deepseek/capability-matrix/test",
         extraArgs: []
       }
     });
@@ -467,6 +528,41 @@ describe("cli host adapter", () => {
     assert.deepEqual(parseCliArgs([
       "diagnostics",
       "swe-bench",
+      "run",
+      "--task",
+      "1",
+      "--execute",
+      "--provider",
+      "glm",
+      "--model",
+      "glm-5.2",
+      "--run-id",
+      "glm-run",
+      "--output",
+      "json"
+    ]), {
+      command: "diagnostics",
+      diagnosticsCommand: "swe-bench",
+      prompt: "",
+      output: "json",
+      live: false,
+      modelProvider: "glm",
+      model: "glm-5.2",
+      diagnosticsInput: {
+        command: "swe-bench",
+        action: "run",
+        dryRun: false,
+        provider: "glm",
+        model: "glm-5.2",
+        runId: "glm-run",
+        task: "1",
+        execute: true,
+        extraArgs: []
+      }
+    });
+    assert.deepEqual(parseCliArgs([
+      "diagnostics",
+      "swe-bench",
       "predict",
       "--instance-file",
       ".deepseek/swe-lite-runs/demo/instance.json",
@@ -611,6 +707,9 @@ describe("cli host adapter", () => {
     assert.equal(lines.some((line) => line.includes("deepseek diagnostics bundle|release|doctor|verify|refresh|evaluate|env|flow|swe-bench")), true);
     assert.equal(lines.some((line) => line.includes("--predictions-path <path>")), true);
     assert.equal(lines.some((line) => line.includes("deepseek chat [--session <session-id>]")), true);
+    assert.equal(lines.some((line) => line.includes("--tool-projection none|read-only|read-write|safe-all")), true);
+    assert.equal(lines.some((line) => line.includes("--tool-opt-in <category>")), true);
+    assert.equal(lines.some((line) => line.includes("--tool-projection none|read-only|read-write|all")), false);
     assert.equal(lines.join("\n").includes("stream-json"), false);
     assert.equal(lines.join("\n").includes(" -p "), false);
   });
@@ -830,6 +929,27 @@ describe("cli host adapter", () => {
     });
   });
 
+  it("discovers the workspace root from a nested launch directory", async () => {
+    await withTempCwd("deepseek-cli-workspace-discovery-", async () => {
+      await mkdir(join("src", "nested"), { recursive: true });
+      await writeFile("package.json", JSON.stringify({ name: "workspace-discovery-fixture" }), "utf8");
+      await writeFile(join("src", "root-only.ts"), "export const WorkspaceDiscoveryNeedle = true;\n", "utf8");
+      process.chdir(join(process.cwd(), "src", "nested"));
+
+      const fileLines: string[] = [];
+      await runCli(["file", "list", "src", "--output", "json"], (line: string) => {
+        fileLines.push(line);
+      }, [], { stdinIsTTY: false, stdoutIsTTY: false });
+      const fileResult = JSON.parse(fileLines[0] ?? "{}") as {
+        readonly status?: string;
+        readonly resultList?: { readonly items?: readonly { readonly target?: { readonly path?: string } }[] };
+      };
+
+      assert.equal(fileResult.status, "completed");
+      assert.equal(fileResult.resultList?.items?.some((item) => item.target?.path?.endsWith("src/root-only.ts")), true);
+    });
+  });
+
   it("runs /file as a local chat navigation command and projects result lists", async () => {
     const lines = await runWithSeededWorkspace(["chat", "--output", "jsonl"], [
       "/file list src\n/palette state\n/palette refs add current\n/palette refs list\n/file refs .md\n/file preview src/index.ts\n/file preview\n/exit\n"
@@ -856,6 +976,32 @@ describe("cli host adapter", () => {
     assert.equal(records.some((record) => record.kind === "chat.command.file" && record.record?.kind === "file.manager.diagnostic" && record.record.diagnostic?.code === "FILE_MANAGER_QUERY_REQUIRED"), true);
     assert.equal(records.some((record) => record.kind === "model.requested" || record.kind === "agent.loop.started"), false);
     assert.equal(lines.join("\n").includes("\u001b["), false);
+  });
+
+  it("resolves chat file previews through the injected workspace root", async () => {
+    const cwdRoot = process.cwd().replace(/\\/g, "/");
+    const deps = createDeterministicRuntimeDependencies();
+    await deps.platform.writeFile(`${cwdRoot}/src/index.ts`, "export const wrongRoot = true;\n");
+    await deps.platform.writeFile("/workspace/src/index.ts", "export const workspaceRoot = true;\n");
+    const kernel = await createDefaultRuntimeKernel(deps);
+    const lines: string[] = [];
+    await runCli(["chat", "--output", "jsonl"], (line: string) => {
+      lines.push(line);
+    }, ["/file preview src/index.ts\n/exit\n"], { stdinIsTTY: false, stdoutIsTTY: false }, {
+      createRuntime: async () => ({ deps, kernel }),
+      workspaceRoot: "/workspace"
+    });
+
+    const records = lines.map((line) => JSON.parse(line) as {
+      kind?: string;
+      record?: {
+        kind?: string;
+        item?: { label?: string; target?: { path?: string; metadata?: { preview?: string } } };
+      };
+    });
+    assert.equal(records.some((record) => record.kind === "chat.command.file" && record.record?.kind === "file.manager.item" && record.record.item?.target?.path === "/workspace/src/index.ts"), true);
+    assert.equal(records.some((record) => record.record?.item?.target?.metadata?.preview?.includes("workspaceRoot")), true);
+    assert.equal(records.some((record) => record.record?.item?.target?.metadata?.preview?.includes("wrongRoot")), false);
   });
 
   it("runs /jump as a local chat navigation command and projects symbol results", async () => {
@@ -1029,7 +1175,7 @@ describe("cli host adapter", () => {
     await kernel.shutdown("cli-test-live-glm-profile");
   });
 
-  it("enables context pipeline and profile workflow metadata for SWE-bench one-shot runs", async () => {
+  it("passes explicit tool opt-ins into one-shot runtime projection", async () => {
     const deps = createDeterministicRuntimeDependencies();
     const capturedRequests: ModelRequest[] = [];
     const runtimeDeps = {
@@ -1041,7 +1187,7 @@ describe("cli host adapter", () => {
     const lines: string[] = [];
 
     await runCli(
-      ["run", "Resolve SWE-bench instance astropy__astropy-12907.", "--output", "jsonl", "--live", "--provider", "glm", "--model", "glm-5.1"],
+      ["run", "fetch public docs", "--output", "jsonl", "--live", "--tool-projection", "safe-all", "--tool-opt-in", "network"],
       (line: string) => {
         lines.push(line);
       },
@@ -1052,121 +1198,229 @@ describe("cli host adapter", () => {
       }
     );
 
-    const records = lines.map((line) => JSON.parse(line) as { kind?: string; data?: { contextPipeline?: JsonObject; profilePolicy?: JsonObject } });
-    const modelRequested = records.find((record) => record.kind === "model.requested");
-    assert.equal(typeof modelRequested?.data?.contextPipeline?.pipelineFingerprint, "string");
-    assert.equal(modelRequested?.data?.profilePolicy?.profileId, "evaluation/swe-bench-lite.v1");
-    assert.equal(modelRequested?.data?.profilePolicy?.role, "evaluation-workflow");
-    assert.equal((modelRequested?.data?.profilePolicy?.loopLimits as { maxModelIterations?: number } | undefined)?.maxModelIterations, 48);
-    assert.deepEqual(modelRequested?.data?.profilePolicy?.workflowCapabilityIds, [
-      "core.swe.bench.run"
-    ]);
-    const modelRequestedStages = modelRequested?.data?.profilePolicy?.workflowStages as readonly { readonly id?: string; readonly exitCriteria?: readonly string[] }[] | undefined;
-    assert.equal(modelRequestedStages?.[0]?.id, "dispatch");
-    assert.equal(modelRequestedStages?.[0]?.exitCriteria?.includes("governed harness result or classified blocker recorded"), true);
-    const modelRequestedStagedWorkflow = modelRequested?.data?.profilePolicy?.stagedTaskWorkflow as { readonly graphId?: string; readonly fingerprint?: string; readonly graph?: { readonly stages?: readonly { readonly stageId?: string; readonly allowedTools?: readonly string[] }[] }; readonly runState?: { readonly stageStates?: readonly { readonly status?: string }[] } } | undefined;
-    assert.equal(modelRequestedStagedWorkflow?.graphId?.startsWith("graph:evaluation/swe-bench-lite.v1:"), true);
-    assert.match(modelRequestedStagedWorkflow?.fingerprint ?? "", /^fnv1a:/);
-    assert.equal(modelRequestedStagedWorkflow?.graph?.stages?.map((stage) => stage.stageId).join(","), "stage:dispatch");
-    assert.equal(modelRequestedStagedWorkflow?.graph?.stages?.[0]?.allowedTools?.includes("core.swe.bench.run"), true);
-    assert.equal(modelRequestedStagedWorkflow?.runState?.stageStates?.filter((stage) => stage.status === "ready").length, 1);
-    assert.equal(typeof capturedRequests[0]?.metadata?.contextPipeline, "object");
-    assert.equal(typeof (capturedRequests[0]?.metadata?.contextPipeline as { pipelineFingerprint?: string } | undefined)?.pipelineFingerprint, "string");
-    const providerProfilePolicy = capturedRequests[0]?.metadata?.profilePolicy as { profileId?: string; workflowCapabilityIds?: readonly string[]; workflowStages?: readonly { readonly id?: string }[]; stagedTaskWorkflow?: { readonly graphId?: string; readonly graph?: { readonly stages?: readonly { readonly stageId?: string }[] } }; loopLimits?: { maxToolCalls?: number } } | undefined;
-    assert.equal(providerProfilePolicy?.profileId, "evaluation/swe-bench-lite.v1");
-    assert.equal(providerProfilePolicy?.loopLimits?.maxToolCalls, 96);
-    assert.equal(providerProfilePolicy?.workflowCapabilityIds?.includes("core.swe.bench.run"), true);
-    assert.equal(providerProfilePolicy?.workflowStages?.map((stage) => stage.id).join(","), "dispatch");
-    assert.equal(providerProfilePolicy?.stagedTaskWorkflow?.graphId, modelRequestedStagedWorkflow?.graphId);
-    assert.equal(providerProfilePolicy?.stagedTaskWorkflow?.graph?.stages?.[0]?.stageId, "stage:dispatch");
-    const modelVisibleProfilePolicy = (capturedRequests[0]?.messages ?? [])
-      .map((message) => message.content)
-      .join("\n");
-    assert.equal(modelVisibleProfilePolicy.includes("Agent profile workflow:"), true);
-    assert.equal(modelVisibleProfilePolicy.includes("Profile id: evaluation/swe-bench-lite.v1"), true);
-    assert.equal(modelVisibleProfilePolicy.includes("Role: evaluation-workflow"), true);
-    assert.equal(modelVisibleProfilePolicy.includes("Workflow graph: workflow/evaluation.swe-bench-lite.v1"), true);
-    assert.equal(modelVisibleProfilePolicy.includes("Primary orchestration capabilities: core.swe.bench.run"), true);
-    assert.equal(modelVisibleProfilePolicy.includes("Workflow stages:"), true);
-    assert.equal(modelVisibleProfilePolicy.includes("1. dispatch: Dispatch the numbered user request to the governed SWE-bench run capability."), true);
-    await kernel.shutdown("cli-test-swe-bench-context-pipeline");
-  });
+    const firstRequest = capturedRequests[0];
+    assert.ok(firstRequest, "expected one-shot run to dispatch a model request");
+    const toolNames = (firstRequest.tools ?? []).map((tool) => {
+      const fn = tool.function;
+      return isJsonObject(fn) ? String(fn.name) : "";
+    });
+    const toolPolicy = (firstRequest.messages ?? []).find((message) => message.content.includes("Tool visibility policy: safe-all"))?.content ?? "";
 
-  it("bounds provider-facing tool history for SWE-bench one-shot runs", async () => {
-    const deps = createDeterministicRuntimeDependencies();
-    const gateway = new SweBenchOneShotHistoryTailGateway(8);
-    const runtimeDeps = {
-      ...deps,
-      models: gateway,
-      policy: new AllowAllPolicyEngine()
-    };
-    await runtimeDeps.platform.writeFile(`${process.cwd().replace(/\\/g, "/")}/README.md`, "history tail fixture\n");
-    await registerRuntimeCoreTools(runtimeDeps, process.cwd());
-    const kernel = await createDefaultRuntimeKernel(runtimeDeps);
-    const lines: string[] = [];
-
-    await runCli(
-      ["run", "Resolve SWE-bench instance astropy__astropy-12907.", "--output", "jsonl", "--live", "--provider", "glm", "--model", "glm-5.1"],
-      (line: string) => {
-        lines.push(line);
-      },
-      [],
-      { stdinIsTTY: false, stdoutIsTTY: false },
-      {
-        createRuntime: async () => ({ deps: runtimeDeps, kernel })
-      }
-    );
-
-    const records = lines.map((line) => JSON.parse(line) as { kind?: string; data?: { providerRequestReplay?: { selectedHistoryMessageCount?: number; historyMessageCount?: number; providerMessageCount?: number; toolCallLinkage?: { assistantToolCallCount?: number; toolResultCount?: number } } } });
-    const lastReplay = records.filter((record) => record.kind === "model.requested").at(-1)?.data?.providerRequestReplay;
-    const lastRequest = gateway.requests.at(-1);
-    const toolMessages = lastRequest?.messages?.filter((message) => message.role === "tool") ?? [];
-    const assistantToolMessages = lastRequest?.messages?.filter((message) => (message.toolCalls?.length ?? 0) > 0) ?? [];
-
-    assert.equal(toolMessages.length, 1);
-    assert.equal(assistantToolMessages.length, 1);
-    assert.equal((lastReplay?.historyMessageCount ?? 0) <= 2, true);
-    assert.equal(lastReplay?.toolCallLinkage?.toolResultCount, 1);
-    assert.equal(lastReplay?.toolCallLinkage?.assistantToolCallCount, 1);
-    assert.equal((lastReplay?.selectedHistoryMessageCount ?? 0) <= 4, true);
-    assert.equal((lastReplay?.providerMessageCount ?? 0) > (lastReplay?.selectedHistoryMessageCount ?? 0), true);
-    await kernel.shutdown("cli-test-swe-bench-history-tail");
-  });
-
-  it("promotes live SWE-bench task runs to the governed run tool projection", async () => {
-    const deps = createDeterministicRuntimeDependencies();
-    const capturedRequests: ModelRequest[] = [];
-    const runtimeDeps = {
-      ...deps,
-      models: new CaptureModelRequestGateway(capturedRequests)
-    };
-    await registerRuntimeCoreTools(runtimeDeps, process.cwd());
-    const kernel = await createDefaultRuntimeKernel(runtimeDeps);
-    const lines: string[] = [];
-    let capturedToolProjection: unknown;
-
-    await runCli(
-      ["run", "给我完成 SWE-bench Lite 第 3 题测试，跑通并告诉我结果。", "--output", "jsonl", "--live", "--provider", "glm", "--model", "glm-5.1"],
-      (line: string) => {
-        lines.push(line);
-      },
-      [],
-      { stdinIsTTY: false, stdoutIsTTY: false },
-      {
-        createRuntime: async (runtimeOptions) => {
-          capturedToolProjection = runtimeOptions.toolProjection;
-          return { deps: runtimeDeps, kernel };
-        }
-      }
-    );
-
-    const records = lines.map((line) => JSON.parse(line) as { kind?: string; data?: { toolProjection?: string } });
-    const modelRequested = records.find((record) => record.kind === "model.requested");
-    assert.equal(capturedToolProjection, "all");
-    assert.equal(capturedRequests[0]?.toolProjection, "all");
-    assert.equal(modelRequested?.data?.toolProjection, "all");
+    assert.equal(toolNames.includes("core_web_fetch"), true);
+    assert.equal(toolPolicy.includes("Tool opt-ins: network."), true);
     assert.equal(lines.some((line) => line.includes("agent.loop.completed")), true);
-    await kernel.shutdown("cli-test-swe-bench-live-tool-projection");
+    await kernel.shutdown("cli-test-tool-opt-ins");
+  });
+
+  it("projects command-habit aliases through CLI one-shot tool policy", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    const capturedRequests: ModelRequest[] = [];
+    const runtimeDeps = {
+      ...deps,
+      models: new CaptureModelRequestGateway(capturedRequests)
+    };
+    await registerRuntimeCoreTools(runtimeDeps, process.cwd());
+    const kernel = await createDefaultRuntimeKernel(runtimeDeps);
+    const lines: string[] = [];
+
+    await runCli(
+      ["run", "search, copy, and verify files", "--output", "jsonl", "--live", "--tool-projection", "safe-all"],
+      (line: string) => {
+        lines.push(line);
+      },
+      [],
+      { stdinIsTTY: false, stdoutIsTTY: false },
+      {
+        createRuntime: async () => ({ deps: runtimeDeps, kernel })
+      }
+    );
+
+    const firstRequest = capturedRequests[0];
+    assert.ok(firstRequest, "expected one-shot run to dispatch a model request");
+    const toolPolicy = (firstRequest.messages ?? []).find((message) => message.content.includes("Tool visibility policy: safe-all"))?.content ?? "";
+    assert.equal(toolPolicy.includes("Common command-habit aliases route to governed tools:"), true, toolPolicy);
+
+    assert.equal(toolPolicy.includes("grep -> core_search_text"), true);
+    assert.equal(toolPolicy.includes("rg -> core_search_text"), true);
+    assert.equal(toolPolicy.includes("ls -> core_file_list"), true);
+    assert.equal(toolPolicy.includes("cat -> core_file_read"), true);
+    await kernel.shutdown("cli-test-command-habit-aliases");
+  });
+
+  it("projects engineering prompts through a primary role workflow before model dispatch", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    const capturedRequests: ModelRequest[] = [];
+    const runtimeDeps = {
+      ...deps,
+      models: new CaptureModelRequestGateway(capturedRequests)
+    };
+    await registerRuntimeCoreTools(runtimeDeps, process.cwd());
+    const kernel = await createDefaultRuntimeKernel(runtimeDeps);
+    const lines: string[] = [];
+
+    await runCli(
+      ["run", "修复这个仓库里的 CLI 调度缺陷，补测试并跑验证。", "--output", "jsonl", "--live"],
+      (line: string) => {
+        lines.push(line);
+      },
+      [],
+      { stdinIsTTY: false, stdoutIsTTY: false },
+      {
+        createRuntime: async () => ({ deps: runtimeDeps, kernel })
+      }
+    );
+
+    const firstRequest = capturedRequests[0];
+    const profilePolicy = firstRequest?.metadata?.profilePolicy as JsonObject | undefined;
+    const readyStage = firstRequest?.metadata?.workflowReadyStageControl as JsonObject | undefined;
+    const toolNames = (firstRequest?.tools ?? []).map((tool) => {
+      const fn = tool.function;
+      return isJsonObject(fn) ? String(fn.name) : "";
+    });
+
+    assert.equal(profilePolicy?.profileId, "engineering/coding.v1");
+    assert.equal(profilePolicy?.role, "engineering-agent");
+    assert.equal(profilePolicy?.workflowPriority, "primary");
+    assert.equal(readyStage?.stageId, "stage:understand");
+    assert.equal(String(readyStage?.requiredNextAction).includes("core.file.read"), true);
+    assert.equal(String(readyStage?.requiredNextAction).includes("core.search.text"), true);
+    assert.equal(toolNames.includes("core_file_read"), true);
+    assert.equal(toolNames.includes("core_file_edit"), false);
+    assert.equal(lines.some((line) => line.includes("workflow.ready-stage.control")), true);
+    await kernel.shutdown("cli-test-engineering-primary-workflow");
+  });
+
+  it("threads supervisor workflow run state into dynamic prompt state without changing stable profile guidance", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    const statePath = `${process.cwd().replace(/\\/g, "/")}/.deepseek/test-supervisor-run-state.json`;
+    await deps.platform.writeFile(statePath, JSON.stringify({
+      schemaVersion: "1.0.0",
+      taskRunId: "staged:runner:unit-child-state:2",
+      graphId: "workflow/evaluation.swe-bench-lite.child.v1",
+      profileId: "evaluation/swe-bench-lite.child.v1",
+      stageStates: [
+        { stageId: "prepare", status: "succeeded", attempts: 1, inputRefs: [], outputRefs: ["ref:runner:tool-matrix"], diagnostics: [] },
+        { stageId: "understand", status: "running", attempts: 0, inputRefs: ["ref:runner:tool-matrix"], outputRefs: [], diagnostics: [] }
+      ],
+      refs: [
+        { schemaVersion: "1.0.0", refId: "ref:runner:tool-matrix", type: "state", producerStageId: "prepare", scope: "task", metadata: { status: "complete" }, compatibility: { schemaVersion: "1.0.0", minReaderVersion: "1.0.0" }, redaction: { class: "internal", fields: ["metadata"] } }
+      ],
+      events: [],
+      compatibility: { schemaVersion: "1.0.0", minReaderVersion: "1.0.0" },
+      redaction: { class: "internal" }
+    }));
+    const capturedRequests: ModelRequest[] = [];
+    const runtimeDeps = {
+      ...deps,
+      models: new CaptureModelRequestGateway(capturedRequests)
+    };
+    await registerRuntimeCoreTools(runtimeDeps, process.cwd());
+    const kernel = await createDefaultRuntimeKernel(runtimeDeps);
+    const lines: string[] = [];
+
+    await runCli(
+      [
+        "run",
+        "Resolve SWE-bench instance demo__repo-1.\n\nManaged SWE-bench execution profile:\nProblem statement:\nfix it",
+        "--supervisor-workflow-state",
+        statePath,
+        "--output",
+        "jsonl",
+        "--live",
+        "--tool-projection",
+        "all"
+      ],
+      (line: string) => {
+        lines.push(line);
+      },
+      [],
+      { stdinIsTTY: false, stdoutIsTTY: false },
+      {
+        createRuntime: async () => ({ deps: runtimeDeps, kernel })
+      }
+    );
+
+    const messages = capturedRequests[0]?.messages ?? [];
+    const stableProfile = messages.find((message) => message.content.includes("Agent profile workflow:"));
+    const dynamicState = messages.find((message) => message.content.includes("Supervisor workflow state:"));
+
+    assert.equal(stableProfile?.cacheHint?.policy, "stable");
+    assert.equal(dynamicState?.cacheHint?.policy, "ephemeral");
+    assert.equal(dynamicState?.content.includes("Task run: staged:runner:unit-child-state:2."), true);
+    assert.equal(dynamicState?.content.includes("prepare:succeeded refs=ref:runner:tool-matrix attempts=1"), true);
+    assert.equal(dynamicState?.content.includes("understand:running refs=none attempts=0"), true);
+    assert.equal(capturedRequests[0]?.metadata?.profilePolicy !== undefined, true);
+    assert.equal(lines.some((line) => line.includes("prompt.assembled")), true);
+    await kernel.shutdown("cli-test-supervisor-workflow-state");
+  });
+
+  it("uses supervisor repair workflow state for child runtime gates", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    const statePath = `${process.cwd().replace(/\\/g, "/")}/.deepseek/test-supervisor-repair-state.json`;
+    await deps.platform.writeFile(statePath, JSON.stringify({
+      schemaVersion: "1.0.0",
+      taskRunId: "staged:runner:unit-child-repair-state:2",
+      graphId: "workflow/evaluation.swe-bench-lite.child.v1",
+      profileId: "evaluation/swe-bench-lite.child.v1",
+      stageStates: [
+        { stageId: "prepare", status: "succeeded", attempts: 1, inputRefs: [], outputRefs: ["ref:runner:tool-matrix"], diagnostics: [] },
+        { stageId: "understand", status: "succeeded", attempts: 1, inputRefs: ["ref:runner:tool-matrix"], outputRefs: ["ref:runner:source-inspection-evidence", "ref:runner:official-repair-feedback"], diagnostics: [] },
+        { stageId: "change", status: "pending", attempts: 0, inputRefs: ["ref:runner:source-inspection-evidence", "ref:runner:official-repair-feedback"], outputRefs: [], diagnostics: [] }
+      ],
+      refs: [
+        { schemaVersion: "1.0.0", refId: "ref:runner:tool-matrix", type: "state", producerStageId: "prepare", scope: "task", metadata: { status: "complete" }, compatibility: { schemaVersion: "1.0.0", minReaderVersion: "1.0.0" }, redaction: { class: "internal", fields: ["metadata"] } },
+        { schemaVersion: "1.0.0", refId: "ref:runner:official-repair-feedback", type: "diagnostic", producerStageId: "understand", scope: "task", metadata: { failingTestCount: 2, failureExcerptCount: 1 }, compatibility: { schemaVersion: "1.0.0", minReaderVersion: "1.0.0" }, redaction: { class: "internal", fields: ["metadata"] } }
+      ],
+      events: [],
+      compatibility: { schemaVersion: "1.0.0", minReaderVersion: "1.0.0" },
+      redaction: { class: "internal" }
+    }));
+    const capturedRequests: ModelRequest[] = [];
+    const runtimeDeps = {
+      ...deps,
+      models: new CaptureModelRequestGateway(capturedRequests)
+    };
+    await registerRuntimeCoreTools(runtimeDeps, process.cwd());
+    const kernel = await createDefaultRuntimeKernel(runtimeDeps);
+
+    await runCli(
+      [
+        "run",
+        "Resolve SWE-bench instance demo__repo-1.\n\nManaged SWE-bench execution profile:\nProblem statement:\nfix it",
+        "--supervisor-workflow-state",
+        statePath,
+        "--output",
+        "jsonl",
+        "--live",
+        "--tool-projection",
+        "all"
+      ],
+      () => undefined,
+      [],
+      { stdinIsTTY: false, stdoutIsTTY: false },
+      {
+        createRuntime: async () => ({ deps: runtimeDeps, kernel })
+      }
+    );
+
+    const firstRequest = capturedRequests[0];
+    const profilePolicy = firstRequest?.metadata?.profilePolicy as JsonObject | undefined;
+    const readyStage = firstRequest?.metadata?.workflowReadyStageControl as JsonObject | undefined;
+    const toolNames = (firstRequest?.tools ?? []).map((tool) => {
+      const fn = tool.function;
+      return isJsonObject(fn) ? String(fn.name) : "";
+    });
+    const stagedWorkflow = profilePolicy?.stagedTaskWorkflow as JsonObject | undefined;
+    const runState = stagedWorkflow?.runState as JsonObject | undefined;
+    const stageStates = runState?.stageStates as JsonObject[] | undefined;
+
+    assert.equal(stageStates?.find((stage) => stage.stageId === "stage:understand")?.status, "succeeded");
+    assert.equal(readyStage?.stageId, "stage:change");
+    assert.equal(readyStage?.stageKind, "produce");
+    assert.equal(String(readyStage?.requiredNextAction).includes("core.file.edit"), true);
+    assert.equal(toolNames.includes("core_file_edit"), true);
+    assert.equal(toolNames.includes("core_patch_apply"), true);
+    await kernel.shutdown("cli-test-supervisor-repair-workflow-state");
   });
 
   it("projects one-shot output contracts through prompt assembly and verification", async () => {
@@ -2270,6 +2524,7 @@ describe("cli host adapter", () => {
       ["database schema baseline\nwrite app\n/palette recall database\n/palette recall explain current\n/palette refs add current\n/palette refs list\ncontinue from stale recall\n/exit\n"],
       { stdinIsTTY: false, stdoutIsTTY: false },
       {
+        workspaceRoot: "/workspace",
         createRuntime: async () => ({ deps: toolDeps, kernel })
       }
     );
@@ -2990,6 +3245,7 @@ describe("cli host adapter", () => {
       ["write app\n/revert apply current\n/exit\n"],
       { stdinIsTTY: false, stdoutIsTTY: false },
       {
+        workspaceRoot: "/workspace",
         createRuntime: async () => ({ deps: toolDeps, kernel })
       }
     );
@@ -3037,6 +3293,7 @@ describe("cli host adapter", () => {
       ["write app\n/revert review current\n/revert confirm current\n/exit\n"],
       { stdinIsTTY: false, stdoutIsTTY: false },
       {
+        workspaceRoot: "/workspace",
         createRuntime: async () => ({ deps: toolDeps, kernel })
       }
     );
@@ -3117,6 +3374,7 @@ describe("cli host adapter", () => {
       ["write app\n/revert review current\n/revert confirm current\n/exit\n"],
       { stdinIsTTY: false, stdoutIsTTY: false },
       {
+        workspaceRoot: "/workspace",
         createRuntime: async () => ({ deps: toolDeps, kernel })
       }
     );
@@ -3233,6 +3491,42 @@ describe("cli host adapter", () => {
     assert.deepEqual([...sessionIds].length, 1);
   });
 
+  it("passes explicit tool projection and opt-ins through chat runtime submissions", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    const capturedRequests: ModelRequest[] = [];
+    const runtimeDeps = {
+      ...deps,
+      models: new CaptureModelRequestGateway(capturedRequests)
+    };
+    await registerRuntimeCoreTools(runtimeDeps, process.cwd());
+    const kernel = await createDefaultRuntimeKernel(runtimeDeps);
+    const lines: string[] = [];
+    await runCli(
+      ["chat", "--output", "jsonl", "--tool-projection", "safe-all", "--tool-opt-in", "network"],
+      (line: string) => {
+        lines.push(line);
+      },
+      ["fetch docs\n/exit\n"],
+      { stdinIsTTY: false, stdoutIsTTY: false },
+      {
+        createRuntime: async () => ({ deps: runtimeDeps, kernel })
+      }
+    );
+
+    const firstRequest = capturedRequests[0];
+    assert.ok(firstRequest, "expected chat to dispatch a model request");
+    const toolNames = (firstRequest.tools ?? []).map((tool) => {
+      const fn = tool.function;
+      return isJsonObject(fn) ? String(fn.name) : "";
+    });
+    const toolPolicy = (firstRequest.messages ?? []).find((message) => message.content.includes("Tool visibility policy: safe-all"))?.content ?? "";
+
+    assert.equal(toolNames.includes("core_web_fetch"), true);
+    assert.equal(toolPolicy.includes("Tool opt-ins: network."), true);
+    assert.equal(lines.some((line) => line.includes("agent.loop.completed")), true);
+    await kernel.shutdown("cli-test-chat-tool-opt-ins");
+  });
+
   it("routes model tool calls through preflight and governed execution", async () => {
     const deps = createDeterministicRuntimeDependencies();
     const toolDeps = { ...deps, models: new ToolCallingModelGateway() };
@@ -3248,6 +3542,7 @@ describe("cli host adapter", () => {
       [],
       { stdinIsTTY: false, stdoutIsTTY: false },
       {
+        workspaceRoot: "/workspace",
         createRuntime: async () => {
           return { deps: toolDeps, kernel };
         }
@@ -3315,6 +3610,56 @@ describe("cli host adapter", () => {
     await kernel.shutdown("cli-test-swe-env-prepare-tool-call");
   });
 
+  it("routes diagnostics swe-bench run through the governed run capability", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    const toolDeps = { ...deps, policy: new AllowAllPolicyEngine() };
+    await registerRuntimeCoreTools(toolDeps, "/workspace");
+    const capturedInputs: JsonObject[] = [];
+    await registerFakeCliSweBenchRunCapability(toolDeps, capturedInputs);
+    const kernel = await createDefaultRuntimeKernel(toolDeps);
+    const lines: string[] = [];
+
+    await runCli(
+      ["diagnostics", "swe-bench", "run", "--task", "1", "--execute", "--provider", "glm", "--model", "glm-5.2", "--run-id", "test-run", "--output", "json"],
+      (line: string) => {
+        lines.push(line);
+      },
+      [],
+      { stdinIsTTY: false, stdoutIsTTY: false },
+      {
+        workspaceRoot: "/workspace",
+        createRuntime: async () => ({ deps: toolDeps, kernel })
+      }
+    );
+
+    assert.equal(lines.length, 1);
+    const parsed = JSON.parse(lines[0] ?? "{}") as {
+      kind?: string;
+      status?: string;
+      command?: string;
+      sweBench?: { action?: string; run?: { ok?: boolean; value?: JsonObject }; diagnostics?: readonly { code?: string }[] };
+    };
+    assert.equal(parsed.kind, "diagnostics.swe-bench");
+    assert.equal(parsed.status, "pass");
+    assert.equal(parsed.command, "swe-bench");
+    assert.equal(parsed.sweBench?.action, "run");
+    assert.equal(parsed.sweBench?.run?.ok, true);
+    assert.equal((parsed.sweBench?.run?.value?.evidence as JsonObject | undefined)?.tool, "swe.bench.run");
+    assert.equal(parsed.sweBench?.diagnostics?.some((entry) => entry.code === "SWE_BENCH_PREDICTION_INVALID_ACTION"), false);
+    assert.deepEqual(capturedInputs[0], {
+      taskNumber: 1,
+      execute: true,
+      dryRun: false,
+      provider: "glm",
+      model: "glm-5.2",
+      runId: "test-run",
+      workspaceRoot: "/workspace",
+      cwd: "/workspace"
+    });
+    assert.equal(lines.join("\n").includes("fake swe-bench run"), true);
+    await kernel.shutdown("cli-test-diagnostics-swe-bench-run");
+  });
+
   it("runs scriptable session commands with typed failures for unknown sessions", async () => {
     const resumeLines: string[] = [];
     await runCli(["session", "resume", "session-missing", "--output", "json"], (line: string) => {
@@ -3331,6 +3676,93 @@ describe("cli host adapter", () => {
     const fork = JSON.parse(forkLines[0] ?? "{}") as { ok?: boolean; error?: { code?: string } };
     assert.equal(fork.ok, false);
     assert.equal(fork.error?.code, "SESSION_NOT_FOUND");
+  });
+
+  it("renders a session execution board from persisted session events", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    const kernel = await createDefaultRuntimeKernel(deps);
+    const sessionId = await deps.sessions.create({ label: "board-fixture" });
+    await deps.sessions.append(cliModeSessionEvent(sessionId, 1, "agent.loop.started", {
+      status: "running",
+      caller: "cli.run",
+      redaction: { class: "internal" }
+    }));
+    await deps.sessions.append(cliModeSessionEvent(sessionId, 2, "agent.phase.plan.created", {
+      schemaVersion: AGENT_MODE_SCHEMA_VERSION,
+      planId: "agent-phase-plan:board",
+      sessionId,
+      interactionMode: "chat",
+      agentMode: "engineer",
+      phases: [{
+        schemaVersion: AGENT_MODE_SCHEMA_VERSION,
+        phase: "execute",
+        status: "required",
+        required: true,
+        mode: "executor",
+        budgets: [],
+        diagnostics: [],
+        redaction: { class: "internal" },
+        compatibility: AGENT_MODE_COMPATIBILITY
+      }, {
+        schemaVersion: AGENT_MODE_SCHEMA_VERSION,
+        phase: "verify",
+        status: "required",
+        required: true,
+        mode: "verifier",
+        budgets: [],
+        diagnostics: [],
+        redaction: { class: "internal" },
+        compatibility: AGENT_MODE_COMPATIBILITY
+      }],
+      budgets: [],
+      reason: "board fixture",
+      diagnostics: [],
+      redaction: { class: "internal" },
+      compatibility: AGENT_MODE_COMPATIBILITY
+    }));
+    await deps.sessions.append(cliModeSessionEvent(sessionId, 3, "model.tool.intent", {
+      name: "core.shell.run",
+      redaction: { class: "internal" }
+    }));
+    await deps.sessions.append(cliModeSessionEvent(sessionId, 4, "model.tool.result", {
+      terminalKind: "success",
+      redaction: { class: "internal" }
+    }));
+    await deps.sessions.append(cliModeSessionEvent(sessionId, 5, "agent.loop.completed", {
+      status: "completed",
+      traceId: "trace-board",
+      redaction: { class: "internal" }
+    }));
+
+    const jsonLines: string[] = [];
+    await runCli(["session", "board", sessionId, "--output", "json"], (line: string) => {
+      jsonLines.push(line);
+    }, [], { stdinIsTTY: false, stdoutIsTTY: false }, {
+      createRuntime: async () => ({ deps, kernel })
+    });
+    const parsed = JSON.parse(jsonLines[0] ?? "{}") as {
+      ok?: boolean;
+      value?: {
+        status?: string;
+        summary?: { totalSteps?: number; toolCallCount?: number; terminalStatus?: string };
+        steps?: readonly { sequence?: number; kind?: string; label?: string; status?: string }[];
+      };
+    };
+    assert.equal(parsed.ok, true);
+    assert.equal(parsed.value?.status, "completed");
+    assert.equal(parsed.value?.summary?.totalSteps, 5);
+    assert.equal(parsed.value?.summary?.toolCallCount, 1);
+    assert.equal(parsed.value?.summary?.terminalStatus, "completed");
+    assert.equal(parsed.value?.steps?.some((step) => step.kind === "model.tool.intent" && step.label?.includes("core.shell.run")), true);
+
+    const textLines: string[] = [];
+    await runCli(["session", "board", sessionId, "--output", "text"], (line: string) => {
+      textLines.push(line);
+    }, [], { stdinIsTTY: false, stdoutIsTTY: false }, {
+      createRuntime: async () => ({ deps, kernel })
+    });
+    assert.equal(textLines.some((line) => line.includes(`session board ${sessionId}`)), true);
+    assert.equal(textLines.some((line) => line.includes("tool core.shell.run")), true);
   });
 
   it("renders mode-aware fork-lite output with active worker inheritance policy", async () => {
@@ -3612,6 +4044,377 @@ describe("cli host adapter", () => {
     assert.equal(records.some((record) => record.kind === "diagnostics.flow.inspect.acceptance" && record.acceptance?.decision === "verify_required"), true);
     assert.equal(records.some((record) => record.kind === "diagnostics.flow.inspect.delivery" && record.delivery?.nextPhase === "proof"), true);
     assert.equal(lines.join("\n").includes("\u001b["), false);
+  });
+
+  it("renders diagnostics capability matrix dry-run as supervisor evidence plan", async () => {
+    const lines: string[] = [];
+    await runCli(["diagnostics", "capability-matrix", "run", "--dry-run", "--output", "json"], (line: string) => {
+      lines.push(line);
+    });
+
+    assert.equal(lines.length, 1);
+    const parsed = JSON.parse(lines[0] ?? "{}") as {
+      kind?: string;
+      status?: string;
+      capabilityMatrix?: {
+        dryRun?: boolean;
+        supervisorBoundary?: string;
+        tasks?: readonly { taskId?: string; toolProjection?: string; evidenceArtifacts?: readonly string[] }[];
+        runs?: readonly {
+          taskId?: string;
+          guidance?: {
+            ownerLayer: string;
+            rootCause: string;
+            recommendedAction: string;
+            rerunCondition: string;
+            evidenceGaps: readonly string[];
+            confidence: string;
+          };
+        }[];
+        aggregate?: { totalTaskCount?: number; classificationCounts?: Record<string, number> };
+      };
+    };
+    assert.equal(parsed.kind, "diagnostics.capability-matrix");
+    assert.equal(parsed.status, "warn");
+    assert.equal(parsed.capabilityMatrix?.dryRun, true);
+    assert.equal(parsed.capabilityMatrix?.supervisorBoundary, "evaluate-only-no-help");
+    assert.equal(parsed.capabilityMatrix?.tasks?.length, 8);
+    assert.equal(parsed.capabilityMatrix?.aggregate?.totalTaskCount, 8);
+    assert.equal(parsed.capabilityMatrix?.aggregate?.classificationCounts?.["partial"], 8);
+    assert.equal(JSON.stringify(parsed.capabilityMatrix).includes("src/math.ts"), false);
+    assert.equal(JSON.stringify(parsed.capabilityMatrix).includes("src/math.js"), true);
+    assert.equal(parsed.capabilityMatrix?.tasks?.some((task) => task.toolProjection === "all"), false);
+    assert.equal(parsed.capabilityMatrix?.tasks?.some((task) => task.toolProjection === "safe-all"), true);
+    for (const task of parsed.capabilityMatrix?.tasks ?? []) {
+      assert.deepEqual(task.evidenceArtifacts, ["prompt.txt", "trace.jsonl", "summary.json", "diff.patch", "classification.json"]);
+    }
+    const firstRun = parsed.capabilityMatrix?.runs?.[0];
+    assert.equal(firstRun?.guidance?.ownerLayer, "evaluation-supervisor");
+    assert.equal(firstRun.guidance.rootCause.includes("Dry-run"), true);
+    assert.equal(firstRun.guidance.recommendedAction.includes("live"), true);
+    assert.equal(firstRun.guidance.rerunCondition.includes("credentials"), true);
+    assert.deepEqual(firstRun.guidance.evidenceGaps, ["trace.jsonl", "diff.patch", "summary.json"]);
+    assert.equal(firstRun.guidance.confidence, "high");
+  });
+
+  it("classifies workflow projection gaps as CLI capability gaps", () => {
+    const classification = classifyCapabilityMatrixRun(
+      1,
+      "",
+      [
+        "WORKFLOW_CAPABILITY_PROJECTION_EMPTY: primary governed workflow declared capabilities that are not executable.",
+        '"classification":"blocked-by-cli-capability-gap"',
+        '"missingCapabilityIds":["core.file.edit","core.test.run"]'
+      ].join("\n"),
+      "",
+      { workspaceMode: "disposable-write" }
+    );
+
+    assert.equal(classification.classification, "blocked-by-cli-capability-gap");
+    assert.equal(classification.reason.includes("core.file.edit"), true);
+    assert.equal(classification.reason.includes("core.test.run"), true);
+    assert.equal(classification.guidance.ownerLayer, "tool-projection");
+    assert.equal(classification.guidance.recommendedAction.includes("Register or expose"), true);
+    assert.equal(classification.guidance.rerunCondition.includes("visible"), true);
+    assert.deepEqual(classification.guidance.evidenceGaps, ["profile id", "stage id", "visible tool ids"]);
+  });
+
+  it("distinguishes capability gap root causes in matrix classification reasons", () => {
+    const absent = classifyCapabilityMatrixRun(
+      1,
+      "",
+      [
+        "WORKFLOW_CAPABILITY_PROJECTION_EMPTY",
+        '"diagnosticKind":"absent-implementation"',
+        '"unregisteredWorkflowCapabilityIds":["core.patch.apply"]'
+      ].join("\n"),
+      "",
+      { workspaceMode: "disposable-write" }
+    );
+    const policyHidden = classifyCapabilityMatrixRun(
+      1,
+      "",
+      [
+        "WORKFLOW_CAPABILITY_PROJECTION_EMPTY",
+        '"diagnosticKind":"disabled-by-policy"',
+        '"policyHiddenCapabilityIds":["core.shell.run"]'
+      ].join("\n"),
+      "",
+      { workspaceMode: "disposable-write" }
+    );
+    const sandboxBlocked = classifyCapabilityMatrixRun(
+      1,
+      "",
+      "KERNEL_POLICY_DENIED: sandbox blocked process execution for permission process:run",
+      "",
+      { workspaceMode: "disposable-write" }
+    );
+    const projectionBug = classifyCapabilityMatrixRun(
+      1,
+      "",
+      [
+        "WORKFLOW_CAPABILITY_PROJECTION_EMPTY",
+        '"diagnosticKind":"projection-bug"',
+        '"allowedCapabilityIds":["core.file.edit"]'
+      ].join("\n"),
+      "",
+      { workspaceMode: "disposable-write" }
+    );
+
+    assert.equal(absent.classification, "blocked-by-cli-capability-gap");
+    assert.equal(absent.reason.includes("absent implementation"), true);
+    assert.equal(absent.reason.includes("core.patch.apply"), true);
+    assert.equal(policyHidden.classification, "blocked-by-cli-capability-gap");
+    assert.equal(policyHidden.reason.includes("disabled by tool projection policy"), true);
+    assert.equal(policyHidden.reason.includes("core.shell.run"), true);
+    assert.equal(sandboxBlocked.classification, "blocked-by-cli-bug");
+    assert.equal(sandboxBlocked.reason.includes("blocked by sandbox or host policy"), true);
+    assert.equal(projectionBug.classification, "blocked-by-cli-bug");
+    assert.equal(projectionBug.reason.includes("projection bug"), true);
+    assert.equal(absent.guidance.ownerLayer, "tool-implementation");
+    assert.equal(policyHidden.guidance.ownerLayer, "tool-policy");
+    assert.equal(sandboxBlocked.guidance.ownerLayer, "policy-sandbox");
+    assert.equal(projectionBug.guidance.ownerLayer, "tool-projection");
+    assert.equal(policyHidden.guidance.recommendedAction.includes("host policy"), true);
+    assert.equal(sandboxBlocked.guidance.rerunCondition.includes("sandbox"), true);
+    assert.equal(projectionBug.guidance.evidenceGaps.includes("projection compiler trace"), true);
+  });
+
+  it("does not classify credential plumbing failures as missing environment when fallback credentials are available", () => {
+    const classification = classifyCapabilityMatrixRun(
+      1,
+      JSON.stringify({
+        kind: "runtime.observability",
+        name: "credential.resolution",
+        fields: {
+          provider: "glm",
+          available: true,
+          sourceClass: "launch-workspace-env-file"
+        }
+      }),
+      "PROVIDER_CREDENTIAL_MISSING",
+      "",
+      { workspaceMode: "disposable-write" }
+    );
+
+    assert.equal(classification.classification, "blocked-by-cli-bug");
+    assert.equal(classification.guidance.ownerLayer, "credentials");
+    assert.equal(classification.guidance.rootCause.includes("resolved"), true);
+    assert.equal(classification.guidance.recommendedAction.includes("credential plumbing"), true);
+  });
+
+  it("does not treat unrelated auth substrings in successful traces as credential failures", () => {
+    const classification = classifyCapabilityMatrixRun(
+      0,
+      [
+        JSON.stringify({ kind: "context.lcm.node-recorded", data: { sourceClass: "user-prompt" } }),
+        JSON.stringify({ kind: "model.tool.intent", data: { name: "core.file.read" } }),
+        JSON.stringify({ kind: "agent.loop.completed", reason: "workflow-stages-completed", diagnostics: [{ code: "KERNEL_SCHEDULER_TIMEOUT", message: "Task cancelled: timeout" }] }),
+        "authoritative local evidence was inspected"
+      ].join("\n"),
+      "",
+      "",
+      { workspaceMode: "project-read-only" }
+    );
+
+    assert.equal(classification.classification, "partial");
+    assert.equal(classification.guidance.ownerLayer, "task-design");
+  });
+
+  it("does not classify fixture command module failures as a missing CLI entrypoint", () => {
+    const classification = classifyCapabilityMatrixRun(
+      1,
+      [
+        JSON.stringify({ kind: "agent.loop.started" }),
+        JSON.stringify({
+          kind: "capability.completed",
+          data: {
+            capabilityId: "core.shell.run",
+            output: {
+              stderr: "Error: Cannot find module '/tmp/capability-matrix/T06/workspace/missing-check.js'\ncode: 'MODULE_NOT_FOUND'"
+            }
+          }
+        })
+      ].join("\n"),
+      "",
+      "",
+      { workspaceMode: "disposable-write" }
+    );
+
+    assert.notEqual(classification.classification, "invalid-test-environment");
+    assert.notEqual(classification.guidance.ownerLayer, "test-environment");
+  });
+
+  it("does not classify post-start workspace ENOENT as a missing CLI entrypoint", () => {
+    const classification = classifyCapabilityMatrixRun(
+      0,
+      [
+        JSON.stringify({ kind: "agent.loop.started" }),
+        JSON.stringify({
+          kind: "agent.loop.completed",
+          data: {
+            reason: "workflow-stages-completed",
+            diagnostics: [{
+              code: "KERNEL_EXECUTOR_FAILED",
+              message: "ENOENT: no such file or directory, open '/Users/ankye/work/deepseek-agent-cli/.deepseek/capability-matrix/T03/workspace/readme.md'"
+            }]
+          }
+        })
+      ].join("\n"),
+      "",
+      "diff --git a/src/slug.js b/src/slug.js\n",
+      { workspaceMode: "disposable-write" }
+    );
+
+    assert.notEqual(classification.classification, "invalid-test-environment");
+    assert.notEqual(classification.guidance.ownerLayer, "test-environment");
+  });
+
+  it("does not classify allowed policy metadata as a sandbox denial", () => {
+    const classification = classifyCapabilityMatrixRun(
+      0,
+      [
+        JSON.stringify({ kind: "execution.envelope.created", data: { envelope: { capabilityId: "core.shell.run", permissions: ["process:run"] } } }),
+        JSON.stringify({ kind: "policy.decided", data: { action: "allow", reason: "Live CLI policy allows workspace-scoped process execution." } }),
+        JSON.stringify({ kind: "capability.completed", data: { capabilityId: "core.shell.run", status: "success" } })
+      ].join("\n"),
+      "",
+      "",
+      { workspaceMode: "project-read-only" }
+    );
+
+    assert.notEqual(classification.classification, "blocked-by-cli-bug");
+    assert.notEqual(classification.guidance.ownerLayer, "policy-sandbox");
+  });
+
+  it("does not classify projection evidence as a capability gap without a projection failure", () => {
+    const classification = classifyCapabilityMatrixRun(
+      0,
+      [
+        JSON.stringify({
+          kind: "prompt.assembled",
+          data: {
+            trace: {
+              sections: [{
+                provenance: {
+                  projectionLimitedWorkflowCapabilityIds: ["core.shell.run"],
+                  unregisteredWorkflowCapabilityIds: []
+                }
+              }]
+            }
+          }
+        }),
+        JSON.stringify({ kind: "agent.loop.completed", data: { reason: "workflow-stages-completed" } })
+      ].join("\n"),
+      "",
+      "",
+      { workspaceMode: "project-read-only" }
+    );
+
+    assert.notEqual(classification.classification, "blocked-by-cli-capability-gap");
+    assert.notEqual(classification.guidance.ownerLayer, "tool-projection");
+  });
+
+  it("does not classify recovered workflow required-action diagnostics as sandbox denials", () => {
+    const classification = classifyCapabilityMatrixRun(
+      0,
+      JSON.stringify({
+        kind: "agent.loop.completed",
+        data: {
+          reason: "workflow-stages-completed",
+          diagnostics: [{
+            code: "KERNEL_POLICY_DENIED",
+            message: "WORKFLOW_REQUIRED_ACTION_MISSED: model response did not request the required workflow action core.git.diff|core.file.read."
+          }]
+        }
+      }),
+      "",
+      "diff --git a/src/slug.js b/src/slug.js\n",
+      { workspaceMode: "disposable-write" }
+    );
+
+    assert.notEqual(classification.classification, "blocked-by-cli-bug");
+    assert.notEqual(classification.guidance.ownerLayer, "policy-sandbox");
+    assert.equal(classification.classification, "partial");
+  });
+
+  it("reports outcome gate evidence gaps for semantic partial matrix runs", () => {
+    const classification = classifyCapabilityMatrixRun(
+      0,
+      [
+        JSON.stringify({ kind: "prompt.assembled" }),
+        JSON.stringify({ kind: "capability.completed", data: { capabilityId: "core.file.edit", status: "success" } })
+      ].join("\n"),
+      "",
+      "diff --git a/src/slug.js b/src/slug.js\n",
+      { workspaceMode: "disposable-write" }
+    );
+
+    assert.equal(classification.classification, "partial");
+    assert.equal(classification.outcomeGate.status, "fail");
+    assert.equal(classification.outcomeGate.reasonCodes.includes("checks-failed"), true);
+    assert.equal(classification.outcomeGate.reasonCodes.includes("terminal-event-missing"), true);
+    assert.equal(classification.guidance.evidenceGaps.includes("outcome:checks-failed"), true);
+    assert.equal(classification.guidance.evidenceGaps.includes("outcome:terminal-event-missing"), true);
+  });
+
+  it("classifies terminal workflow required-action misses as model behavior", () => {
+    const classification = classifyCapabilityMatrixRun(
+      0,
+      JSON.stringify({
+        kind: "agent.loop.completed",
+        data: {
+          reason: "workflow-required-action-missed",
+          diagnostics: [{
+            code: "KERNEL_POLICY_DENIED",
+            message: "WORKFLOW_REQUIRED_ACTION_MISSED: model response did not request the required workflow action core.file.write|core.file.edit|core.patch.apply."
+          }]
+        }
+      }),
+      "",
+      "diff --git a/package.json b/package.json\n",
+      { workspaceMode: "disposable-write" }
+    );
+
+    assert.equal(classification.classification, "blocked-by-model");
+    assert.equal(classification.guidance.ownerLayer, "model-behavior");
+  });
+
+  it("passes launch workspace credential fallback env to live capability matrix child runs", async () => {
+    const platform = new CapabilityMatrixEnvRecordingPlatform();
+    await collectCapabilityMatrix({
+      dryRun: false,
+      live: true,
+      taskIds: ["T02"],
+      reportDir: "/matrix",
+      cliCommand: "deepseek-test",
+      modelProvider: "glm",
+      model: "glm-5.1",
+      platform
+    });
+
+    const childRun = platform.processRuns.find((run) => run.command === "deepseek-test" && run.args.includes("run"));
+    assert.ok(childRun);
+    assert.equal(typeof childRun.options.env?.[liveCredentialLaunchCwdEnvKey], "string");
+    assert.equal(childRun.options.env?.[liveCredentialLaunchCwdEnvKey], process.cwd());
+  });
+
+  it("resolves relative capability matrix CLI entrypoint paths from the launch workspace", async () => {
+    const platform = new CapabilityMatrixEnvRecordingPlatform();
+    await collectCapabilityMatrix({
+      dryRun: false,
+      live: true,
+      taskIds: ["T02"],
+      reportDir: "/matrix",
+      cliCommand: "node src/apps/cli/dist/index.js",
+      modelProvider: "glm",
+      model: "glm-5.1",
+      platform
+    });
+
+    const childRun = platform.processRuns.find((run) => run.command === "node" && run.args.includes("run"));
+    assert.ok(childRun);
+    assert.equal(childRun.args[0], join(process.cwd(), "src/apps/cli/dist/index.js"));
   });
 
   it("renders diagnostics release evidence in JSONL", async () => {
@@ -4013,8 +4816,16 @@ describe("cli host adapter", () => {
       summary?: {
         baselines?: readonly { baselineId?: string; status?: string }[];
         baselineAggregates?: readonly { baselineId?: string; executedRunCount?: number; deferredRunCount?: number; commandSuccessRate?: number }[];
+        codexClassGapScorecard?: {
+          externalBaselineStatus?: string;
+          dimensions?: readonly { dimensionId?: string; status?: string; score?: number }[];
+        };
         gapFindings?: readonly { code?: string }[];
         taskRuns?: readonly { outcome?: string; metrics?: { repairMetricsAvailability?: string } }[];
+      };
+      scorecard?: {
+        externalBaselineStatus?: string;
+        dimensions?: readonly { dimensionId?: string }[];
       };
       aggregate?: { baselineId?: string; executedRunCount?: number };
       finding?: { code?: string };
@@ -4028,8 +4839,12 @@ describe("cli host adapter", () => {
     assert.equal(summary?.baselineAggregates?.find((item) => item.baselineId === "deepseek-cli")?.executedRunCount, 0);
     assert.equal(summary?.baselineAggregates?.find((item) => item.baselineId === "codex")?.deferredRunCount, 9);
     assert.equal(summary?.baselineAggregates?.find((item) => item.baselineId === "codex")?.commandSuccessRate, undefined);
+    assert.equal(summary?.codexClassGapScorecard?.externalBaselineStatus, "deferred");
+    assert.equal(summary?.codexClassGapScorecard?.dimensions?.some((dimension) => dimension.dimensionId === "tool-surface"), true);
+    assert.equal(summary?.codexClassGapScorecard?.dimensions?.some((dimension) => dimension.dimensionId === "projection"), true);
     assert.equal(summary?.gapFindings?.some((finding) => finding.code === "CLI_EVALUATION_GAP_PENDING_EXECUTION"), true);
     assert.equal(records.some((record) => record.kind === "diagnostics.evaluate.baseline-aggregate" && record.aggregate?.baselineId === "deepseek-cli"), true);
+    assert.equal(records.some((record) => record.kind === "diagnostics.evaluate.codex-class-gap-scorecard" && record.scorecard?.externalBaselineStatus === "deferred"), true);
     assert.equal(records.some((record) => record.kind === "diagnostics.evaluate.gap-finding" && record.finding?.code === "CLI_EVALUATION_GAP_PENDING_EXECUTION"), true);
     assert.equal(lines.join("\n").includes("\u001b["), false);
   });
@@ -4100,6 +4915,12 @@ describe("cli host adapter", () => {
     assert.equal(webpageRun?.outcome, "solved");
     assert.equal(webpageRun?.dryRun, false);
     assert.equal(webpageRun?.checks[0]?.status, "pass");
+    assert.equal(webpageRun?.outcomeGate?.status, "pass");
+    assert.equal(webpageRun?.outcomeGate?.commandPassed, true);
+    assert.equal(webpageRun?.outcomeGate?.checksPassed, true);
+    assert.equal(webpageRun?.outcomeGate?.artifactsPresent, true);
+    assert.equal(webpageRun?.outcomeGate?.evidencePresent, true);
+    assert.equal(webpageRun?.outcomeGate?.terminalEventPresent, true);
     assert.equal(webpageRun?.metrics.firstRunSuccess, true);
     assert.equal(webpageRun?.metrics.commandRunCount, 2);
     assert.equal(webpageRun?.metrics.commandSuccessCount, 2);
@@ -4226,6 +5047,8 @@ describe("cli host adapter", () => {
     const webpageRun = summary.taskRuns.find((run) => run.task.taskId === "eval.webpage.generation");
 
     assert.equal(webpageRun?.outcome, "invalid");
+    assert.equal(webpageRun?.outcomeGate?.status, "fail");
+    assert.equal(webpageRun?.outcomeGate?.reasonCodes.includes("evidence-missing"), true);
     assert.equal(webpageRun?.checks[0]?.status, "fail");
     assert.equal(webpageRun?.metrics.evidenceManifestStatus, "missing");
     assert.equal(webpageRun?.metrics.evidenceSourceCoverageRate, 0);
@@ -4403,6 +5226,21 @@ describe("cli host adapter", () => {
       assert.equal(String(evidence.command).includes("--output json"), true);
       assert.equal(serialized.includes("fixture-glm-score-secret"), false);
     });
+  });
+
+  it("passes the reference tool arsenal gate when all reference tools are executable", () => {
+    const delivery = collectDeliveryCapabilitySummary({ taskRuns: [], packageScorecards: [] }, undefined);
+
+    assert.ok(delivery);
+    const arsenal = delivery.dimensions.find((dimension) => dimension.dimensionId === "tool-arsenal");
+    assert.ok(arsenal);
+    assert.equal(arsenal.status, "pass");
+    assert.equal(arsenal.blockingIds.some((id) => id.includes("McpAuthTool")), false);
+    assert.equal(arsenal.blockingIds.some((id) => id.includes("MCPTool")), false);
+    assert.equal(arsenal.blockingIds.some((id) => id.includes("PowerShellTool")), false);
+    assert.equal(arsenal.blockingIds.some((id) => id.includes("AskUserQuestionTool")), false);
+    assert.equal(delivery.blockingToolArsenalIds.some((id) => id.includes("McpAuthTool")), false);
+    assert.equal(delivery.toolArsenalGatePassed, true);
   });
 
   it("accepts diagnostics evaluate --live without unsupported-argument diagnostics", async () => {
@@ -4674,6 +5512,66 @@ describe("cli host adapter", () => {
     assert.equal(text.includes("\u001b["), false);
   });
 
+  it("resolves diagnostics doctor readiness through the injected workspace root", async () => {
+    await withTempCwd("deepseek-cli-doctor-injected-cwd-", async () => {
+      const workspaceRoot = await mkdtemp(join(tmpdir(), "deepseek-cli-doctor-injected-workspace-"));
+      try {
+        await mkdir(join(workspaceRoot, ".deepseek"), { recursive: true });
+        await writeFile(join(workspaceRoot, ".deepseek", "config.json"), `${JSON.stringify({
+          schemaVersion: "1.0.0",
+          profile: "default",
+          values: {
+            indexProviders: {
+              schemaVersion: "1.0.0",
+              kind: "index-provider.manifest",
+              defaultProviderId: "pageindex",
+              source: {
+                scope: "workspace",
+                sourceId: "config.indexProviders",
+                description: "Injected workspace test config.",
+                redaction: { class: "internal", fields: ["sourceId", "description"] }
+              },
+              providers: [
+                {
+                  providerId: "zvec",
+                  kind: "zvec",
+                  status: "enabled",
+                  implementationStatus: "missing",
+                  metadata: {},
+                  redaction: { class: "internal", fields: ["metadata"] }
+                }
+              ],
+              metadata: {},
+              redaction: { class: "internal", fields: ["providers.metadata", "source"] }
+            }
+          },
+          source: {
+            scope: "workspace",
+            priority: 2,
+            path: join(workspaceRoot, ".deepseek", "config.json"),
+            redaction: { class: "internal", fields: ["path"] }
+          },
+          redaction: { class: "internal", fields: ["values"] },
+          migration: { schemaVersion: "1.0.0" }
+        }, null, 2)}\n`);
+        const output: string[] = [];
+        await runCli(["diagnostics", "doctor", "--output", "json"], (line: string) => {
+          output.push(line);
+        }, undefined, undefined, { workspaceRoot });
+        const parsed = JSON.parse(output[0] ?? "{}") as {
+          indexProviders?: { source?: { scope?: string }; providers?: readonly { providerId?: string; requestedStatus?: string; status?: string }[] };
+        };
+        const zvec = parsed.indexProviders?.providers?.find((provider) => provider.providerId === "zvec");
+
+        assert.equal(parsed.indexProviders?.source?.scope, "workspace");
+        assert.equal(zvec?.requestedStatus, "enabled");
+        assert.equal(zvec?.status, "deferred");
+      } finally {
+        await rm(workspaceRoot, { recursive: true, force: true });
+      }
+    });
+  });
+
   it("writes index provider intent and previews effective downgrade", async () => {
     const lines = await withTempCwd("deepseek-cli-index-set-", async () => {
       const output: string[] = [];
@@ -4698,6 +5596,25 @@ describe("cli host adapter", () => {
     assert.equal(parsed.summary?.diagnostics?.some((diagnostic) => diagnostic.code === "INDEX_PROVIDER_UNSUPPORTED_ENABLED"), true);
   });
 
+  it("writes index provider workspace config through the injected workspace root", async () => {
+    await withTempCwd("deepseek-cli-index-injected-cwd-", async () => {
+      const workspaceRoot = await mkdtemp(join(tmpdir(), "deepseek-cli-index-injected-workspace-"));
+      try {
+        const output: string[] = [];
+        await runCli(["index-provider", "set", "zvec", "enabled", "--output", "json"], (line: string) => {
+          output.push(line);
+        }, undefined, undefined, { workspaceRoot });
+        const raw = await readFile(join(workspaceRoot, ".deepseek", "config.json"), "utf8");
+        const parsed = JSON.parse(raw) as { values?: { indexProviders?: { providers?: readonly { providerId?: string; status?: string }[] } } };
+
+        assert.equal(parsed.values?.indexProviders?.providers?.some((provider) => provider.providerId === "zvec" && provider.status === "enabled"), true);
+        await assert.rejects(stat(join(process.cwd(), ".deepseek", "config.json")));
+      } finally {
+        await rm(workspaceRoot, { recursive: true, force: true });
+      }
+    });
+  });
+
   it("rejects invalid index provider arguments before writing config", async () => {
     const lines = await withTempCwd("deepseek-cli-index-invalid-", async () => {
       const output: string[] = [];
@@ -4711,6 +5628,27 @@ describe("cli host adapter", () => {
     assert.equal(parsed.ok, false);
     assert.equal(parsed.written, undefined);
     assert.equal(parsed.diagnostics?.[0]?.code, "INDEX_PROVIDER_CLI_INVALID_ARGUMENT");
+  });
+
+  it("writes readiness init workspace config through the injected workspace root", async () => {
+    await withTempCwd("deepseek-cli-readiness-injected-cwd-", async () => {
+      const workspaceRoot = await mkdtemp(join(tmpdir(), "deepseek-cli-readiness-injected-workspace-"));
+      try {
+        const output: string[] = [];
+        await runCli(["init", "--force", "--output", "json"], (line: string) => {
+          output.push(line);
+        }, undefined, undefined, { workspaceRoot });
+        const raw = await readFile(join(workspaceRoot, ".deepseek", "config.json"), "utf8");
+        const parsed = JSON.parse(raw) as { values?: { telemetry?: string; privacy?: string; sandbox?: string } };
+
+        assert.equal(parsed.values?.telemetry, "disabled");
+        assert.equal(parsed.values?.privacy, "local");
+        assert.equal(parsed.values?.sandbox, "ask");
+        await assert.rejects(stat(join(process.cwd(), ".deepseek", "config.json")));
+      } finally {
+        await rm(workspaceRoot, { recursive: true, force: true });
+      }
+    });
   });
 
   it("renders extension list as JSONL result-list records", async () => {
@@ -5504,7 +6442,8 @@ function capabilityContext(): CapabilityExecutionContext {
 }
 
 async function registerFakeCliSweBenchRunCapability(
-  deps: Pick<ReturnType<typeof createDeterministicRuntimeDependencies>, "capabilities">
+  deps: Pick<ReturnType<typeof createDeterministicRuntimeDependencies>, "capabilities">,
+  capturedInputs: JsonObject[] = []
 ): Promise<void> {
   const definition = defineToolManifest(
     "swe.bench.run",
@@ -5514,28 +6453,55 @@ async function registerFakeCliSweBenchRunCapability(
     ["process:run", "evaluation:swe-bench"],
     objectSchema([], {
       taskNumber: { type: "number" },
+      taskNumbers: { type: "array" },
       execute: { type: "boolean" },
-      dryRun: { type: "boolean" }
+      dryRun: { type: "boolean" },
+      resume: { type: "boolean" },
+      resumeOnly: { type: "boolean" },
+      provider: { type: "string", enum: ["deepseek", "glm"] },
+      model: { type: "string" },
+      runId: { type: "string" },
+      timeoutMs: { type: "number" }
     }),
     objectSchema(["evidence"], { evidence: { type: "object" } }),
-    async (_input, context) => ({
-      ok: true,
-      value: {
-        evidence: {
-          tool: "swe.bench.run",
-          status: "completed",
-          affectedPaths: [],
-          preview: boundedText("fake swe-bench run", 4_000),
-          diagnostics: [],
-          metadata: { redaction: { class: "internal" as const } },
-          replay: replay(context),
-          redaction: { class: "internal" as const, fields: ["metadata"] }
+    async (input, context) => {
+      capturedInputs.push({ ...input });
+      return {
+        ok: true,
+        value: {
+          evidence: {
+            tool: "swe.bench.run",
+            status: "completed",
+            affectedPaths: [],
+            preview: boundedText("fake swe-bench run", 4_000),
+            diagnostics: [],
+            metadata: { redaction: { class: "internal" as const } },
+            replay: replay(context),
+            redaction: { class: "internal" as const, fields: ["metadata"] }
+          }
         }
-      }
-    }),
+      };
+    },
     { timeoutMs: 30_000, replayPolicy: { replayable: false, snapshot: "fake-cli-swe-bench-run", deterministic: true } }
   );
-  await deps.capabilities.register(definition.manifest, definition.execute);
+  await deps.capabilities.register({
+    ...definition.manifest,
+    toolFamily: {
+      schemaVersion: TOOL_FAMILY_CATALOG_SCHEMA_VERSION,
+      catalogVersion: "test-cli-fixture",
+      domainId: "git-build",
+      familyId: "benchmark.run",
+      toolId: "benchmark.run",
+      implementationState: "implemented",
+      maturity: "baseline",
+      riskClass: "process",
+      operationProfiles: ["process", "observe"],
+      hostRequirements: ["cli-host"],
+      connectorProfile: "host",
+      scorecardRubricId: "rubric.benchmark.run.baseline",
+      redaction: { class: "public" }
+    }
+  }, definition.execute);
 }
 
 function visibleToolNames(request: ModelRequest): readonly string[] {
@@ -5690,34 +6656,6 @@ class CaptureModelRequestGateway implements ModelGateway {
   }
 }
 
-class SweBenchOneShotHistoryTailGateway implements ModelGateway {
-  readonly requests: ModelRequest[] = [];
-
-  constructor(private readonly toolCallCount: number) {}
-
-  async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
-    this.requests.push(request);
-    if (this.requests.length <= this.toolCallCount) {
-      yield {
-        kind: "tool-call",
-        id: `call-swe-history-${this.requests.length}`,
-        name: "core.file.read",
-        input: { path: "README.md" }
-      };
-      yield { kind: "finish", reason: "tool-call" };
-      yield { kind: "done" };
-      return;
-    }
-    yield { kind: "delta", text: "history tail bounded" };
-    yield { kind: "finish", reason: "stop" };
-    yield { kind: "done" };
-  }
-
-  async countTokens(text: string): Promise<number> {
-    return text.trim() ? text.trim().split(/\s+/).length : 0;
-  }
-}
-
 class CliAskApprovalPolicyEngine implements PolicyEngine {
   async decide(request: PolicyRequest): Promise<PolicyDecision> {
     const trace = request.auditEvidence?.trace ?? {
@@ -5799,5 +6737,31 @@ class AllowAllPolicyEngine implements PolicyEngine {
       audit: { policy: "allow-all-test" },
       sandboxProfile: "development"
     };
+  }
+}
+
+class CapabilityMatrixEnvRecordingPlatform extends FakePlatformRuntime {
+  readonly processRuns: Array<{
+    readonly command: string;
+    readonly args: readonly string[];
+    readonly options: ProcessRunOptions;
+  }> = [];
+
+  constructor() {
+    super("fake", "/workspace");
+  }
+
+  override async runProcess(command: string, args: readonly string[], options: ProcessRunOptions = {}, observer?: ProcessRunObserver): Promise<ProcessResult> {
+    this.processRuns.push({ command, args, options });
+    if (command === "git") {
+      return { exitCode: 0, stdout: "", stderr: "" };
+    }
+    const stdout = JSON.stringify({
+      kind: "agent.loop.completed",
+      diagnostics: [{ code: "PROVIDER_CREDENTIAL_MISSING", message: "GLM Anthropic-compatible provider credential is missing." }]
+    });
+    observer?.onStdoutChunk?.(stdout);
+    observer?.onProcessExit?.();
+    return { exitCode: 0, stdout, stderr: "" };
   }
 }

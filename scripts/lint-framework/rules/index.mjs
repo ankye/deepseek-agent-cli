@@ -1,4 +1,5 @@
 import { noUngovernedGhostAliases } from "./architecture-drift.mjs";
+import { noSharedBenchmarkHardcode } from "./benchmark-boundary.mjs";
 import { platformContractsArePure, platformContractsUapiBoundary } from "./contracts.mjs";
 import { noDirectContextProjectionBypass } from "./context-projection.mjs";
 import { noPrivateExecutorChaining } from "./executor-chaining.mjs";
@@ -18,6 +19,7 @@ import { centralFileScaleGuardrail } from "./scale-guardrails.mjs";
 
 export const architectureRules = [
   noCrossPackageRelativeImports,
+  noSharedBenchmarkHardcode,
   noUngovernedGhostAliases,
   noInternalPackageSrcImports,
   noAppToAppImports,

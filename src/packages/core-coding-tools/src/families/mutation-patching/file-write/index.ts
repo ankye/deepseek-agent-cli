@@ -26,6 +26,11 @@ export function defineFileWriteTool(deps: CoreCodingToolsDependencies | undefine
 
 async function writeFileTool(input: JsonObject, context: CapabilityExecutionContext, deps: CoreCodingToolsDependencies): Promise<SerializableResult<CoreToolResult>> {
   const parsed = input as FileWriteInput;
+  if (typeof parsed.path !== "string" || typeof parsed.content !== "string" || (parsed.workspaceRoot !== undefined && typeof parsed.workspaceRoot !== "string")) {
+    return failure("file.write", "FILE_WRITE_INPUT_INVALID", "file.write requires string path and content fields.", [], {
+      receivedKeys: Object.keys(input).sort()
+    });
+  }
   const path = resolveToolPath(deps, parsed.workspaceRoot, parsed.path);
   if (!path.ok || !path.value) return failure("file.write", "PATH_REJECTED", path.error?.message ?? "Path rejected.", [String(parsed.path ?? "")]);
   const before = await deps.platform.readFile(path.value.path).catch(() => "");

@@ -41,7 +41,7 @@ import { APPROVAL_SCHEMA_VERSION, MAX_EXECUTION_TIMEOUT_MS, POLICY_GATE_SCHEMA_V
 export const SECRET_REDACTION_TOKEN = "[REDACTED:secret]";
 
 const credentialKeyPattern = /(api[_-]?key|secret|token|password|credential|auth)/i;
-const providerApiKeyPattern = /\b(?:sk|ds)-[A-Za-z0-9_-]{8,}\b|\bdeepseek-[A-Za-z0-9_-]{24,}\b/g;
+const providerApiKeyPattern = /\b(?:sk|ds)-[A-Za-z0-9_-]{8,}\b|\bdeepseek-[A-Za-z0-9_]{24,}\b/g;
 
 const secretPatterns: readonly {
   readonly kind: Exclude<SecretKind, "none" | "redaction-class">;

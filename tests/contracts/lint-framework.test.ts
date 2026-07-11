@@ -33,6 +33,7 @@ const conventions = {
         ["runtime", "@deepseek/runtime"],
         ["model-gateway", "@deepseek/model-gateway"],
         ["prompt-assembly", "@deepseek/prompt-assembly"],
+        ["core-coding-tools", "@deepseek/core-coding-tools"],
         ["credential-auth-management", "@deepseek/credential-auth-management"],
         ["cli", "deepseek-agent-cli"],
         ["vscode-extension", "@deepseek/vscode-extension"]
@@ -94,7 +95,7 @@ const conventions = {
     ]
   },
   governedExecution: {
-    approvedPackages: new Set(["runtime"]),
+    approvedPackages: new Set(["runtime", "core-coding-tools"]),
     deterministicPackages: new Set(["testing-regression"]),
     primitives: [
       {
@@ -335,11 +336,12 @@ describe("architecture lint framework", () => {
     });
   });
 
-  it("allows governed execution primitives in runtime, owner packages, and tests", async () => {
+  it("allows governed execution primitives in runtime, owner packages, model-facing core tool facades, and tests", async () => {
     await withFixture(async (root) => {
       await writeFixtureFile(root, "src/packages/runtime/src/index.ts", "export async function run(deps) { await deps.skills.activateSkill({ schemaVersion: \"1.0.0\", name: \"review\", trigger: \"explicit\", context: {} }); }\n");
       await writeFixtureFile(root, "src/packages/skill-system/src/index.ts", "export async function own(skillSystem) { await skillSystem.activateSkill({ schemaVersion: \"1.0.0\", name: \"review\", trigger: \"explicit\", context: {} }); }\n");
       await writeFixtureFile(root, "src/packages/concurrency-orchestration/src/index.ts", "export async function ownScheduler(scheduler) { await scheduler.run({ id: \"task\", name: \"work\" }, async () => undefined); }\n");
+      await writeFixtureFile(root, "src/packages/core-coding-tools/src/index.ts", "export async function facade(deps) { await deps.mcp.callTool({ schemaVersion: \"1.0.0\", serverId: \"mcp\", name: \"fake\", caller: \"model\", input: {} }); await deps.scheduler.run({ id: \"task\", name: \"work\" }, async () => undefined); }\n");
       await writeFixtureFile(root, "src/apps/cli/test/cli.test.ts", "export async function test(deps) { await deps.mcp.listTools({ schemaVersion: \"1.0.0\", namespace: \"fake\" }); }\n");
 
       const result = spawnSync(process.execPath, ["--input-type=module", "--eval", lintScript(root)], { encoding: "utf8" });
@@ -456,6 +458,34 @@ describe("architecture lint framework", () => {
       assert.equal(result.status, 2, result.stderr || result.stdout);
       const ruleIds = new Set(JSON.parse(result.stdout) as string[]);
       assert.equal(ruleIds.has("runtime/kernel-boundary-imports"), true);
+    });
+  });
+
+  it("rejects benchmark-specific hardcode in shared runtime and platform packages", async () => {
+    await withFixture(async (root) => {
+      await writeFixtureFile(
+        root,
+        "src/packages/runtime/src/agent-loop.ts",
+        [
+          "const SWE_BENCH_REQUEST_BUDGET_GATE = 'forbidden';",
+          "export function createSweBenchVerificationGateState() { return SWE_BENCH_REQUEST_BUDGET_GATE; }"
+        ].join("\n")
+      );
+      await writeFixtureFile(
+        root,
+        "src/packages/platform-contracts/src/runtime.ts",
+        "export const scorerTerminalReason = 'swe-bench-ready-for-harness';\n"
+      );
+      await writeFixtureFile(
+        root,
+        "src/apps/cli/src/diagnostics/swe-bench-prediction.ts",
+        "export const allowedHostDiagnostic = 'SWE_BENCH_HOST_DIAGNOSTIC';\n"
+      );
+
+      const result = spawnSync(process.execPath, ["--input-type=module", "--eval", lintScript(root)], { encoding: "utf8" });
+      assert.equal(result.status, 2, result.stderr || result.stdout);
+      const ruleIds = new Set(JSON.parse(result.stdout) as string[]);
+      assert.equal(ruleIds.has("benchmark/no-shared-runtime-hardcode"), true);
     });
   });
 

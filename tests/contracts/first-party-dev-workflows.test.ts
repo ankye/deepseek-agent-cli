@@ -78,6 +78,18 @@ describe("first-party developer workflow command adapters", () => {
     assert.equal(references.referenceTargets[0]?.path, "/workspace/docs/guide.md");
   });
 
+  it("resolves relative file previews against the workspace root before reading", async () => {
+    const platform = new RecordingPlatform();
+    await platform.writeFile("src/index.ts", "export const wrongRoot = true;\n");
+    await platform.writeFile("/workspace/src/index.ts", "export const workspaceRoot = true;\n");
+
+    const preview = await resolveFileManager(platform, "/workspace", "preview", "src/index.ts");
+
+    assert.equal(preview.status, "completed");
+    assert.equal(preview.data.path, "/workspace/src/index.ts");
+    assert.equal(preview.resultList?.items[0]?.target.metadata?.preview, "export const workspaceRoot = true;");
+  });
+
   it("returns jump navigator file/text/symbol result lists through workspace boundaries", async () => {
     const platform = new RecordingPlatform();
     await platform.writeFile("/workspace/src/index.ts", "export const needle = true;\n");

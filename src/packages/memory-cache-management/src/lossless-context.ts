@@ -245,13 +245,11 @@ export class PersistentJsonlLosslessContextManager extends InMemoryLosslessConte
 
   protected override async persistRecord(node: LosslessContextNode, edges: readonly LosslessContextEdge[]): Promise<void> {
     await this.platform.ensureDirectory(this.root);
-    const existing = await this.platform.readFile(this.logPath).catch(() => "");
     const lines = [
       JSON.stringify({ schemaVersion: LOSSLESS_CONTEXT_SCHEMA_VERSION, recordType: "node", node } satisfies LosslessContextJsonlRecord),
       ...edges.map((edge) => JSON.stringify({ schemaVersion: LOSSLESS_CONTEXT_SCHEMA_VERSION, recordType: "edge", edge } satisfies LosslessContextJsonlRecord))
     ].join("\n");
-    const written = await this.platform.atomicWriteFile(this.logPath, `${existing}${lines}\n`);
-    if (!written.ok) throw new Error(written.error?.message ?? "Lossless context atomic write failed.");
+    await this.platform.appendFile(this.logPath, `${lines}\n`);
   }
 
   private async ensureHydrated(): Promise<void> {

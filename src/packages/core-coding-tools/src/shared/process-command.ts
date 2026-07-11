@@ -6,14 +6,14 @@ export interface ShellInvocation {
   readonly args: readonly string[];
   readonly shellSyntax: boolean;
   readonly shellProfile?: ShellProfile;
-  readonly sweLiteVenvBound?: boolean;
+  readonly managedCheckoutVenvBound?: boolean;
 }
 
 export type ShellInvocationResult =
   | { readonly ok: true; readonly value: ShellInvocation }
   | { readonly ok: false; readonly code: string; readonly message: string };
 
-const SWE_LITE_CHECKOUT_SLOW_PROCESS_TIMEOUT_MS = 600_000;
+const MANAGED_CHECKOUT_SLOW_PROCESS_TIMEOUT_MS = 600_000;
 
 export async function resolveShellInvocation(
   deps: Pick<CoreCodingToolsDependencies, "platform">,
@@ -52,11 +52,11 @@ export async function resolveShellInvocation(
   };
 }
 
-export function currentSweLiteCheckoutRoot(cwd: string, workspaceRoot: string): string | undefined {
-  return sweLiteCheckoutRootFromPath(cwd) ?? sweLiteCheckoutRootFromPath(workspaceRoot);
+export function currentManagedCheckoutRoot(cwd: string, workspaceRoot: string): string | undefined {
+  return managedCheckoutRootFromPath(cwd) ?? managedCheckoutRootFromPath(workspaceRoot);
 }
 
-export function bindSweLiteCheckoutVirtualEnv(invocation: ShellInvocation, checkoutRoot: string): ShellInvocation {
+export function bindManagedCheckoutVirtualEnv(invocation: ShellInvocation, checkoutRoot: string): ShellInvocation {
   const venvBin = `${checkoutRoot}/.venv/bin`;
   if (invocation.shellSyntax) {
     const args = [...invocation.args];
@@ -64,25 +64,25 @@ export function bindSweLiteCheckoutVirtualEnv(invocation: ShellInvocation, check
     return {
       ...invocation,
       args: [...args, bindPathAfterShellPrelude(shellCommand, venvBin, checkoutRoot)],
-      sweLiteVenvBound: true
+      managedCheckoutVenvBound: true
     };
   }
-  const executable = sweLiteCheckoutVirtualEnvExecutable(invocation.command, checkoutRoot);
+  const executable = managedCheckoutVirtualEnvExecutable(invocation.command, checkoutRoot);
   if (!executable) return invocation;
   if (executable.kind === "pip") {
     return {
       ...invocation,
       command: `${checkoutRoot}/.venv/bin/python`,
       args: ["-m", "pip", ...invocation.args],
-      sweLiteVenvBound: true
+      managedCheckoutVenvBound: true
     };
   }
-  return { ...invocation, command: `${checkoutRoot}/.venv/bin/${executable.name}`, sweLiteVenvBound: true };
+  return { ...invocation, command: `${checkoutRoot}/.venv/bin/${executable.name}`, managedCheckoutVenvBound: true };
 }
 
-export function defaultSweLiteCheckoutProcessTimeoutMs(command: string, args: readonly string[], currentCheckoutRoot?: string): number {
-  if (currentCheckoutRoot && isSweLiteCheckoutSlowCommand(command, args)) {
-    return SWE_LITE_CHECKOUT_SLOW_PROCESS_TIMEOUT_MS;
+export function defaultManagedCheckoutProcessTimeoutMs(command: string, args: readonly string[], currentCheckoutRoot?: string): number {
+  if (currentCheckoutRoot && isManagedCheckoutSlowCommand(command, args)) {
+    return MANAGED_CHECKOUT_SLOW_PROCESS_TIMEOUT_MS;
   }
   return 30_000;
 }
@@ -131,13 +131,15 @@ function isPythonTestLauncherModule(moduleName: string): boolean {
 }
 
 export function isStandardTestCommand(command: string, args: readonly string[] = []): boolean {
-  return commandSegments(command, args).some((segment) =>
-    isPythonTestSegment(segment)
-    || isJavaScriptTestSegment(segment)
-    || isGoTestSegment(segment)
-    || isRustTestSegment(segment)
-    || isJavaTestSegment(segment)
-  );
+  let hasTestSegment = false;
+  for (const segment of commandSegments(command, args)) {
+    if (isStandardTestCommandSegment(segment)) {
+      hasTestSegment = true;
+      continue;
+    }
+    if (!isBenignTestCommandCompanionSegment(segment)) return false;
+  }
+  return hasTestSegment;
 }
 
 export function isPythonTestLikeCommand(command: string, args: readonly string[]): boolean {
@@ -150,6 +152,21 @@ function commandSegments(command: string, args: readonly string[]): readonly str
     .split(/&&|\|\||[;|]/)
     .map(normalizeCommandSegment)
     .filter((segment) => segment.length > 0);
+}
+
+function isStandardTestCommandSegment(segment: string): boolean {
+  return isPythonTestSegment(segment)
+    || isJavaScriptTestSegment(segment)
+    || isGoTestSegment(segment)
+    || isRustTestSegment(segment)
+    || isJavaTestSegment(segment);
+}
+
+function isBenignTestCommandCompanionSegment(segment: string): boolean {
+  return /^(?:cd|pushd|popd)(?:\s|$)/.test(segment) ||
+    /^(?:head|tail)(?:\s|$)/.test(segment) ||
+    /^(?:grep|egrep|fgrep)(?:\s|$)/.test(segment) ||
+    /^(?:select-object)(?:\s|$)/.test(segment);
 }
 
 function shellPayloadText(command: string, args: readonly string[]): string {
@@ -479,14 +496,14 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
-function sweLiteCheckoutRootFromPath(path: string): string | undefined {
+function managedCheckoutRootFromPath(path: string): string | undefined {
   const normalized = path.replace(/\\/g, "/").replace(/\/+/g, "/").replace(/\/$/, "");
-  const match = /(?:^|\/)\.deepseek\/swe-lite-runs\/[^/]+\/repo(?:\/|$)/.exec(normalized);
+  const match = /(?:^|\/)\.deepseek\/[^/]+\/[^/]+\/repo(?:\/|$)/.exec(normalized);
   if (!match) return undefined;
   return normalized.slice(0, match.index + match[0].length).replace(/\/$/, "");
 }
 
-function sweLiteCheckoutVirtualEnvExecutable(command: string, checkoutRoot: string): { readonly kind: "pip" | "python"; readonly name: string } | undefined {
+function managedCheckoutVirtualEnvExecutable(command: string, checkoutRoot: string): { readonly kind: "pip" | "python"; readonly name: string } | undefined {
   const normalized = command.replace(/\\/g, "/");
   const name = normalized.slice(normalized.lastIndexOf("/") + 1).toLowerCase();
   if (/^(?:pip|pip3|pip3\.\d+)$/.test(name)) return { kind: "pip", name };
@@ -497,14 +514,14 @@ function sweLiteCheckoutVirtualEnvExecutable(command: string, checkoutRoot: stri
 function bindPathAfterShellPrelude(command: string, venvBin: string, checkoutRoot: string): string {
   const pathBinding = `PATH=${shellQuote(venvBin)}:$PATH; export PATH;`;
   const pipefailPrelude = "set -o pipefail;";
-  const rewrittenCommand = rewritePipInstallCommands(rewriteSweLiteCheckoutAliases(command, checkoutRoot));
+  const rewrittenCommand = rewritePipInstallCommands(rewriteManagedCheckoutAliases(command, checkoutRoot));
   if (command.startsWith(pipefailPrelude)) {
-    return `${pipefailPrelude} ${pathBinding} ${rewritePipInstallCommands(rewriteSweLiteCheckoutAliases(command.slice(pipefailPrelude.length).trimStart(), checkoutRoot))}`;
+    return `${pipefailPrelude} ${pathBinding} ${rewritePipInstallCommands(rewriteManagedCheckoutAliases(command.slice(pipefailPrelude.length).trimStart(), checkoutRoot))}`;
   }
   return `${pathBinding} ${rewrittenCommand}`;
 }
 
-function rewriteSweLiteCheckoutAliases(command: string, checkoutRoot: string): string {
+function rewriteManagedCheckoutAliases(command: string, checkoutRoot: string): string {
   return command.replace(/\/home\/user(?=\/|\s|$|[;&|])/g, shellQuote(checkoutRoot));
 }
 
@@ -520,7 +537,7 @@ function rewritePipInstallCommands(command: string): string {
   );
 }
 
-function isSweLiteCheckoutSlowCommand(command: string, args: readonly string[]): boolean {
+function isManagedCheckoutSlowCommand(command: string, args: readonly string[]): boolean {
   const shellText = [command, ...args].join(" ").toLowerCase();
   return (
     isPipInstallCommand(shellText) ||

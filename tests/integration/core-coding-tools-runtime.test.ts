@@ -55,7 +55,7 @@ describe("core coding tools runtime integration", () => {
     assert.deepEqual(testPolicy?.metadata.args, ["test"]);
     assert.equal(testPolicy?.metadata.cwd, workspaceRoot);
     assert.equal(testPolicy?.metadata.workspaceRoot, workspaceRoot);
-    assert.deepEqual(testPolicy?.metadata.resourceLocks, [`process:${workspaceRoot}`]);
+    assert.deepEqual(testPolicy?.metadata.resourceLocks, ["process:."]);
     await kernel.shutdown();
   });
 
@@ -78,6 +78,77 @@ describe("core coding tools runtime integration", () => {
     assert.equal(events.some((event) => event.kind === "execution.rejected" && event.error?.code === "KERNEL_POLICY_DENIED"), true);
     assert.equal(events.some((event) => event.kind === "scheduler.queued"), false);
     assert.equal(schedulerCalls, 0);
+    await kernel.shutdown();
+  });
+
+  it("infers patch apply resource locks from unified diff targets", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    const policyRequests: PolicyRequest[] = [];
+    deps.policy.decide = async (request) => {
+      policyRequests.push(request);
+      return { action: "allow", reason: "integration allows patch", audit: { policy: "integration" }, sandboxProfile: "development" };
+    };
+    await deps.platform.writeFile(`${workspaceRoot}/README.md`, "hello patch\n");
+    await registerDeterministicCoreTools(deps, workspaceRoot);
+    const kernel = await createDefaultRuntimeKernel(deps);
+    const events = await collectRuntimeEvents(kernel.execute({
+      capabilityId: coreToolIds.patchApply,
+      caller: "integration",
+      input: {
+        workspaceRoot,
+        patch: "--- a/README.md\n+++ b/README.md\n@@ -1,1 +1,1 @@\n-hello patch\n+hello governed patch\n"
+      }
+    }));
+
+    assert.equal(events.some((event) => event.kind === "capability.completed"), true);
+    const patchPolicy = policyRequests.find((request) => request.resource === String(coreToolIds.patchApply));
+    assert.deepEqual(patchPolicy?.metadata.resourceLocks, ["workspace:README.md"]);
+    await kernel.shutdown();
+  });
+
+  it("uses a workspace-wide lock for write tools without a known target path", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    const policyRequests: PolicyRequest[] = [];
+    deps.policy.decide = async (request) => {
+      policyRequests.push(request);
+      return { action: "allow", reason: "integration allows revert", audit: { policy: "integration" }, sandboxProfile: "development" };
+    };
+    await registerDeterministicCoreTools(deps, workspaceRoot);
+    const kernel = await createDefaultRuntimeKernel(deps);
+    await collectRuntimeEvents(kernel.execute({
+      capabilityId: coreToolIds.revertUndo,
+      caller: "integration",
+      input: { workspaceRoot }
+    }));
+
+    const revertPolicy = policyRequests.find((request) => request.resource === String(coreToolIds.revertUndo));
+    assert.deepEqual(revertPolicy?.metadata.resourceLocks, ["workspace:."]);
+    await kernel.shutdown();
+  });
+
+  it("uses the session workspace root when process tools omit cwd and workspaceRoot", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    const policyRequests: PolicyRequest[] = [];
+    const policy = new DefaultPolicyEngine();
+    deps.policy.decide = async (request) => {
+      policyRequests.push(request);
+      return policy.decide(request);
+    };
+    await registerDeterministicCoreTools(deps, workspaceRoot);
+    const sessionId = await deps.sessions.create({ caller: "integration", workspaceRoot });
+    const kernel = await createDefaultRuntimeKernel(deps);
+    const events = await collectRuntimeEvents(kernel.execute({
+      capabilityId: coreToolIds.testRun,
+      caller: "integration",
+      sessionId,
+      input: { command: "npm", args: ["test"], intent: "session-default-root" }
+    }));
+
+    assert.equal(events.some((event) => event.kind === "capability.completed"), true);
+    const testPolicy = policyRequests.find((request) => request.resource === String(coreToolIds.testRun));
+    assert.equal(testPolicy?.metadata.cwd, workspaceRoot);
+    assert.equal(testPolicy?.metadata.workspaceRoot, workspaceRoot);
+    assert.deepEqual(testPolicy?.metadata.resourceLocks, ["process:."]);
     await kernel.shutdown();
   });
 });

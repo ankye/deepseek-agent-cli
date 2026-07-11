@@ -48,7 +48,7 @@ describe("output contract runtime verification", () => {
     assert.equal(gateway.requests[0]?.prompt.includes("Task output contract:"), true);
     assert.equal(gateway.requests[0]?.output?.format, "json_object");
     assert.equal(gateway.requests[0]?.output?.strict, true);
-    assert.equal(gateway.requests[1]?.messages?.some((message) => message.role === "tool" && message.toolName === "agent.self-repair"), true);
+    assert.equal(hasSelfRepairFeedback(gateway.requests[1]), true);
     await kernel.shutdown();
   });
 
@@ -163,4 +163,11 @@ class StaticTextGateway implements ModelGateway {
   async countTokens(text: string): Promise<number> {
     return text.trim() ? text.trim().split(/\s+/).length : 0;
   }
+}
+
+function hasSelfRepairFeedback(request: ModelRequest | undefined): boolean {
+  return request?.messages?.some((message) =>
+    (message.role === "tool" && message.toolName === "agent.self-repair") ||
+    (message.role === "system" && message.content.includes("Self-repair failure evidence"))
+  ) ?? false;
 }

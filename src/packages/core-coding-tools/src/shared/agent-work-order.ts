@@ -57,7 +57,7 @@ export function synthesizeAgentWorkOrder(parsed: AgentSpawnRequest, context: Cap
 }
 
 function allowedToolsFor(toolProjection: NonNullable<AgentSpawnRequest["toolProjection"]>): readonly string[] {
-  if (toolProjection === "all") return ["*"];
+  if (toolProjection === "safe-all" || toolProjection === "all") return ["*"];
   if (toolProjection === "read-write") return ["file.read", "file.list", "search.text", "git.status", "git.diff", "file.edit", "file.write", "test.run"];
   return ["file.read", "file.list", "search.text", "git.status", "git.diff"];
 }

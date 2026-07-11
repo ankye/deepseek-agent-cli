@@ -82,6 +82,17 @@
 - [x] Surface a deterministic stable task-intent contract between profile selection and dynamic workflow state.
 - [x] Add ready-stage primary next-action guidance so produce/repair stages stop treating read/search/list-only exploration as completion progress.
 - [x] Normalize accidental model-supplied `dryRun: true` away from live SWE-bench completion prompts while preserving explicit dry-run, preview, review-only, and resume-only requests.
+- [x] Add path-segment resource lock governance so directory/child workspace writes serialize or fail closed while sibling file writes remain independent.
+- [x] Infer workspace resource locks from unified patch target paths so patch.apply cannot race file edit/write on the same target.
+- [x] Use a workspace-root resource lock for write capabilities whose target path is unknown before execution.
+- [x] Treat process cwd locks as conflicting with overlapping workspace mutation locks so tests and shell commands cannot race active file writes.
+- [x] Preserve non-path resource lock keys literally so session, agent, provider, MCP, hook, and remote locks are not path-normalized into false conflicts.
+- [x] Apply session workspaceRoot defaults to runtime envelope lock inference, policy metadata, and executor input when model tool calls omit cwd/workspaceRoot.
+- [x] Apply pipeline workspaceRoot defaults to step lock inference, preflight, policy metadata, and executor input when pipeline steps omit cwd/workspaceRoot.
+- [x] Coalesce overlapping locks within one execution so a directory/file or process/workspace self-overlap cannot deadlock its own scheduler chain.
+- [x] Treat same-path process cwd and workspace mutation locks as conflicting, not only ancestor/descendant pairs.
+- [x] Let CLI host/custom runtime invocations declare the effective workspaceRoot so session defaults and governed tool execution do not drift back to `process.cwd()`.
+- [x] Bind tool intent preflight workspace path normalization to the platform resolver while preserving stable specific diagnostics for parent traversal, null bytes, home paths, and drive-relative paths.
 - [x] Start implementation only after the above specification tasks are complete; each production change must begin with a failing regression test.
 - [x] Revalidate this OpenSpec change after the summary recovery, progress ledger, stale cache refresh, and test-evidence binding scenarios.
 - [x] Revalidate canonical specs after the same update.
@@ -172,6 +183,17 @@
 - [x] 在 profile selection 与动态 workflow state 之间暴露确定性的稳定 task-intent contract。
 - [x] 增加 ready-stage 主下一步提示，避免 produce/repair 阶段继续把 read/search/list-only exploration 当作完成进展。
 - [x] 对 live SWE-bench 完成类 prompt，规范化模型误传的 `dryRun: true`，同时保留用户明确要求的 dry-run、预览、review-only 与 resume-only 行为。
+- [x] 增加按路径段判定的 resource lock 治理，使目录/子文件 workspace 写入串行或 fail closed，同时保持兄弟文件写入独立。
+- [x] 从 unified patch target paths 推导 workspace resource locks，避免 patch.apply 与同目标 file edit/write 并发竞争。
+- [x] 对执行前目标路径未知的写能力使用 workspace-root resource lock。
+- [x] 将 process cwd lock 与重叠的 workspace mutation lock 视为冲突，避免测试和 shell command 与正在进行的文件写入竞态。
+- [x] 保持非路径 resource lock key 的字面值，避免 session、agent、provider、MCP、hook、remote locks 被路径规范化后产生误冲突。
+- [x] 当模型工具调用省略 cwd/workspaceRoot 时，将 session workspaceRoot 默认值应用到 runtime envelope lock 推导、policy metadata 和 executor input。
+- [x] 当 pipeline step 省略 cwd/workspaceRoot 时，将 pipeline workspaceRoot 默认值应用到 step lock 推导、preflight、policy metadata 和 executor input。
+- [x] 合并同一次执行内部的重叠 locks，避免目录/文件或 process/workspace 自重叠导致自身 scheduler chain 死锁。
+- [x] 将同一路径的 process cwd 与 workspace mutation locks 视为冲突，而不只处理父子路径关系。
+- [x] 允许 CLI host/custom runtime 调用声明有效 workspaceRoot，避免 session 默认值与受管工具执行漂移回 `process.cwd()`。
+- [x] 将 tool intent preflight workspace path normalization 绑定到平台 resolver，同时保留 parent traversal、null byte、home path、drive-relative path 等稳定具体诊断。
 - [x] 只有上述规范任务完成后才开始实现；每个生产改动都必须先写失败回归测试。
 - [x] 在 summary recovery、progress ledger、stale cache refresh 与 test-evidence binding 场景更新后，重新校验本 OpenSpec change。
 - [x] 在同一更新后，重新校验 canonical specs。

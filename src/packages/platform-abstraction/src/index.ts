@@ -1,6 +1,7 @@
-import { mkdir, mkdtemp, readFile as fsReadFile, rename, rm, stat as stat_, writeFile as fsWriteFile, readdir } from "node:fs/promises";
+import { appendFile as fsAppendFile, cp, mkdir, mkdtemp, readFile as fsReadFile, rename, rm, stat as stat_, writeFile as fsWriteFile, readdir } from "node:fs/promises";
+import { readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join, normalize, resolve } from "node:path";
+import { dirname, isAbsolute, join, normalize, posix, resolve, win32 } from "node:path";
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import type {
@@ -19,6 +20,7 @@ import type {
   PlatformRuntime,
   PlatformResolvedPath,
   ProcessProviderDescriptor,
+  ProcessRunControl,
   ProcessRunObserver,
   ProcessResult,
   ProcessRunOptions,
@@ -202,20 +204,23 @@ export class NodePlatformRuntime implements PlatformRuntime {
         error: platformError("PLATFORM_PATH_REJECTED", "Workspace path contains unsupported home, drive-relative, null-byte, UNC, glob, shell-expansion, or trailing dot/space syntax.", { inputPath })
       };
     }
-    const root = resolve(workspaceRoot);
-    const target = isAbsolute(inputPath) ? resolve(inputPath) : resolve(root, inputPath);
-    if (!isPathInside(root, target)) {
+    const pathApi = workspacePathApi(this.os);
+    const root = pathApi.resolve(workspaceRoot);
+    const target = pathApi.isAbsolute(inputPath) ? pathApi.resolve(inputPath) : pathApi.resolve(root, inputPath);
+    const filesystem = filesystemSemantics(this.os);
+    if (!isPathInside(root, target, filesystem.caseSensitive, pathApi)) {
       return {
         ok: false,
         error: platformError("PLATFORM_PATH_OUTSIDE_ROOT", "Workspace path resolved outside the governed root.", { workspaceRoot: root })
       };
     }
+    const relativePath = relativePathInside(root, target, filesystem.caseSensitive, pathApi);
     return {
       ok: true,
       value: {
         path: target,
         root,
-        relativePath: normalize(target.slice(root.length).replace(/^[/\\]/, "")),
+        relativePath,
         safe: true,
         diagnostics: [],
         redaction: { class: "internal", fields: ["path", "root", "relativePath"] }
@@ -402,6 +407,48 @@ export class NodePlatformRuntime implements PlatformRuntime {
     await fsWriteFile(path, content, "utf8");
   }
 
+  async appendFile(path: string, content: string): Promise<void> {
+    if (this.readOnlyFilesystem) throw new Error("FILESYSTEM_READ_ONLY");
+    await mkdir(dirname(path), { recursive: true });
+    await fsAppendFile(path, content, "utf8");
+  }
+
+  async statPath(path: string) {
+    const stat = await stat_(path);
+    return {
+      path: resolve(path),
+      kind: stat.isFile() ? "file" as const : stat.isDirectory() ? "directory" as const : "other" as const,
+      sizeBytes: stat.size,
+      mtimeMs: stat.mtimeMs
+    };
+  }
+
+  async copyPath(sourcePath: string, targetPath: string, options: { readonly overwrite?: boolean; readonly recursive?: boolean } = {}): Promise<void> {
+    if (this.readOnlyFilesystem) throw new Error("FILESYSTEM_READ_ONLY");
+    const sourceStat = await stat_(sourcePath);
+    if (sourceStat.isDirectory() && options.recursive !== true) throw new Error("COPY_RECURSIVE_REQUIRED");
+    await mkdir(dirname(targetPath), { recursive: true });
+    await cp(sourcePath, targetPath, {
+      recursive: sourceStat.isDirectory(),
+      errorOnExist: options.overwrite !== true,
+      force: options.overwrite === true
+    });
+  }
+
+  async movePath(sourcePath: string, targetPath: string, options: { readonly overwrite?: boolean } = {}): Promise<void> {
+    if (this.readOnlyFilesystem) throw new Error("FILESYSTEM_READ_ONLY");
+    await mkdir(dirname(targetPath), { recursive: true });
+    if (options.overwrite === true) await rm(targetPath, { recursive: true, force: true });
+    await rename(sourcePath, targetPath);
+  }
+
+  async deletePath(path: string, options: { readonly recursive?: boolean } = {}): Promise<void> {
+    if (this.readOnlyFilesystem) throw new Error("FILESYSTEM_READ_ONLY");
+    const targetStat = await stat_(path);
+    if (targetStat.isDirectory() && options.recursive !== true) throw new Error("DELETE_RECURSIVE_REQUIRED");
+    await rm(path, { recursive: targetStat.isDirectory(), force: false });
+  }
+
   async findFiles(pattern: string, root: string): Promise<readonly string[]> {
     const files: string[] = [];
     await walk(root, files);
@@ -434,7 +481,7 @@ export class NodePlatformRuntime implements PlatformRuntime {
     return results;
   }
 
-  async runProcess(command: string, args: readonly string[], options: ProcessRunOptions = {}, observer?: ProcessRunObserver): Promise<ProcessResult> {
+  async runProcess(command: string, args: readonly string[], options: ProcessRunOptions = {}, observer?: ProcessRunObserver, control?: ProcessRunControl): Promise<ProcessResult> {
     const processProvider = await this.resolveProcessProvider();
     if (!processProvider.available) {
       return {
@@ -474,15 +521,27 @@ export class NodePlatformRuntime implements PlatformRuntime {
       let settled = false;
       let stdoutTruncated = false;
       let stderrTruncated = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
       if (stdinMode === "pipe") child.stdin?.end();
       const finish = (result: ProcessResult) => {
         if (settled) return;
         settled = true;
         if (timer) clearTimeout(timer);
+        control?.signal?.removeEventListener("abort", onAbort);
         observer?.onProcessExit?.();
         resolvePromise(result);
       };
-      const timer = timeoutMs
+      const onAbort = () => {
+        stderr += `${stderr ? "\n" : ""}Process aborted by caller.`;
+        killProcessTree(child, "SIGKILL");
+        finish({ exitCode: 130, stdout, stderr, metadata: providerMetadata("argv", "degraded", [], "PROCESS_ABORTED", [diagnostic("PROCESS_ABORTED", "error", "Process aborted by caller."), ...profileDiagnostics], timeoutMs) });
+      };
+      if (control?.signal?.aborted) {
+        onAbort();
+        return;
+      }
+      control?.signal?.addEventListener("abort", onAbort, { once: true });
+      timer = timeoutMs
         ? setTimeout(() => {
           stderr += `${stderr ? "\n" : ""}Process timed out after ${timeoutMs}ms.`;
           killProcessTree(child, "SIGKILL");
@@ -556,8 +615,8 @@ export class NodePlatformRuntime implements PlatformRuntime {
   }
 
   async statFile(path: string): Promise<{ mtimeMs: number; size: number }> {
-    const stat = await stat_(path);
-    return { mtimeMs: stat.mtimeMs, size: stat.size };
+    const stat = await this.statPath(path);
+    return { mtimeMs: stat.mtimeMs, size: stat.sizeBytes };
   }
 
   async httpFetch(url: string, options: {
@@ -693,18 +752,20 @@ export class FakePlatformRuntime extends NodePlatformRuntime {
     }
     const root = normalizeVirtualPath(isVirtualAbsolutePath(workspaceRoot) ? workspaceRoot : `${this.fakeRoot}/${workspaceRoot}`);
     const target = normalizeVirtualPath(isVirtualAbsolutePath(inputPath) ? inputPath : `${root}/${inputPath}`);
-    if (!isVirtualPathInside(root, target)) {
+    const filesystem = filesystemSemantics(this.os);
+    if (!isVirtualPathInside(root, target, filesystem.caseSensitive)) {
       return {
         ok: false,
         error: platformError("PLATFORM_PATH_OUTSIDE_ROOT", "Workspace path resolved outside the governed root.", { workspaceRoot: root })
       };
     }
+    const relativePath = virtualRelativePathInside(root, target, filesystem.caseSensitive);
     return {
       ok: true,
       value: {
         path: target,
         root,
-        relativePath: target === root ? "" : target.slice(root.length).replace(/^\//, ""),
+        relativePath,
         safe: true,
         diagnostics: [],
         redaction: { class: "internal", fields: ["path", "root", "relativePath"] }
@@ -813,6 +874,76 @@ export class FakePlatformRuntime extends NodePlatformRuntime {
     this.files.set(normalizeVirtualPath(path), content);
   }
 
+  override async appendFile(path: string, content: string): Promise<void> {
+    if (this.fakeOptions.readOnlyFilesystem) throw new Error("FILESYSTEM_READ_ONLY");
+    const normalized = normalizeVirtualPath(path);
+    this.files.set(normalized, `${this.files.get(normalized) ?? ""}${content}`);
+  }
+
+  override async statPath(path: string) {
+    const normalized = normalizeVirtualPath(path);
+    const content = this.files.get(normalized);
+    if (content !== undefined) {
+      return {
+        path: normalized,
+        kind: "file" as const,
+        sizeBytes: Buffer.byteLength(content, "utf8"),
+        mtimeMs: 0
+      };
+    }
+    if ([...this.files.keys()].some((candidate) => candidate.startsWith(`${normalized}/`))) {
+      return {
+        path: normalized,
+        kind: "directory" as const,
+        sizeBytes: 0,
+        mtimeMs: 0
+      };
+    }
+    throw new Error(`Fake path not found: ${normalized}`);
+  }
+
+  override async copyPath(sourcePath: string, targetPath: string, options: { readonly overwrite?: boolean; readonly recursive?: boolean } = {}): Promise<void> {
+    if (this.fakeOptions.readOnlyFilesystem) throw new Error("FILESYSTEM_READ_ONLY");
+    const source = normalizeVirtualPath(sourcePath);
+    const target = normalizeVirtualPath(targetPath);
+    const content = this.files.get(source);
+    if (content !== undefined) {
+      if (options.overwrite !== true && this.pathExists(target)) throw new Error("TARGET_EXISTS");
+      this.files.set(target, content);
+      return;
+    }
+    const sourcePrefix = `${source}/`;
+    const entries = [...this.files.entries()].filter(([path]) => path.startsWith(sourcePrefix));
+    if (entries.length === 0) throw new Error(`Fake path not found: ${source}`);
+    if (options.recursive !== true) throw new Error("COPY_RECURSIVE_REQUIRED");
+    if (options.overwrite !== true && this.pathExists(target)) throw new Error("TARGET_EXISTS");
+    for (const [path, value] of entries) {
+      this.files.set(`${target}/${path.slice(sourcePrefix.length)}`, value);
+    }
+  }
+
+  override async movePath(sourcePath: string, targetPath: string, options: { readonly overwrite?: boolean } = {}): Promise<void> {
+    if (this.fakeOptions.readOnlyFilesystem) throw new Error("FILESYSTEM_READ_ONLY");
+    await this.copyPath(sourcePath, targetPath, { ...(options.overwrite !== undefined ? { overwrite: options.overwrite } : {}), recursive: true });
+    await this.deletePath(sourcePath, { recursive: true });
+  }
+
+  override async deletePath(path: string, options: { readonly recursive?: boolean } = {}): Promise<void> {
+    if (this.fakeOptions.readOnlyFilesystem) throw new Error("FILESYSTEM_READ_ONLY");
+    const target = normalizeVirtualPath(path);
+    if (this.files.delete(target)) return;
+    const targetPrefix = `${target}/`;
+    const entries = [...this.files.keys()].filter((candidate) => candidate.startsWith(targetPrefix));
+    if (entries.length === 0) throw new Error(`Fake path not found: ${target}`);
+    if (options.recursive !== true) throw new Error("DELETE_RECURSIVE_REQUIRED");
+    for (const entry of entries) this.files.delete(entry);
+  }
+
+  private pathExists(path: string): boolean {
+    const normalized = normalizeVirtualPath(path);
+    return this.files.has(normalized) || [...this.files.keys()].some((candidate) => candidate.startsWith(`${normalized}/`));
+  }
+
   override async createTempDirectory(prefix: string): Promise<string> {
     const root = normalizeVirtualPath(`${this.fakeRoot}/tmp/deepseek-evaluation-runs`);
     const id = `${prefix}${this.files.size}`;
@@ -851,7 +982,7 @@ export class FakePlatformRuntime extends NodePlatformRuntime {
     return results;
   }
 
-  override async runProcess(command: string, args: readonly string[], options: ProcessRunOptions = {}, observer?: ProcessRunObserver): Promise<ProcessResult> {
+  override async runProcess(command: string, args: readonly string[], options: ProcessRunOptions = {}, observer?: ProcessRunObserver, control?: ProcessRunControl): Promise<ProcessResult> {
     const processProvider = await this.resolveProcessProvider();
     if (!processProvider.available) {
       return {
@@ -865,7 +996,8 @@ export class FakePlatformRuntime extends NodePlatformRuntime {
       command,
       args,
       executionProfile: options.executionProfile ?? "default",
-      stdin: options.stdin ?? (options.executionProfile === "noninteractive" ? "ignore" : "pipe")
+      stdin: options.stdin ?? (options.executionProfile === "noninteractive" ? "ignore" : "pipe"),
+      aborted: control?.signal?.aborted === true
     });
     observer?.onStdoutChunk?.(stdout);
     observer?.onProcessExit?.();
@@ -963,10 +1095,67 @@ function sandboxCapabilities(input: {
   };
 }
 
-function isPathInside(root: string, target: string): boolean {
-  const normalizedRoot = normalize(root);
-  const normalizedTarget = normalize(target);
-  return normalizedTarget === normalizedRoot || normalizedTarget.startsWith(`${normalizedRoot}\\`) || normalizedTarget.startsWith(`${normalizedRoot}/`);
+function workspacePathApi(os: PlatformOsFamily): typeof posix | typeof win32 {
+  return os === "windows" ? win32 : posix;
+}
+
+function isPathInside(root: string, target: string, caseSensitive = true, pathApi: typeof posix | typeof win32 = workspacePathApi(process.platform === "win32" ? "windows" : "linux")): boolean {
+  const normalizedRoot = stripTrailingPathSeparator(pathApi.normalize(root), pathApi.sep);
+  const normalizedTarget = stripTrailingPathSeparator(pathApi.normalize(target), pathApi.sep);
+  const comparableRoot = caseSensitive ? normalizedRoot : normalizedRoot.toLowerCase();
+  const comparableTarget = caseSensitive ? normalizedTarget : normalizedTarget.toLowerCase();
+  return comparableTarget === comparableRoot || comparableTarget.startsWith(pathChildPrefix(comparableRoot, pathApi.sep));
+}
+
+function relativePathInside(root: string, target: string, caseSensitive: boolean, pathApi: typeof posix | typeof win32): string {
+  const normalizedRoot = stripTrailingPathSeparator(pathApi.normalize(root), pathApi.sep);
+  const normalizedTarget = stripTrailingPathSeparator(pathApi.normalize(target), pathApi.sep);
+  if (caseSensitive) return pathApi.relative(normalizedRoot, normalizedTarget);
+  const canonical = realFilesystemRelativePathInside(normalizedRoot, normalizedTarget, pathApi);
+  if (canonical !== undefined) return canonical;
+  const comparableRoot = normalizedRoot.toLowerCase();
+  const comparableTarget = normalizedTarget.toLowerCase();
+  if (comparableTarget === comparableRoot) return "";
+  const targetPrefix = pathChildPrefix(comparableRoot, pathApi.sep);
+  if (comparableTarget.startsWith(targetPrefix)) {
+    return comparableTarget.slice(targetPrefix.length);
+  }
+  return pathApi.relative(comparableRoot, comparableTarget);
+}
+
+function realFilesystemRelativePathInside(root: string, target: string, pathApi: typeof posix | typeof win32): string | undefined {
+  const relative = pathApi.relative(root, target);
+  if (!relative || relative.startsWith("..")) return relative === "" ? "" : undefined;
+  const segments = relative.split(/[\\/]+/).filter(Boolean);
+  const canonical: string[] = [];
+  let current = root;
+  for (const segment of segments) {
+    const entries = safeReadDirNames(current);
+    if (!entries) return undefined;
+    const entry = entries.find((name) => name.toLowerCase() === segment.toLowerCase());
+    if (!entry) return undefined;
+    canonical.push(entry);
+    current = pathApi.join(current, entry);
+  }
+  return canonical.join(pathApi.sep);
+}
+
+function safeReadDirNames(path: string): readonly string[] | undefined {
+  try {
+    return readdirSync(path, { withFileTypes: true }).map((entry) => entry.name);
+  } catch {
+    return undefined;
+  }
+}
+
+function pathChildPrefix(path: string, separator: string): string {
+  return path.endsWith(separator) ? path : `${path}${separator}`;
+}
+
+function stripTrailingPathSeparator(path: string, separator: string): string {
+  if (path === separator) return path;
+  if (/^[a-zA-Z]:\\$/.test(path)) return path;
+  return path.endsWith(separator) ? path.slice(0, -separator.length) : path;
 }
 
 function isVirtualAbsolutePath(path: string): boolean {
@@ -996,8 +1185,17 @@ function normalizePathForSearch(path: string): string {
   return path.replace(/\\/g, "/");
 }
 
-function isVirtualPathInside(root: string, target: string): boolean {
-  return target === root || target.startsWith(`${root}/`);
+function isVirtualPathInside(root: string, target: string, caseSensitive = true): boolean {
+  const comparableRoot = caseSensitive ? root : root.toLowerCase();
+  const comparableTarget = caseSensitive ? target : target.toLowerCase();
+  return comparableTarget === comparableRoot || comparableTarget.startsWith(`${comparableRoot}/`);
+}
+
+function virtualRelativePathInside(root: string, target: string, caseSensitive = true): string {
+  const comparableRoot = caseSensitive ? root : root.toLowerCase();
+  const comparableTarget = caseSensitive ? target : target.toLowerCase();
+  if (comparableTarget === comparableRoot) return "";
+  return comparableTarget.slice(comparableRoot.length).replace(/^\//, "");
 }
 
 async function walk(root: string, files: string[]): Promise<void> {

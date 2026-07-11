@@ -53,6 +53,7 @@ export interface RedactedError extends JsonObject {
   readonly code: string;
   readonly message: string;
   readonly retryable: boolean;
+  readonly suggestedActions?: readonly string[];
   readonly redaction: RedactionMetadata;
   readonly details?: JsonObject;
 }

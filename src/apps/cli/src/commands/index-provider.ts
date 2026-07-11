@@ -11,7 +11,8 @@ import { INDEX_PROVIDER_SCHEMA_VERSION } from "@deepseek/platform-contracts";
 import { createDefaultIndexProviderManifest, resolveIndexProviderDiagnostics } from "@deepseek/index-provider";
 import { PersistentConfigService } from "@deepseek/config";
 import { NodePlatformRuntime } from "@deepseek/platform-abstraction";
-import type { CliOptions } from "../types.js";
+import type { CliOptions, CliRunOptions } from "../types.js";
+import { resolveCliWorkspaceRoot } from "../host/workspace-root.js";
 
 export interface CliIndexProviderResult extends JsonObject {
   readonly kind: "index-provider.status" | "index-provider.set";
@@ -23,13 +24,14 @@ export interface CliIndexProviderResult extends JsonObject {
   readonly redaction: { readonly class: "internal"; readonly fields?: readonly string[] };
 }
 
-export async function runIndexProviderCommand(options: CliOptions, write: (line: string) => Promise<void>): Promise<void> {
-  const result = await collectIndexProviderResult(options);
+export async function runIndexProviderCommand(options: CliOptions, write: (line: string) => Promise<void>, runOptions: CliRunOptions = {}): Promise<void> {
+  const result = await collectIndexProviderResult(options, runOptions);
   for (const line of renderIndexProviderResult(result, options.output)) await write(line);
 }
 
-export async function collectIndexProviderResult(options: CliOptions): Promise<CliIndexProviderResult> {
-  const config = createConfig();
+export async function collectIndexProviderResult(options: CliOptions, runOptions: CliRunOptions = {}): Promise<CliIndexProviderResult> {
+  const workspaceRoot = await resolveCliWorkspaceRoot(runOptions);
+  const config = createConfig(workspaceRoot);
   const resolved = await config.resolve();
   const currentManifest = manifestFromConfigValue(resolved.values.find((value) => value.key === "indexProviders")?.redactedValue);
   if (options.indexProviderAction === "set") {
@@ -103,9 +105,8 @@ export function missingActivationEvidence(provider: IndexProviderDiagnosticRecor
   return provider.activationEvidence.filter((evidence) => evidence.status !== "present").map((evidence) => evidence.kind);
 }
 
-function createConfig(): PersistentConfigService {
+function createConfig(workspaceRoot: string): PersistentConfigService {
   const platform = new NodePlatformRuntime();
-  const workspaceRoot = process.cwd();
   return new PersistentConfigService({
     platform,
     workspaceRoot,

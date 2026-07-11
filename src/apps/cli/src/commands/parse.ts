@@ -2,16 +2,29 @@ import type { AgentLoopOutputContract, AgentLoopOutputContractKind, AgentLoopOut
 import { asId } from "@deepseek/platform-contracts";
 import type { CliOptions, CliTerminalFlags } from "../types.js";
 import { defaultTerminalFlags } from "../host/terminal.js";
+import {
+  parseNumberFlag,
+  parsePositiveNumberFlag,
+  promptFromArgs,
+  readFlagValue,
+  readRepeatedFlagValues
+} from "./parse-flags.js";
+export { cliUsageLines } from "./usage.js";
 
 const readinessCommands = new Set<ReadinessCommandName>(["init", "config", "auth", "doctor", "privacy", "verify-install"]);
-const diagnosticsCommands = new Set<DiagnosticsCommandName>(["bundle", "release", "doctor", "verify", "refresh", "evaluate", "env", "flow", "swe-bench"]);
+const diagnosticsCommands = new Set<DiagnosticsCommandName>(["bundle", "release", "doctor", "verify", "refresh", "evaluate", "env", "flow", "swe-bench", "capability-matrix"]);
 const defaultOutputMode: AgentLoopOutputMode = "text";
 
 export function parseCliArgs(args: readonly string[], _terminal: CliTerminalFlags = defaultTerminalFlags): CliOptions {
   const output = parseOutputMode(args);
   const timeoutMs = parsePositiveNumberFlag(args, "--timeout-ms");
   const live = args.includes("--live");
+  const workspaceRoot = readFlagValue(args, "--workspace-root");
   const toolProjection = parseToolProjection(args);
+  const toolOptIns = parseToolOptIns(args);
+  const approvalMode = parseApprovalMode(args);
+  const supervisorWorkflowStatePath = readFlagValue(args, "--supervisor-workflow-state");
+  const additionalUserContextFile = readFlagValue(args, "--additional-user-context-file");
   const reasoning = parseReasoningOptions(args);
   const outputContract = parseOutputContract(args);
   const tuiProfile = parseTuiProfile(args);
@@ -19,10 +32,10 @@ export function parseCliArgs(args: readonly string[], _terminal: CliTerminalFlag
   const model = readFlagValue(args, "--model");
   const first = args[0];
   if (!first || first === "help" || first === "--help" || first === "-h") {
-    return { command: "help", prompt: "", output, live };
+    return { command: "help", prompt: "", output, live, ...(workspaceRoot ? { workspaceRoot } : {}) };
   }
   if (first === "run") {
-    return { command: "run", prompt: promptFromArgs(args.slice(1)), output, live, ...(outputContract ? { outputContract } : {}), ...(timeoutMs ? { timeoutMs } : {}), ...(toolProjection ? { toolProjection } : {}), ...(reasoning ? { reasoning } : {}), ...(modelProvider ? { modelProvider } : {}), ...(model ? { model } : {}) };
+    return { command: "run", prompt: promptFromArgs(args.slice(1)), output, live, ...(workspaceRoot ? { workspaceRoot } : {}), ...(outputContract ? { outputContract } : {}), ...(timeoutMs ? { timeoutMs } : {}), ...(toolProjection ? { toolProjection } : {}), ...(toolOptIns.length > 0 ? { toolOptIns } : {}), ...(approvalMode ? { approvalMode } : {}), ...(supervisorWorkflowStatePath ? { supervisorWorkflowStatePath } : {}), ...(additionalUserContextFile ? { additionalUserContextFile } : {}), ...(reasoning ? { reasoning } : {}), ...(modelProvider ? { modelProvider } : {}), ...(model ? { model } : {}) };
   }
   if (first === "chat") {
     const sessionId = readFlagValue(args, "--session");
@@ -31,8 +44,12 @@ export function parseCliArgs(args: readonly string[], _terminal: CliTerminalFlag
       prompt: "",
       output,
       live,
+      ...(workspaceRoot ? { workspaceRoot } : {}),
       ...(tuiProfile ? { tuiProfile } : {}),
       ...(timeoutMs ? { timeoutMs } : {}),
+      ...(toolProjection ? { toolProjection } : {}),
+      ...(toolOptIns.length > 0 ? { toolOptIns } : {}),
+      ...(approvalMode ? { approvalMode } : {}),
       ...(reasoning ? { reasoning } : {}),
       ...(modelProvider ? { modelProvider } : {}),
       ...(model ? { model } : {}),
@@ -43,7 +60,7 @@ export function parseCliArgs(args: readonly string[], _terminal: CliTerminalFlag
     return { command: "tools-smoke", prompt: "", output, live };
   }
   if (first === "session") {
-    const action = args[1] === "fork" ? "fork" : "resume";
+    const action = args[1] === "fork" ? "fork" : args[1] === "board" ? "board" : "resume";
     const sessionId = args[2] && !args[2].startsWith("-") ? asId<"session">(args[2]) : undefined;
     const base: CliOptions = {
       command: "session",
@@ -53,7 +70,7 @@ export function parseCliArgs(args: readonly string[], _terminal: CliTerminalFlag
       sessionAction: action
     };
     if (action === "fork" && sessionId) return { ...base, parentSessionId: sessionId };
-    if (action === "resume" && sessionId) return { ...base, sessionId };
+    if ((action === "resume" || action === "board") && sessionId) return { ...base, sessionId };
     return base;
   }
   if (first === "mcp") {
@@ -222,45 +239,6 @@ export function parseCliArgs(args: readonly string[], _terminal: CliTerminalFlag
     return { command: "readiness", readinessCommand: first, prompt: "", output, live, readinessInput: parseReadinessInput(first, args) };
   }
   return { command: "help", prompt: "", output, live };
-}
-
-export function cliUsageLines(): readonly string[] {
-  return [
-    "DeepSeek CLI",
-    "Usage:",
-    "  deepseek run \"<task>\" [--output text|json|jsonl] [--live] [--provider deepseek|glm] [--model <model>] [--thinking off|low|medium|high|xhigh|max] [--tool-projection none|read-only|read-write|all] [--no-tools] [--timeout-ms <ms>] [--output-contract json-object|json-file|file|command-plan]",
-    "  deepseek chat [--session <session-id>] [--output text|json|jsonl] [--live] [--provider deepseek|glm] [--model <model>] [--thinking off|low|medium|high|xhigh|max] [--tui auto|line|full-screen|off] [--timeout-ms <ms>]",
-    "  deepseek session resume <session-id> [--output text|json]",
-    "  deepseek session fork <session-id> [--output text|json]",
-    "  deepseek mcp test <manifest.json> [--enable-real-mcp] [--call <tool> --input <json>] [--output text|json]",
-    "  deepseek index-provider status [--output text|json|jsonl]",
-    "  deepseek index-provider set <pageindex|zvec|code-index> <enabled|deferred|disabled> [--user] [--output text|json|jsonl]",
-    "  deepseek mode [status|agent|workers|verify|plan] [--output text|json|jsonl]",
-    "  deepseek memory status|list|candidates|remember|approve|reject|edit|delete|enable|disable|export|explain [args] [--output text|json]",
-    "  deepseek context status|grep|describe|summarize|expand|budget|pin [args] [--session <session-id>] [--output text|json|jsonl]",
-    "  deepseek checks openspec|typecheck|lint|test|boundaries|build-cli [--output text|json|jsonl]",
-    "  deepseek file list|preview|refs <query> [--output text|json|jsonl]",
-    "  deepseek repo files|grep|recall|project-index <query> [--output text|json|jsonl]",
-    "  deepseek git status|diff|review [--output text|json|jsonl]",
-    "  deepseek jump file|text|symbol <query> [--output text|json|jsonl]",
-    "  deepseek extension list [--output text|json|jsonl]",
-    "  deepseek extension plugin install|verify|snapshot|apply-lockfile <file.json> [--output text|json|jsonl]",
-    "  deepseek extension plugin contributions [--output text|json|jsonl]",
-    "  deepseek extension skill list|activate [name] [--output text|json|jsonl]",
-    "  deepseek extension auth scopes [--output text|json|jsonl]",
-    "  deepseek extension mcp test <manifest.json> [--enable-real-mcp] [--call <tool> --input <json>] [--output text|json|jsonl]",
-    "  deepseek palette list [--output text|json|jsonl]",
-    "  deepseek palette keymap [core|vi-minimal|vi-professional] [--output text|json|jsonl]",
-    "  deepseek palette action <action> <target-id> [--output text|json|jsonl]",
-    "  deepseek revert preview --request <id>|--turn <id>|--session <id> [--path <path>] [--output text|json|jsonl]",
-    "  deepseek revert apply --request <id>|--turn <id>|--session <id> [--path <path>] [--output text|json|jsonl]",
-    "  deepseek diagnostics bundle|release|doctor|verify|refresh|evaluate|env|flow|swe-bench [prepare|inspect|predict|evaluate] [--prompt <text>] [--profile <id>] [--execute] [--baseline <id>] [--instance-file <path>] [--repo-dir <path>] [--output-path <path>] [--predictions-path <path>] [--trace-output-path <jsonl>] [--append-output] [--report-dir <path>] [--run-id <id>] [--instance-id <id>] [--cache-trace-path <jsonl>] [--cache-hit-target <rate>] [--full] [--dry-run] [--live] [--output text|json|jsonl]",
-    "  deepseek tools-smoke [--output text|jsonl]",
-    "  deepseek <init|config|auth|doctor|privacy|verify-install> [--output text|json]",
-    "Notes:",
-    "  fact-sensitive run/chat turns classify and select bounded local evidence before model dispatch",
-    "  one-shot run turns use bounded self-repair for repairable failures and emit redacted repair evidence"
-  ];
 }
 
 function parseContextInput(args: readonly string[]): JsonObject {
@@ -564,6 +542,7 @@ function parseDiagnosticsInput(command: DiagnosticsCommandName, args: readonly s
     const traceOutputPath = readFlagValue(args, "--trace-output-path");
     const reportDir = readFlagValue(args, "--report-dir");
     const runId = readFlagValue(args, "--run-id");
+    const task = readFlagValue(args, "--task");
     const datasetName = readFlagValue(args, "--dataset-name");
     const split = readFlagValue(args, "--split");
     const harnessPython = readFlagValue(args, "--harness-python");
@@ -578,6 +557,8 @@ function parseDiagnosticsInput(command: DiagnosticsCommandName, args: readonly s
     if (args.includes("--append-output")) input.appendOutput = true;
     if (reportDir) input.reportDir = reportDir;
     if (runId) input.runId = runId;
+    if (task) input.task = task;
+    if (args.includes("--execute")) input.execute = true;
     if (datasetName) input.datasetName = datasetName;
     if (split) input.split = split;
     if (harnessPython) input.harnessPython = harnessPython;
@@ -586,7 +567,21 @@ function parseDiagnosticsInput(command: DiagnosticsCommandName, args: readonly s
     if (instanceIds.length > 0) input.instanceIds = instanceIds;
     const timeoutMs = parsePositiveNumberFlag(args, "--timeout-ms");
     if (timeoutMs) input.timeoutMs = timeoutMs;
-    input.extraArgs = extraDiagnosticsArgs(args, new Set(["--dry-run", "--append-output"]), new Set(["predict", "evaluate"]));
+    input.extraArgs = extraDiagnosticsArgs(args, new Set(["--dry-run", "--append-output", "--execute"]), new Set(["predict", "evaluate", "run"]));
+  }
+  if (command === "capability-matrix") {
+    const rawAction = args[2];
+    input.action = rawAction && !rawAction.startsWith("--") ? rawAction : "run";
+    input.dryRun = args.includes("--dry-run");
+    const taskIds = readRepeatedFlagValues(args, "--task");
+    if (taskIds.length > 0) input.taskIds = taskIds;
+    const reportDir = readFlagValue(args, "--report-dir");
+    if (reportDir) input.reportDir = reportDir;
+    const cliCommand = readFlagValue(args, "--cli-command");
+    if (cliCommand) input.cliCommand = cliCommand;
+    const timeoutMs = parsePositiveNumberFlag(args, "--timeout-ms");
+    if (timeoutMs) input.timeoutMs = timeoutMs;
+    input.extraArgs = extraDiagnosticsArgs(args, new Set(["--dry-run"]), new Set(["run", "plan"]));
   }
   return input as JsonObject;
 }
@@ -618,6 +613,8 @@ function extraDiagnosticsArgs(args: readonly string[], knownBooleanFlags: Readon
       value === "--output-path" ||
       value === "--predictions-path" || value === "--trace-output-path" ||
       value === "--report-dir" ||
+      value === "--task" ||
+      value === "--cli-command" ||
       value === "--run-id" ||
       value === "--instance-id" ||
       value === "--dataset-name" ||
@@ -695,8 +692,24 @@ function jsonObjectFromString(value: string): JsonObject | undefined {
 function parseToolProjection(args: readonly string[]): CliOptions["toolProjection"] {
   if (args.includes("--no-tools")) return "none";
   const value = readFlagValue(args, "--tool-projection");
-  if (value === "none" || value === "read-only" || value === "read-write" || value === "all") return value;
+  if (value === "all") return "safe-all";
+  if (value === "none" || value === "read-only" || value === "read-write" || value === "safe-all") return value;
   return undefined;
+}
+
+function parseApprovalMode(args: readonly string[]): CliOptions["approvalMode"] {
+  const value = readFlagValue(args, "--approval-mode");
+  if (value === "ask" || value === "trusted") return value;
+  if (args.includes("--trusted")) return "trusted";
+  return undefined;
+}
+
+function parseToolOptIns(args: readonly string[]): readonly string[] {
+  const values = readRepeatedFlagValues(args, "--tool-opt-in")
+    .flatMap((value) => value.split(","))
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean);
+  return [...new Set(values)];
 }
 
 function parseModelProvider(args: readonly string[]): CliOptions["modelProvider"] {
@@ -724,70 +737,6 @@ function parseReasoningEffort(value: string): ModelReasoningEffort | undefined {
 function parseProviderEffort(value: string): ModelReasoningProviderEffort | undefined {
   if (value === "max") return "max";
   return undefined;
-}
-
-function parsePositiveNumberFlag(args: readonly string[], name: string): number | undefined {
-  const index = args.indexOf(name);
-  if (index < 0) return undefined;
-  const value = Number(args[index + 1]);
-  return Number.isFinite(value) && value > 0 ? value : undefined;
-}
-
-function parseNumberFlag(args: readonly string[], name: string): number | undefined {
-  const index = args.indexOf(name);
-  if (index < 0) return undefined;
-  const value = Number(args[index + 1]);
-  return Number.isFinite(value) ? value : undefined;
-}
-
-function readFlagValue(args: readonly string[], name: string): string | undefined {
-  const index = args.indexOf(name);
-  if (index < 0) return undefined;
-  const value = args[index + 1];
-  return typeof value === "string" && !value.startsWith("-") ? value : undefined;
-}
-
-function readRepeatedFlagValues(args: readonly string[], name: string): readonly string[] {
-  const values: string[] = [];
-  for (let index = 0; index < args.length; index += 1) {
-    if (args[index] !== name) continue;
-    const value = args[index + 1];
-    if (typeof value === "string") values.push(value);
-  }
-  return values;
-}
-
-function promptFromArgs(args: readonly string[]): string {
-  const filtered: string[] = [];
-  for (let index = 0; index < args.length; index += 1) {
-    const value = args[index];
-    if (!value) continue;
-    if (
-      value === "--output" ||
-      value === "--timeout-ms" ||
-      value === "--tool-projection" ||
-      value === "--tui" ||
-      value === "--thinking" ||
-      value === "--reasoning-effort" ||
-      value === "--provider" ||
-      value === "--model-provider" ||
-      value === "--model" ||
-      value === "--output-contract" ||
-      value === "--output-contract-path" ||
-      value === "--output-schema" ||
-      value === "--output-schema-file" ||
-      value === "--output-contract-description"
-    ) {
-      index += 1;
-      continue;
-    }
-    if (value === "--palette") continue;
-    if (value === "--live") continue;
-    if (value === "--no-tools") continue;
-    if (value === "--output-contract-optional") continue;
-    filtered.push(value);
-  }
-  return filtered.join(" ").trim();
 }
 
 function isReadinessCommand(value: string | undefined): value is ReadinessCommandName {

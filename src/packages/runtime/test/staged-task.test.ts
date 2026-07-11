@@ -61,7 +61,39 @@ describe("staged task runtime state machine", () => {
           schemaVersion: STAGED_TASK_SCHEMA_VERSION,
           status: "succeeded",
           outputRefs: [refFixture(stage.expectedOutputRefs[0]!, stage.stageId, "evidence")],
-          diagnostics: [],
+          evaluation: {
+            schemaVersion: STAGED_TASK_SCHEMA_VERSION,
+            evaluationId: "evaluation:prepare",
+            stageId: stage.stageId,
+            evaluatorId: "test:evaluator",
+            status: "passed",
+            score: 1,
+            reason: "Required evidence was produced.",
+            evidenceRefs: [stage.expectedOutputRefs[0]!],
+            evaluatedAt: "2026-06-04T00:00:00.000Z",
+            compatibility: STAGED_TASK_COMPATIBILITY,
+            redaction: { class: "internal" }
+          },
+          technicalDirectorAcceptance: {
+            schemaVersion: STAGED_TASK_SCHEMA_VERSION,
+            acceptanceId: "acceptance:prepare",
+            stageId: stage.stageId,
+            reviewerId: "technical-director:test",
+            decision: "accepted",
+            criteriaApplicable: true,
+            evidenceSufficient: true,
+            reason: "Acceptance criteria and evidence sufficiency confirmed.",
+            evaluationId: "evaluation:prepare",
+            acceptedAt: "2026-06-04T00:00:00.000Z",
+            compatibility: STAGED_TASK_COMPATIBILITY,
+            redaction: { class: "internal" }
+          },
+          diagnostics: [{
+            code: "STAGED_TASK_TECHNICAL_DIRECTOR_ACCEPTED",
+            message: "Acceptance criteria and evidence sufficiency confirmed.",
+            retryable: false,
+            redaction: { class: "internal" }
+          }],
           compatibility: STAGED_TASK_COMPATIBILITY,
           redaction: { class: "internal" }
         };
@@ -77,6 +109,121 @@ describe("staged task runtime state machine", () => {
     assert.equal(result.state.stageStates.find((stage) => stage.stageId === "stage:prepare")?.status, "succeeded");
     assert.equal(executorContextKeys.includes("state"), false);
     assert.equal(executorContextKeys.includes("stateSnapshot"), false);
+  });
+
+  it("does not mark produced stage output as succeeded without evaluation and technical director acceptance", async () => {
+    const graph = graphFixture();
+    const initial = createStagedTaskRunState(graph, { taskRunId: "task-run:evaluation-gated" });
+    const executor: StageExecutor = {
+      kind: "process-check",
+      async run(stage) {
+        return {
+          schemaVersion: STAGED_TASK_SCHEMA_VERSION,
+          status: "succeeded",
+          outputRefs: [refFixture(stage.expectedOutputRefs[0]!, stage.stageId, "evidence")],
+          diagnostics: [],
+          compatibility: STAGED_TASK_COMPATIBILITY,
+          redaction: { class: "internal" }
+        };
+      }
+    };
+
+    const result = await runReadyStage(graph, initial, "stage:prepare", {
+      executors: [executor],
+      now: () => "2026-06-04T00:00:00.000Z"
+    });
+
+    const prepareState = result.state.stageStates.find((stage) => stage.stageId === "stage:prepare");
+    const produceState = result.state.stageStates.find((stage) => stage.stageId === "stage:produce");
+    assert.deepEqual(result.events.map((event) => event.kind), ["stage.started", "stage.evaluation.required"]);
+    assert.equal(prepareState?.status, "running");
+    assert.deepEqual(prepareState?.outputRefs, ["ref:prepare-evidence"]);
+    assert.equal(prepareState?.evaluation?.status, "needs-review");
+    assert.deepEqual(prepareState?.evaluation?.evidenceRefs, ["ref:prepare-evidence"]);
+    assert.equal(prepareState?.evaluation?.reason, "Stage output requires evaluation before success can be accepted.");
+    assert.equal(prepareState?.diagnostics[0]?.code, "STAGED_TASK_TECHNICAL_DIRECTOR_ACCEPTANCE_REQUIRED");
+    assert.equal(produceState?.status, "pending");
+  });
+
+  it("records typed stage evaluation before state transition and blocks downstream expansion until technical director acceptance", async () => {
+    const graph = graphFixture();
+    const initial = createStagedTaskRunState(graph, { taskRunId: "task-run:typed-evaluation" });
+    const executor: StageExecutor = {
+      kind: "process-check",
+      async run(stage) {
+        return {
+          schemaVersion: STAGED_TASK_SCHEMA_VERSION,
+          status: "succeeded",
+          outputRefs: [refFixture(stage.expectedOutputRefs[0]!, stage.stageId, "evidence")],
+          evaluation: {
+            schemaVersion: STAGED_TASK_SCHEMA_VERSION,
+            evaluationId: "evaluation:typed-prepare",
+            stageId: stage.stageId,
+            evaluatorId: "test:evaluator",
+            status: "passed",
+            score: 0.93,
+            reason: "The required evidence ref is present and satisfies the stage acceptance policy.",
+            evidenceRefs: [stage.expectedOutputRefs[0]!],
+            evaluatedAt: "2026-06-04T00:00:00.000Z",
+            compatibility: STAGED_TASK_COMPATIBILITY,
+            redaction: { class: "internal" }
+          },
+          diagnostics: [],
+          compatibility: STAGED_TASK_COMPATIBILITY,
+          redaction: { class: "internal" }
+        };
+      }
+    };
+
+    const result = await runReadyStage(graph, initial, "stage:prepare", {
+      executors: [executor],
+      now: () => "2026-06-04T00:00:00.000Z"
+    });
+
+    const evaluationEvent = result.events.find((event) => event.kind === "stage.evaluation.required");
+    const prepareState = result.state.stageStates.find((stage) => stage.stageId === "stage:prepare");
+    const produceState = result.state.stageStates.find((stage) => stage.stageId === "stage:produce");
+    assert.equal(evaluationEvent?.evaluation?.status, "passed");
+    assert.equal(evaluationEvent?.evaluation?.score, 0.93);
+    assert.equal(evaluationEvent?.evaluation?.reason, "The required evidence ref is present and satisfies the stage acceptance policy.");
+    assert.deepEqual(evaluationEvent?.evaluation?.evidenceRefs, ["ref:prepare-evidence"]);
+    assert.equal(prepareState?.evaluation?.status, "passed");
+    assert.equal(prepareState?.technicalDirectorAcceptance, undefined);
+    assert.equal(prepareState?.status, "running");
+    assert.equal(produceState?.status, "pending");
+  });
+
+  it("requires technical director acceptance even when deterministic stage evaluation passes", async () => {
+    const graph = graphFixture();
+    const initial = createStagedTaskRunState(graph, { taskRunId: "task-run:director-gated" });
+    const executor: StageExecutor = {
+      kind: "process-check",
+      async run(stage) {
+        return {
+          schemaVersion: STAGED_TASK_SCHEMA_VERSION,
+          status: "succeeded",
+          outputRefs: [refFixture(stage.expectedOutputRefs[0]!, stage.stageId, "evidence")],
+          diagnostics: [{
+            code: "STAGED_TASK_EVALUATION_PASSED",
+            message: "Deterministic evaluation passed, pending technical director acceptance.",
+            retryable: false,
+            redaction: { class: "internal" }
+          }],
+          compatibility: STAGED_TASK_COMPATIBILITY,
+          redaction: { class: "internal" }
+        };
+      }
+    };
+
+    const result = await runReadyStage(graph, initial, "stage:prepare", {
+      executors: [executor],
+      now: () => "2026-06-04T00:00:00.000Z"
+    });
+
+    const prepareState = result.state.stageStates.find((stage) => stage.stageId === "stage:prepare");
+    assert.equal(prepareState?.status, "running");
+    assert.equal(prepareState?.diagnostics.some((diagnostic) => diagnostic.code === "STAGED_TASK_EVALUATION_PASSED"), true);
+    assert.equal(prepareState?.diagnostics.some((diagnostic) => diagnostic.code === "STAGED_TASK_TECHNICAL_DIRECTOR_ACCEPTANCE_REQUIRED"), true);
   });
 
   it("fails closed through a failure event when executor kind is not registered", async () => {

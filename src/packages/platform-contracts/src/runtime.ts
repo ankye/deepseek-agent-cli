@@ -18,7 +18,7 @@ import type { EvolutionEngine } from "./evolution.js";
 import type { ExtensionManager } from "./extension.js";
 import type { HookSystem } from "./hook.js";
 import type { McpGateway } from "./mcp.js";
-import type { ModelGateway, ModelProfile, ModelReasoningOptions } from "./model.js";
+import type { ModelChatMessage, ModelGateway, ModelProfile, ModelReasoningOptions } from "./model.js";
 import type { PromptAssembler } from "./prompt-assembly.js";
 import type { StagedTaskGraph, StagedTaskRunState } from "./staged-task.js";
 import type { VisibleReasoningProjection } from "./visible-reasoning.js";
@@ -133,11 +133,14 @@ export type RuntimeEventKind =
   | "memory.permanent.hook.started"
   | "memory.permanent.hook.completed"
   | "memory.permanent.hook.failed"
+  | "workflow.ready-stage.control"
+  | "workflow.required-action.missed"
   | "workflow.step"
   | "bus.recorded"
   | "model.delta"
   | "model.reasoning"
   | "model.reasoning.persisted"
+  | "tool.decision-board.snapshot"
   | "model.tool.intent"
   | "model.tool.repaired"
   | "model.tool.rejected"
@@ -232,6 +235,7 @@ export interface RuntimeKernelRequest {
   readonly capabilityId: CapabilityId;
   readonly input: JsonObject;
   readonly caller: string;
+  readonly metadata?: JsonObject;
   readonly sessionId?: SessionId;
   readonly turnId?: TurnId;
   readonly agentId?: AgentId;
@@ -245,6 +249,149 @@ export interface RuntimeKernelResult extends JsonObject {
   readonly status: ExecutionOutcomeStatus;
   readonly output?: JsonObject;
   readonly error?: KernelError;
+}
+
+export type ToolDecisionRecordKind =
+  | "projection"
+  | "intent"
+  | "preflight"
+  | "policy"
+  | "execution"
+  | "feedback"
+  | "suppression"
+  | "lineage"
+  | "failure-analysis";
+
+export type ToolDecisionRecordStatus =
+  | "visible"
+  | "hidden"
+  | "unavailable"
+  | "requested"
+  | "repaired"
+  | "completed"
+  | "failed"
+  | "rejected"
+  | "denied"
+  | "suppressed"
+  | "accepted"
+  | "blocked";
+
+export interface ToolDecisionRecord extends JsonObject {
+  readonly recordId: string;
+  readonly kind: ToolDecisionRecordKind;
+  readonly status: ToolDecisionRecordStatus;
+  readonly toolCallId?: string;
+  readonly toolName?: string;
+  readonly capabilityId?: string;
+  readonly normalizedInputHash?: string;
+  readonly reasonCode?: string;
+  readonly correctiveAction?: string;
+  readonly recommendedNextAction?: string;
+  readonly iteration?: number;
+  readonly timestamp: string;
+  readonly metadata: JsonObject;
+}
+
+export type FailureAnalysisAttribution =
+  | "framework-scheduling"
+  | "tool-availability"
+  | "environment"
+  | "harness-adapter"
+  | "cache"
+  | "prompt-reproduction"
+  | "repair-feedback"
+  | "model-owned"
+  | "inconclusive";
+
+export type FailureAnalysisProofStatus = "unproven" | "proven" | "disproven" | "inconclusive";
+
+export type FailureAnalysisNextAction =
+  | "search-evidence"
+  | "prove-attribution"
+  | "repair"
+  | "rerun"
+  | "focused-evidence-query"
+  | "environment-escalation"
+  | "bounded-blocker"
+  | "stop-with-classification";
+
+export interface FailureAnalysisRecord extends JsonObject {
+  readonly recordId: string;
+  readonly attemptId: string;
+  readonly stageId?: string;
+  readonly terminalKind: string;
+  readonly failureClass: string;
+  readonly attribution: FailureAnalysisAttribution;
+  readonly proofStatus: FailureAnalysisProofStatus;
+  readonly evidenceQueries: readonly string[];
+  readonly acceptedEvidenceRefs: readonly string[];
+  readonly nextAllowedAction: FailureAnalysisNextAction;
+  readonly rerunAllowed: boolean;
+  readonly modelOwnedAttributionAllowed: boolean;
+  readonly residualRisk?: string;
+  readonly timestamp: string;
+  readonly redaction: { readonly class: "internal"; readonly fields?: readonly string[] };
+}
+
+export interface SharedSchedulingLineageRecord extends JsonObject {
+  readonly recordId: string;
+  readonly parentRunId?: string;
+  readonly childRunId?: string;
+  readonly attemptId?: string;
+  readonly stageId?: string;
+  readonly dispatchBatchId?: string;
+  readonly toolCallId?: string;
+  readonly terminalEventId?: string;
+  readonly evidenceRefs: readonly string[];
+  readonly nextAllowedAction?: FailureAnalysisNextAction | string;
+  readonly timestamp: string;
+  readonly redaction: { readonly class: "internal"; readonly fields?: readonly string[] };
+}
+
+export interface SharedSchedulingEvidence extends JsonObject {
+  readonly lineageIds: readonly SharedSchedulingLineageRecord[];
+  readonly failureAnalysisRecords: readonly FailureAnalysisRecord[];
+  readonly acceptedEvidenceRefs: readonly string[];
+  readonly nextAllowedAction?: FailureAnalysisNextAction | string;
+  readonly redaction: { readonly class: "internal"; readonly fields?: readonly string[] };
+}
+
+export type ToolProjectionDecisionStatus = "visible" | "hidden" | "denied" | "unavailable";
+
+export interface ToolProjectionDecision extends JsonObject {
+  readonly capabilityId: string;
+  readonly status: ToolProjectionDecisionStatus;
+  readonly visible: boolean;
+  readonly reason: string;
+  readonly reasonCode: string;
+  readonly policySource: string;
+  readonly profileId?: string;
+  readonly stageId?: string;
+  readonly requiredByStage: boolean;
+  readonly issueClass: "none" | "deliberate-boundary" | "cli-capability-gap" | "platform-unavailable" | "provider-compatibility-limit" | "policy-denial";
+  readonly unavailableBecause?: string;
+  readonly aliases: readonly string[];
+  readonly sideEffect: string;
+}
+
+export interface ToolDecisionBoard extends JsonObject {
+  readonly boardId: string;
+  readonly sessionId: SessionId;
+  readonly turnId: TurnId;
+  readonly iteration: number;
+  readonly activeProfileId?: string;
+  readonly activeStageId?: string;
+  readonly visibleToolIds: readonly string[];
+  readonly projectionSummaries: readonly ToolProjectionDecision[];
+  readonly hiddenToolSummaries: readonly ToolProjectionDecision[];
+  readonly records: readonly ToolDecisionRecord[];
+  readonly previousRejectedIntents: readonly ToolDecisionRecord[];
+  readonly repeatedRejectedIntentCount: number;
+  readonly decisionLoopFailureCandidate: boolean;
+  readonly recommendedNextActions: readonly string[];
+  readonly sharedSchedulingEvidence: SharedSchedulingEvidence;
+  readonly counters: JsonObject;
+  readonly redaction: { readonly class: "internal"; readonly fields?: readonly string[] };
 }
 
 export interface RuntimeKernelLogger {
@@ -293,9 +440,19 @@ export interface AgentLoopLimits extends JsonObject {
   readonly maxOutputBytes: number;
   readonly maxRetries: number;
   readonly maxRepairAttempts: number;
+  readonly stageBudgets?: readonly AgentLoopStageBudget[];
 }
 
-export type AgentLoopToolProjection = "none" | "read-only" | "read-write" | "all";
+export interface AgentLoopStageBudget extends JsonObject {
+  readonly stageId?: string;
+  readonly stageKind?: string;
+  readonly maxModelIterations?: number;
+  readonly maxToolCalls?: number;
+  readonly stopReason?: string;
+  readonly policy?: JsonObject;
+}
+
+export type AgentLoopToolProjection = "none" | "read-only" | "read-write" | "safe-all" | "all";
 
 export type AgentLoopProjectRuleSource = "agents-md" | "claude-md" | "host-policy" | "repository-guidance";
 export type AgentLoopProjectRuleStatus = "included" | "missing" | "excluded" | "degraded";
@@ -395,11 +552,14 @@ export interface AgentLoopProfilePolicyMetadata extends JsonObject {
   readonly workflowCapabilityIds: readonly string[];
   readonly workflowStages?: readonly AgentLoopProfileWorkflowStageMetadata[];
   readonly stagedTaskWorkflow?: AgentLoopProfileStagedTaskWorkflowMetadata;
+  readonly supervisorWorkflowState?: StagedTaskRunState;
   readonly toolProjection?: AgentLoopToolProjection;
   readonly toolProjectionSource: string;
   readonly contextPipelineEnabled?: boolean;
   readonly loopLimits?: JsonObject;
   readonly workflowGateOverride?: AgentLoopProfileWorkflowGateOverride;
+  readonly workflowGovernanceMode?: "standard" | "evaluation";
+  readonly stageAcceptanceMode?: "automatic" | "supervisor";
   readonly antiTailoring: boolean;
   readonly executionBoundary: string;
   readonly redaction: { readonly class: "internal"; readonly fields?: readonly string[] };
@@ -437,6 +597,7 @@ export interface AgentLoopProfileWorkflowStageMetadata extends JsonObject {
 
 export interface AgentLoopRequest extends JsonObject {
   readonly prompt: string;
+  readonly initialMessages?: readonly ModelChatMessage[];
   readonly sessionId?: SessionId;
   readonly agentId?: AgentId;
   readonly interactionMode?: InteractionModeName;
@@ -452,6 +613,7 @@ export interface AgentLoopRequest extends JsonObject {
   readonly limits?: Partial<AgentLoopLimits>;
   readonly live?: boolean;
   readonly toolProjection?: AgentLoopToolProjection;
+  readonly toolOptIns?: readonly string[];
   readonly selfRepair?: Partial<SelfRepairConfig>;
   readonly evidenceFirst?: { readonly enabled?: boolean };
   readonly projectRules?: readonly AgentLoopProjectRuleEvidence[];

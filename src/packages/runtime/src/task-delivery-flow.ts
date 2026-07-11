@@ -77,7 +77,7 @@ export function createTaskBrief(options: CreateTaskBriefOptions): TaskBrief {
   const rawInput = options.rawInput.trim();
   const lower = rawInput.toLowerCase();
   const activeTaskAvailable = options.activeTaskAvailable === true;
-  const classification = classifyIntent(lower, activeTaskAvailable);
+  const classification = classifyIntent(rawInput, lower, activeTaskAvailable);
   return {
     schemaVersion: TASK_DELIVERY_FLOW_SCHEMA_VERSION,
     briefId: `task-brief:${stableHash(`${rawInput}:${classification.normalizedIntent}`)}`,
@@ -433,7 +433,7 @@ function taskDecisionEnvelopePlanData(envelope: TaskDecisionEnvelope): JsonObjec
   };
 }
 
-function classifyIntent(lower: string, activeTaskAvailable: boolean): {
+function classifyIntent(rawInput: string, lower: string, activeTaskAvailable: boolean): {
   readonly normalizedIntent: string;
   readonly intentKind: TaskIntentKind;
   readonly confidence: number;
@@ -463,17 +463,6 @@ function classifyIntent(lower: string, activeTaskAvailable: boolean): {
         needsUserConfirmation: true
       };
   }
-  if (isSweBenchPrompt(lower)) {
-    return {
-      normalizedIntent: "run swe-bench lite task",
-      intentKind: "evaluation",
-      confidence: 0.82,
-      contextRequirements: ["benchmark-instance", "repository-checkout", "verification-harness"],
-      assumptions: ["Resolve the requested SWE-bench item from configured local benchmark assets."],
-      missingInfo: [],
-      needsUserConfirmation: false
-    };
-  }
   if (lower.includes("跑分") || lower.includes("score") || lower.includes("evaluate")) {
     return {
       normalizedIntent: "run evaluation score",
@@ -481,6 +470,17 @@ function classifyIntent(lower: string, activeTaskAvailable: boolean): {
       confidence: 0.78,
       contextRequirements: ["evaluation-baseline", "acceptance-evidence"],
       assumptions: ["Use configured diagnostics/evaluation profile."],
+      missingInfo: [],
+      needsUserConfirmation: false
+    };
+  }
+  if (isReadOnlyArchitectureAnalysisPrompt(rawInput, lower)) {
+    return {
+      normalizedIntent: "analyze cli architecture workflow",
+      intentKind: "diagnostics",
+      confidence: 0.78,
+      contextRequirements: ["repository-source", "architecture-boundaries", "runtime-workflow"],
+      assumptions: ["Use read-only repository inspection and report architecture findings without changing files."],
       missingInfo: [],
       needsUserConfirmation: false
     };
@@ -508,7 +508,7 @@ function classifyIntent(lower: string, activeTaskAvailable: boolean): {
     };
   }
   return {
-    normalizedIntent: lower || "empty task input",
+    normalizedIntent: rawInput || "empty task input",
     intentKind: "unknown",
     confidence: 0.4,
     contextRequirements: ["user-intent"],
@@ -518,12 +518,31 @@ function classifyIntent(lower: string, activeTaskAvailable: boolean): {
   };
 }
 
-function isSweBenchPrompt(lower: string): boolean {
-  return (
-    lower.includes("swe-bench") ||
-    lower.includes("swebench") ||
-    lower.includes("swe bench")
-  );
+function isReadOnlyArchitectureAnalysisPrompt(rawInput: string, lower: string): boolean {
+  const analysisIntent = lower.includes("analysis")
+    || lower.includes("analyze")
+    || rawInput.includes("分析")
+    || rawInput.includes("梳理")
+    || rawInput.includes("检查");
+  const architectureScope = lower.includes("architecture")
+    || rawInput.includes("架构")
+    || lower.includes("workflow")
+    || rawInput.includes("流程")
+    || lower.includes("orchestration")
+    || rawInput.includes("编排")
+    || rawInput.includes("调度");
+  const cliOrRuntimeScope = lower.includes("cli")
+    || lower.includes("runtime")
+    || rawInput.includes("profile")
+    || rawInput.includes("工具")
+    || rawInput.includes("意图识别")
+    || rawInput.includes("任务拆分");
+  const readOnly = rawInput.includes("不要修改")
+    || rawInput.includes("不修改")
+    || lower.includes("read-only")
+    || lower.includes("do not modify")
+    || lower.includes("without changing");
+  return analysisIntent && architectureScope && cliOrRuntimeScope && readOnly;
 }
 
 function parseJsonObjectCandidate(text: string): JsonObject | undefined {
@@ -566,38 +585,25 @@ function defaultAcceptanceCriteria(evidenceRefs: readonly string[]) {
 }
 
 function defaultDecisionConstraints(brief: TaskBrief): readonly string[] {
-  const constraints = [
+  return [
     "Use prompt assembly for model-bound decisions.",
     "Return structured task decisions; do not claim completion."
-  ];
-  if (!isSweBenchBrief(brief)) return constraints;
-  return [
-    ...constraints,
-    "For SWE-bench Lite tasks, use the governed SWE-bench run capability or diagnostics adapter to bind a run-scoped task checkout.",
-    "Historical evaluator artifacts and prior benchmark run directories are outside the model-visible task scope and are rejected by the runtime guard.",
-    "Start from the run-scoped benchmark instance and checkout; do not solve by inspecting CLI diagnostics, fixture tests, prior predictions, or evaluator-side artifacts.",
-    "Keep source inspection, edits, temporary repro scripts, tests, and diffs inside the selected benchmark checkout unless the user explicitly asks to repair this CLI framework.",
-    "Modify only the benchmark repository checkout unless the user explicitly asks to change this CLI framework.",
-    "Prefer a minimal failing regression or minimal reproduction inside the benchmark repo before broad dependency setup when local source and tests are enough to demonstrate the behavior.",
-    "Use only project-local virtual environment or explicit local install target for Python package setup; do not run host/global package installers.",
-    "Do not replace the benchmark checkout by installing the same package from a package index; verification must import or exercise the selected checkout.",
-    "Do not mine upstream git history, previous fix commits, or repository history for the solution; use the provided issue statement, checkout, local source, and tests.",
-    "After a focused regression fails for the target behavior, patch the checkout before spending more turns on dependency installation; unresolved environment setup becomes partial verification evidence.",
-    "After focused verification passes and a source diff exists, stop chasing full dependency installation or broad test suites unless the focused evidence is contradictory; report the focused proof and any full-suite environment gaps.",
-    "Treat full dependency installation as verification support, not as a prerequisite for producing a source fix; if it fails or times out, capture that evidence and continue with the best focused test, patch, and diff.",
-    "Collect proof from focused benchmark or repository tests plus the resulting diff before reporting."
   ];
 }
 
 function defaultAllowedTools(brief: TaskBrief): readonly string[] {
-  if (isSweBenchBrief(brief)) {
+  if (brief.intentKind === "diagnostics") {
+    return ["workspace.read", "search.text", "process.check"];
+  }
+  if (brief.intentKind === "evaluation") {
     return ["workspace.read", "workspace.write", "search.text", "shell.run", "git.diff", "test.run"];
   }
   return ["workspace.read", "process.check"];
 }
 
 function defaultCandidateProfiles(brief: TaskBrief): readonly string[] {
-  if (isSweBenchBrief(brief)) return ["evaluation/swe-bench-lite.v1", "coding/general.v1"];
+  if (brief.intentKind === "evaluation") return ["evaluation/dynamic.v1", "coding/general.v1"];
+  if (brief.intentKind === "diagnostics") return ["analysis/read-only.v1", "coding/general.v1"];
   return ["coding/general.v1"];
 }
 
@@ -608,7 +614,6 @@ function criterionAccepted(evidenceRefs: readonly string[], checkIds: readonly s
 }
 
 function createDeterministicDecisionEnvelope(request: TaskDecisionRequest, goal: TaskGoal): TaskDecisionEnvelope {
-  const sweBench = isSweBenchBrief(request.brief);
   return {
     schemaVersion: TASK_DELIVERY_FLOW_SCHEMA_VERSION,
     decisionId: `task-decision:${stableHash(`${request.requestId}:${goal.goalId}`)}`,
@@ -624,25 +629,8 @@ function createDeterministicDecisionEnvelope(request: TaskDecisionRequest, goal:
       status: "required"
     }],
     profileSelection: request.candidateProfiles[0] ?? "coding/general.v1",
-    toolStrategy: sweBench
-      ? [
-        "Use the governed SWE-bench run preparation/evaluation capability to obtain the current run-scoped checkout before inspecting source code.",
-        "Use the current run-scoped checkout as the root for relative file, shell, test, and git operations.",
-        "Use file/search tools to identify candidate source files inside the benchmark repository.",
-        "Create or run a minimal reproduction for the reported behavior before spending multiple turns on full environment installation.",
-        "Limit environment work to one dependency setup attempt in a project-local virtual environment before returning to source edits and focused verification.",
-        "After a focused failure identifies a source defect, patch the checkout directly; do not look up upstream fix commits or substitute a package-index install for the checkout.",
-        "If the focused failure is already observed, do not keep installing dependencies before the source patch; patch first, then verify with the shortest available command and git diff.",
-        "Edit the benchmark checkout, then use shell/git/test tools to gather proof."
-      ]
-      : ["Use read-only evidence first.", "Execute only governed tools."],
-    verificationPlan: sweBench
-      ? [
-        "Run focused benchmark or repository tests relevant to the modified files.",
-        "If full dependency installation fails or times out, record it as partial verification and still capture the focused test attempt plus git diff.",
-        "Capture git diff and test output before reporting."
-      ]
-      : ["Collect proof evidence.", "Run focused checks before delivery."],
+    toolStrategy: ["Use read-only evidence first.", "Execute only governed tools."],
+    verificationPlan: ["Collect proof evidence.", "Run focused checks before delivery."],
     repairPolicy: ["Return to the owning failed phase when acceptance fails."],
     stopConditions: ["Budget exhausted.", "User guidance requires clarification."],
     questionsForUser: request.brief.needsUserConfirmation ? request.brief.missingInfo : [],
@@ -651,10 +639,6 @@ function createDeterministicDecisionEnvelope(request: TaskDecisionRequest, goal:
     compatibility: TASK_DELIVERY_FLOW_COMPATIBILITY,
     redaction: { class: "internal" }
   };
-}
-
-function isSweBenchBrief(brief: TaskBrief): boolean {
-  return brief.intentKind === "evaluation" && brief.normalizedIntent === "run swe-bench lite task";
 }
 
 function createPhaseRecords(plan: TaskDeliveryPlan, acceptance: TaskAcceptanceReview): readonly TaskDeliveryPhaseRecord[] {

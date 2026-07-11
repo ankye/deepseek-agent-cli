@@ -4,6 +4,7 @@ import {
   compileTaskProfile,
   getTaskProfile,
   listTaskProfiles,
+  softwareEngineerProfile,
   webpageGenerationProfile
 } from "@deepseek/task-profiles";
 import {
@@ -19,8 +20,86 @@ describe("task profile catalog", () => {
     assert.equal(profile?.profileId, webpageGenerationProfile.profileId);
     assert.deepEqual(
       listTaskProfiles().map((entry) => entry.profileId),
-      ["evaluation/webpage-generation.v1"]
+      ["evaluation/webpage-generation.v1", "engineering/software-engineer.v1"]
     );
+  });
+
+  it("exposes software-engineer as a reusable staged engineering workflow contract", () => {
+    assert.equal(getTaskProfile("software-engineer")?.profileId, softwareEngineerProfile.profileId);
+
+    const compiled = compileTaskProfile(softwareEngineerProfile, {
+      parameters: { workspaceRootRef: "ref:workspace-root" }
+    });
+    const stages = compiled.graph.stages;
+
+    assert.equal(compiled.profileId, "engineering/software-engineer.v1");
+    assert.deepEqual(
+      stages.map((stage) => stage.stageId),
+      ["stage:understand", "stage:plan", "stage:change", "stage:verify", "stage:report"]
+    );
+    assert.deepEqual(stages.map((stage) => stage.dependsOn), [
+      [],
+      ["stage:understand"],
+      ["stage:plan"],
+      ["stage:change"],
+      ["stage:verify"]
+    ]);
+
+    for (const stage of stages) {
+      const parameters = stage.parameters as {
+        readonly requiredFamilyIds?: readonly string[];
+        readonly successCriteria?: readonly string[];
+        readonly requiredEvidenceRefs?: readonly string[];
+        readonly fallbackBlockerCriteria?: readonly string[];
+        readonly decisionBoardProjection?: { readonly profileId?: string; readonly stageId?: string };
+      } | undefined;
+
+      assert.ok(stage.allowedTools?.length, `${stage.stageId} should declare allowed tool families`);
+      assert.ok(parameters?.requiredFamilyIds?.length, `${stage.stageId} should declare required tool families`);
+      assert.ok(parameters?.successCriteria?.length, `${stage.stageId} should declare success criteria`);
+      assert.ok(parameters?.requiredEvidenceRefs?.length, `${stage.stageId} should declare required evidence refs`);
+      assert.ok(parameters?.fallbackBlockerCriteria?.length, `${stage.stageId} should declare blocker criteria`);
+      assert.equal(parameters?.decisionBoardProjection?.profileId, "engineering/software-engineer.v1");
+      assert.equal(parameters?.decisionBoardProjection?.stageId, stage.stageId);
+      assert.deepEqual(stage.acceptance?.requiredRefs, parameters?.requiredEvidenceRefs);
+    }
+
+    assert.deepEqual(stages[0]?.allowedTools, [
+      "file.read",
+      "file.list",
+      "file.stat",
+      "json.read",
+      "path.resolve",
+      "workspace.glob",
+      "search.text",
+      "search.symbol",
+      "code.diagnostics-lsp",
+      "git.status-diff",
+      "context.project-index"
+    ]);
+    assert.deepEqual(stages[2]?.allowedTools, [
+      "file.write",
+      "file.edit",
+      "file.copy",
+      "file.move",
+      "file.delete",
+      "directory.create",
+      "file.touch",
+      "json.patch",
+      "patch.apply",
+      "revert.undo",
+      "shell.run",
+      "process.output",
+      "git.status-diff"
+    ]);
+    assert.deepEqual(stages[3]?.allowedTools, [
+      "shell.run",
+      "process.output",
+      "code.diagnostics-lsp",
+      "build.test-lint-typecheck",
+      "package.manager",
+      "git.status-diff"
+    ]);
   });
 
   it("compiles base, fragments, overlays, and local params into a stable typed DAG", () => {

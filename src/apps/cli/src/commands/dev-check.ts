@@ -10,6 +10,7 @@ import type {
 import { CLI_PALETTE_SCHEMA_VERSION } from "@deepseek/platform-contracts";
 import type { CliOptions, CliRunOptions } from "../types.js";
 import { createCliAgentRuntime } from "../host/runtime.js";
+import { resolveCliWorkspaceRoot } from "../host/workspace-root.js";
 
 export type DevCheckAction = "openspec" | "typecheck" | "lint" | "test" | "boundaries" | "build-cli";
 export type DevCheckStatus = "completed" | "failed" | "denied";
@@ -56,10 +57,11 @@ const supportedActions = new Set(Object.keys(descriptors));
 const shellFragmentPattern = /[;&|`$<>]|\b(?:rm|del|erase|rmdir|Remove-Item|git\s+(?:reset|checkout|clean|push|commit|merge|rebase))\b/i;
 
 export async function runDevCheckCommand(options: CliOptions, write: (line: string) => Promise<void>, runOptions: CliRunOptions): Promise<void> {
-  const runtime = await createCliAgentRuntime({ live: options.live, workspaceRoot: process.cwd() }, runOptions);
+  const workspaceRoot = await resolveCliWorkspaceRoot(runOptions);
+  const runtime = await createCliAgentRuntime({ live: options.live, workspaceRoot }, runOptions);
   try {
     const input = checkInput(options);
-    const result = await resolveDevCheck(runtime.deps.platform, process.cwd(), input.action, input.args);
+    const result = await resolveDevCheck(runtime.deps.platform, workspaceRoot, input.action, input.args);
     for (const line of renderDevCheckResult(result, options.output)) await write(line);
   } finally {
     await runtime.kernel.shutdown("cli-dev-check-completed");

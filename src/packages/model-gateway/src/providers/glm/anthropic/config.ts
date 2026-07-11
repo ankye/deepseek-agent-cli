@@ -20,6 +20,7 @@ export const glmAnthropicProviderConfig: ModelProviderConfig = {
 export const defaultGlmAnthropicProfile: ModelProfile = {
   id: asId<"modelProfile">("model-glm-anthropic-default"),
   providerId: glmAnthropicProviderId,
+  provider: "glm",
   model: "glm-5.1",
   temperature: 0
 };

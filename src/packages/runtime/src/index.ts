@@ -26,6 +26,14 @@ export { classifyEvidenceTask, createEvidenceFirstRuntimeContext, createEvidence
 export * from "./self-repair/index.js";
 export { createAgentLoopBudget, consumedBudgetEvents } from "./modes/budgets.js";
 export { createRuntimeModePlan } from "./modes/phase-planner.js";
+export {
+  createReadyStageBudgetUsage,
+  nextReadyStageBudgetUsage,
+  readyStageBudgetEventData,
+  readyStageBudgetForControl,
+  readyStageBudgetKey,
+  readyStageBudgetReviewMessage
+} from "./ready-stage-budget.js";
 export { createInteractionModeState, createInteractionModeTransition, createAgentModeBinding, mapReasoningEffort, summarizeModePlan } from "./modes/mode-state.js";
 export { LAZY_DELEGATION_PATTERNS, validateWorkOrderCompleteness, createDelegationSkipDecision } from "./modes/delegation-policy.js";
 export { createPendingVerifierResult } from "./modes/verifier-policy.js";

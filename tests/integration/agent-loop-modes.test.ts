@@ -123,7 +123,7 @@ describe("agent loop mode orchestration", () => {
     assert.equal(events.some((event) => event.kind === "agent.repair.started"), true);
     assert.equal(events.some((event) => event.kind === "agent.repair.stopped" && event.data.stopReason === "completed"), true);
     assert.equal(gateway.requests.length, 3);
-    assert.equal(gateway.requests[1]?.messages?.some((message) => message.role === "tool" && message.toolName === "agent.self-repair"), true);
+    assert.equal(hasSelfRepairFeedback(gateway.requests[1]), true);
     assert.equal(events.at(-1)?.kind, "agent.loop.completed");
     assert.equal(terminal?.selfRepair?.activated, true);
     assert.equal(terminal?.modeSummary?.verifierResults.at(-1)?.verdict, "pass");
@@ -228,7 +228,7 @@ class RepairingVerifierModelGateway implements ModelGateway {
 
   async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
     this.requests.push(request);
-    const hasSelfRepairFeedback = request.messages?.some((message) => message.role === "tool" && message.toolName === "agent.self-repair") ?? false;
+    const hasSelfRepairFeedback = requestHasSelfRepairFeedback(request);
     const hasReadEvidence = request.messages?.some((message) => message.role === "tool" && message.toolName === "core.file.read") ?? false;
     if (hasSelfRepairFeedback && !hasReadEvidence) {
       yield { kind: "tool-call", id: "repair-readme", name: "core.file.read", input: { path: "README.md" } };
@@ -279,6 +279,17 @@ class RepairingVerifierModelGateway implements ModelGateway {
       redaction: { class: "internal" }
     };
   }
+}
+
+function requestHasSelfRepairFeedback(request: ModelRequest | undefined): boolean {
+  return request?.messages?.some((message) =>
+    (message.role === "tool" && message.toolName === "agent.self-repair") ||
+    (message.role === "system" && message.content.includes("Self-repair failure evidence"))
+  ) ?? false;
+}
+
+function hasSelfRepairFeedback(request: ModelRequest | undefined): boolean {
+  return requestHasSelfRepairFeedback(request);
 }
 
 class ReadThenFinishModelGateway implements ModelGateway {

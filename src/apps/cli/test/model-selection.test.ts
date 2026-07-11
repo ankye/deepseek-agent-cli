@@ -88,12 +88,17 @@ describe("cli model selection", () => {
     assert.deepEqual(policy.workflow.stages.map((stage) => stage.id), [
       "understand",
       "change",
-      "verify"
+      "verify",
+      "score",
+      "package"
     ]);
-    assert.equal(policy.workflow.capabilityIds.includes("core.swe.bench.run"), false);
+    assert.equal(policy.workflow.capabilityIds.includes("core.swe.harness.run"), true);
+    assert.equal(policy.workflow.capabilityIds.includes("core.swe.prediction.write"), true);
     assert.equal(policy.workflow.stages[0]?.capabilityIds.includes("core.file.read"), true);
     assert.equal(policy.workflow.stages[1]?.capabilityIds.includes("core.file.edit"), true);
     assert.equal(policy.workflow.stages[2]?.capabilityIds.includes("core.test.run"), true);
+    assert.equal(policy.workflow.stages[3]?.capabilityIds.includes("core.swe.harness.run"), true);
+    assert.equal(policy.workflow.stages[4]?.capabilityIds.includes("core.swe.prediction.write"), true);
   });
 
   it("represents SWE-bench CLI profile as a workflow role over generic capabilities", () => {
@@ -106,7 +111,7 @@ describe("cli model selection", () => {
     assert.equal(policy.workflow.graphId, "workflow/evaluation.swe-bench-lite.v1");
     assert.equal(policy.workflow.priority, "primary");
     assert.equal(policy.workflow.orchestrationMode, "staged-capability-workflow");
-    assert.deepEqual(policy.toolProjection, "all");
+    assert.deepEqual(policy.toolProjection, "safe-all");
     assert.deepEqual(policy.contextPipeline, { enabled: true });
     assert.deepEqual(policy.limits, SWE_BENCH_AGENT_LOOP_LIMITS);
     assert.deepEqual(policy.workflow.capabilityIds, [
@@ -140,6 +145,41 @@ describe("cli model selection", () => {
     assert.equal(policy.toolProjection, "read-only");
     assert.equal(policy.toolProjectionSource, "user");
     assert.equal(policy.workflow.capabilityIds.includes("core.swe.bench.run"), true);
+  });
+
+  it("compiles engineering workflow capability ids into required tool families", () => {
+    const policy = resolveCliAgentProfilePolicy({
+      prompt: "修复这个仓库里的 CLI 调度缺陷，补测试并跑验证。"
+    });
+
+    const metadata = cliAgentProfilePolicyMetadata(policy) as {
+      readonly requiredFamilyIds?: readonly string[];
+      readonly capabilityAffordanceCompiler?: {
+        readonly status?: string;
+        readonly requiredFamilyIds?: readonly string[];
+        readonly resolvedCapabilityIds?: readonly string[];
+        readonly missingCapabilityIds?: readonly string[];
+      };
+      readonly stagedTaskWorkflow?: {
+        readonly graph?: {
+          readonly stages?: readonly {
+            readonly parameters?: {
+              readonly requiredFamilyIds?: readonly string[];
+            };
+          }[];
+        };
+      };
+    };
+    const compiler = metadata.capabilityAffordanceCompiler;
+    const stageFamilies = metadata.stagedTaskWorkflow?.graph?.stages?.map((stage) => stage.parameters?.requiredFamilyIds ?? []) ?? [];
+
+    assert.equal(compiler?.status, "ready");
+    assert.equal(compiler?.missingCapabilityIds?.length, 0);
+    assert.equal(compiler?.requiredFamilyIds?.includes("file.edit"), true);
+    assert.equal(compiler?.requiredFamilyIds?.includes("build.test-lint-typecheck"), true);
+    assert.equal(compiler?.resolvedCapabilityIds?.includes("core.test.run"), true);
+    assert.equal(metadata.requiredFamilyIds?.includes("patch.apply"), true);
+    assert.equal(stageFamilies.some((families) => families.includes("build.test-lint-typecheck")), true);
   });
 
   it("compiles SWE-bench profile workflow into replayable staged-task metadata", () => {

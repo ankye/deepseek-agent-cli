@@ -56,17 +56,26 @@ describe("task delivery flow runtime controller", () => {
     assert.equal(invalidation.invalidatedFields.includes("profileSelection"), true);
   });
 
-  it("classifies short SWE-bench Lite prompts as executable evaluation tasks", () => {
+  it("keeps benchmark-named prompts generic unless an external evaluation profile selects them", () => {
+    const benchmarkNamed = createTaskDeliveryFlowSummary({
+      rawInput: "给我完成 Benchmark Lite 第 1 题测试，跑通并告诉我结果。",
+      activeTaskAvailable: true
+    });
+
+    assert.equal(benchmarkNamed.brief.intentKind, "unknown");
+    assert.equal(benchmarkNamed.brief.needsUserConfirmation, true);
+    assert.equal(benchmarkNamed.decisionRequest.candidateProfiles[0], "coding/general.v1");
+
     const summary = createTaskDeliveryFlowSummary({
-      rawInput: "给我完成 SWE-bench Lite 第 1 题测试，跑通并告诉我结果。",
+      rawInput: "跑分并收集验收证据。",
       activeTaskAvailable: true
     });
 
     assert.equal(summary.brief.intentKind, "evaluation");
-    assert.equal(summary.brief.normalizedIntent, "run swe-bench lite task");
+    assert.equal(summary.brief.normalizedIntent, "run evaluation score");
     assert.equal(summary.brief.needsUserConfirmation, false);
-    assert.equal(summary.decisionRequest.candidateProfiles[0], "evaluation/swe-bench-lite.v1");
-    assert.equal(summary.decisionEnvelope.profileSelection, "evaluation/swe-bench-lite.v1");
+    assert.equal(summary.decisionRequest.candidateProfiles[0], "evaluation/dynamic.v1");
+    assert.equal(summary.decisionEnvelope.profileSelection, "evaluation/dynamic.v1");
     assert.equal(summary.decisionRequest.allowedTools.includes("workspace.write"), true);
     assert.equal(summary.decisionRequest.allowedTools.includes("shell.run"), true);
     const modelFacingGuidance = [
@@ -74,28 +83,41 @@ describe("task delivery flow runtime controller", () => {
       ...summary.decisionEnvelope.toolStrategy,
       ...summary.decisionEnvelope.verificationPlan
     ].join("\n");
-    assert.equal(modelFacingGuidance.includes(".deepseek/swebench-workspaces"), false);
+    assert.equal(modelFacingGuidance.includes(".deepseek/evaluation-workspaces"), false);
     assert.equal(modelFacingGuidance.includes("historical"), false);
-    assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("governed SWE-bench run")), true);
-    assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("run-scoped")), true);
-    assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("runtime guard")), true);
-    assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("minimal failing regression")), true);
-    assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("full dependency installation")), true);
-    assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("project-local virtual environment")), true);
-    assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("host/global package installers")), true);
-    assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("same package from a package index")), true);
-    assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("upstream git history")), true);
-    assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("After a focused regression fails")), true);
-    assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("After focused verification passes")), true);
-    assert.equal(summary.decisionEnvelope.toolStrategy.some((step) => step.includes("governed SWE-bench run")), true);
-    assert.equal(summary.decisionEnvelope.toolStrategy.some((step) => step.includes("run-scoped checkout")), true);
-    assert.equal(summary.decisionEnvelope.toolStrategy.some((step) => step.includes("minimal reproduction")), true);
-    assert.equal(summary.decisionEnvelope.toolStrategy.some((step) => step.includes("one dependency setup attempt")), true);
-    assert.equal(summary.decisionEnvelope.toolStrategy.some((step) => step.includes("patch the checkout directly")), true);
-    assert.equal(summary.decisionEnvelope.toolStrategy.some((step) => step.includes("do not keep installing dependencies")), true);
-    assert.equal(summary.decisionEnvelope.verificationPlan.some((step) => step.includes("focused benchmark")), true);
-    assert.equal(summary.decisionEnvelope.verificationPlan.some((step) => step.includes("full dependency installation")), true);
+    assert.equal(modelFacingGuidance.includes("Benchmark Lite"), false);
+    assert.equal(summary.decisionRequest.constraints.some((constraint) => constraint.includes("prompt assembly")), true);
+    assert.equal(summary.decisionEnvelope.toolStrategy.some((step) => step.includes("governed tools")), true);
+    assert.equal(summary.decisionEnvelope.verificationPlan.some((step) => step.includes("focused checks")), true);
     assert.equal(summary.plan.planningMode, "catalog-profile");
     assert.equal(summary.delivery.status, "returned");
+  });
+
+  it("classifies read-only CLI architecture analysis as executable diagnostics work", () => {
+    const summary = createTaskDeliveryFlowSummary({
+      rawInput: "分析这个仓库的 CLI 调度架构边界，指出意图识别、任务拆分、profile 拼装和工具编排在哪里落地，不要修改文件。",
+      activeTaskAvailable: true
+    });
+
+    assert.equal(summary.brief.intentKind, "diagnostics");
+    assert.equal(summary.brief.needsUserConfirmation, false);
+    assert.equal(summary.brief.missingInfo.length, 0);
+    assert.equal(summary.decisionRequest.candidateProfiles[0], "analysis/read-only.v1");
+    assert.equal(summary.decisionEnvelope.profileSelection, "analysis/read-only.v1");
+    assert.equal(summary.plan.planningMode, "catalog-profile");
+    assert.equal(summary.decisionRequest.allowedTools.includes("workspace.read"), true);
+    assert.equal(summary.decisionRequest.allowedTools.includes("search.text"), true);
+    assert.equal(summary.decisionRequest.allowedTools.includes("workspace.write"), false);
+  });
+
+  it("preserves path literal casing in default normalized intents", () => {
+    const summary = createTaskDeliveryFlowSummary({
+      rawInput: "生成 docs/USAGE.md 和 examples/config.json。",
+      activeTaskAvailable: true
+    });
+
+    assert.equal(summary.brief.intentKind, "unknown");
+    assert.equal(summary.brief.normalizedIntent.includes("docs/USAGE.md"), true);
+    assert.equal(summary.brief.normalizedIntent.includes("docs/usage.md"), false);
   });
 });

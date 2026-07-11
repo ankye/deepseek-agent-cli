@@ -626,7 +626,7 @@ function modeStateFor(requestedMode: string): JsonObject {
     case "plan":
       return { mode: "plan", agentMode: "planner", toolProjection: "read-only", reviewRequired: false };
     case "auto":
-      return { mode: "auto", agentMode: "implementer", toolProjection: "all", reviewRequired: false };
+      return { mode: "auto", agentMode: "implementer", toolProjection: "safe-all", reviewRequired: false };
     case "review":
       return { mode: "review", agentMode: "verifier", toolProjection: "read-only", reviewRequired: true };
     case "status":

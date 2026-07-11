@@ -4,7 +4,6 @@
 Define how the agent loop coordinates planning, tool governance, verification, repair, synthesis, and terminal phases for DeepSeek runtime turns.
 
 定义 agent loop 如何协调 DeepSeek runtime turn 中的 planning、tool governance、verification、repair、synthesis 与 terminal 阶段。
-
 ## Requirements
 ### Requirement: First Usable Agent Loop / 第一个可用 Agent Loop
 
@@ -359,3 +358,120 @@ For structured, mutating, or externally scored tasks, the agent loop SHALL NOT e
 - **THEN** final assistant text without matching contract verification does not count as completed delivery
 - **AND** the loop either enters self-repair or fails closed with typed diagnostics
 - **中文** 当任务要求 JSON artifact、schema-compliant file、command plan、workspace mutation 或可由 benchmark 检查的 output 时，只有 final assistant text 而没有匹配的 contract verification 不得计为完成交付；loop 必须进入 self-repair 或带 typed diagnostics 安全失败。
+
+### Requirement: Agent Loop Enforces Required Workflow Actions / Agent Loop 强制工作流必需动作
+
+When a primary staged workflow has a ready-stage control record, the agent loop SHALL enforce the required action semantics instead of treating the turn as unconstrained conversational planning.
+
+当 primary staged workflow 具备 ready-stage control record 时，agent loop 必须强制执行 required action 语义，而不得把该轮当成无约束对话规划。
+
+#### Scenario: Required action is visible before model dispatch / 必需动作在模型派发前可见
+
+- **WHEN** ready-stage control exists for a model iteration
+- **THEN** `prompt.assembled`, `model.requested`, and provider request audit metadata include a bounded summary of the active stage and required/progress action
+- **AND** stable task intent/profile contract remains separate from dynamic run state so provider cache evidence can distinguish static and dynamic regions
+- **中文** 当某次模型迭代存在 ready-stage control 时，`prompt.assembled`、`model.requested` 与 provider request audit metadata 必须包含 active stage 与 required/progress action 的有界摘要；稳定 task intent/profile contract 必须与动态 run state 分离，使 provider cache evidence 能区分静态与动态区域。
+
+#### Scenario: No-tool model turn cannot consume workflow budget silently / 无工具模型轮次不得静默消耗工作流预算
+
+- **WHEN** a required workflow action exists
+- **AND** the model response contains no tool call and no accepted terminal blocker
+- **THEN** the agent loop emits a typed no-progress event with workflow graph id, stage id, required action, model request count, and retry policy
+- **AND** the loop either gives one bounded corrective feedback turn or fails closed according to the ready-stage control policy
+- **AND** it MUST NOT continue indefinitely until the generic model-iteration budget is exhausted
+- **中文** 当存在 required workflow action，且模型响应没有 tool call 也没有被接受的 terminal blocker 时，agent loop 必须发出 typed no-progress event，包含 workflow graph id、stage id、required action、model request count 与 retry policy；loop 必须按 ready-stage control policy 给出一次有界纠偏反馈或安全失败；不得一直运行到通用 model-iteration budget 耗尽。
+
+### Requirement: Terminal Workflow Capabilities Close The Supervisor / 终端工作流 Capability 关闭 Supervisor
+
+The agent loop SHALL close exactly once when a terminal workflow capability succeeds, fails, is cancelled, or is rejected during execution, after recording structured stage and tool result evidence.
+
+terminal workflow capability 成功、失败、取消或执行拒绝后，agent loop 必须在记录结构化 stage 与 tool result evidence 后恰好关闭一次。
+
+#### Scenario: Terminal capability outcome stops outer loop / Terminal Capability 产生结果后停止外层 Loop
+
+- **WHEN** a ready-stage control marks a capability as terminal for the supervising workflow
+- **AND** that capability returns a governed kernel terminal outcome
+- **THEN** the agent loop records the tool result evidence, advances or closes the workflow stage where applicable, emits terminal workflow events, and emits one terminal agent-loop event with matching success or failure status
+- **AND** it does not request another model iteration merely to summarize the terminal result
+- **中文** 当 ready-stage control 将某个 capability 标记为 supervising workflow 的 terminal capability，且该 capability 返回受管 kernel terminal outcome 时，agent loop 必须记录 tool result evidence、在适用时推进或关闭 workflow stage、发出 terminal workflow events，并以匹配的成功或失败状态发出一个 agent-loop terminal event；不得仅为了总结 terminal result 再请求一次模型。
+
+### Requirement: Caller Deadline Caps Nested Work / Caller Deadline 限制嵌套工作
+
+The agent loop SHALL cap model-requested tool timeouts, nested capability deadlines, and child process deadlines by the caller's remaining deadline.
+
+agent loop 必须用 caller 剩余 deadline 限制模型请求的 tool timeout、嵌套 capability deadline 与 child process deadline。
+
+#### Scenario: Model timeout cannot inflate caller deadline / 模型 Timeout 不能放大 Caller Deadline
+
+- **WHEN** a model tool input requests a timeout greater than the caller deadline or remaining stage deadline
+- **THEN** preflight or runtime timeout normalization caps the nested timeout to the smaller remaining deadline
+- **AND** the runtime records the requested timeout, capped timeout, caller deadline, and reason
+- **AND** long-running manifest defaults may raise too-short tool inputs only up to the caller deadline, never beyond it
+- **中文** 当模型 tool input 请求的 timeout 大于 caller deadline 或剩余 stage deadline 时，preflight 或 runtime timeout normalization 必须把嵌套 timeout 限制为较小的剩余 deadline；runtime 必须记录 requested timeout、capped timeout、caller deadline 与原因；long-running manifest default 可以把过短 tool input 提升到 caller deadline 内，但绝不能超过 caller deadline。
+
+### Requirement: Execution-Bearing Coding Prompts Use Primary Role Workflows / 执行型 Coding Prompt 使用 Primary Role Workflow
+
+The agent loop SHALL route execution-bearing coding prompts through a primary role workflow instead of treating the role profile as an advisory prompt hint.
+
+agent loop 必须将具备执行性质的 coding prompt 路由到 primary role workflow，而不是把 role profile 当作 advisory prompt hint。
+
+#### Scenario: Engineering task has ready-stage control / 工程任务具备 Ready-Stage Control
+
+- **WHEN** a user prompt asks the CLI to fix, implement, modify, debug, test, verify, refactor, review, or otherwise perform repository-sensitive engineering work
+- **THEN** the selected profile is a primary engineering role profile
+- **AND** the provider request metadata includes ready-stage control before model dispatch
+- **AND** the model-visible required action is constrained by the active engineering stage
+- **中文** 当用户 prompt 要求 CLI 修复、实现、修改、调试、测试、验证、重构、审查或执行其它 repository-sensitive engineering work 时，选中的 profile 必须是 primary engineering role profile；provider request metadata 必须在模型派发前包含 ready-stage control；模型可见的 required action 必须受当前 engineering stage 约束。
+
+#### Scenario: Casual chat remains advisory / 闲聊保持 Advisory
+
+- **WHEN** a user prompt is casual chat, low-risk explanation, or pure informational conversation without repository-sensitive execution intent
+- **THEN** the selected profile may remain advisory
+- **AND** the loop must not force mutation-oriented workflow stages or required tool calls
+- **中文** 当用户 prompt 是闲聊、低风险解释或没有 repository-sensitive execution intent 的纯信息对话时，选中的 profile 可以保持 advisory；loop 不得强制进入 mutation-oriented workflow stage 或 required tool call。
+
+### Requirement: Stable Profile Contract Is Separate From Dynamic Run State / 稳定 Profile Contract 与动态 Run State 分离
+
+The agent loop SHALL keep stable role/workflow/capability profile contracts separate from dynamic run state and progress markers.
+
+agent loop 必须将稳定的 role/workflow/capability profile contract 与动态 run state、progress marker 分离。
+
+#### Scenario: Provider request distinguishes stable and dynamic profile data / Provider Request 区分稳定与动态 Profile 数据
+
+- **WHEN** a primary role workflow is projected into a provider request
+- **THEN** stable profile identifiers, stage contracts, allowed capabilities, and exit criteria are represented separately from current attempts, produced refs, diagnostics, and stage status
+- **AND** cache/prefix analysis can distinguish profile contract churn from dynamic run-state churn
+- **中文** 当 primary role workflow 被投影到 provider request 时，稳定的 profile id、stage contract、allowed capabilities 与 exit criteria 必须与当前 attempts、produced refs、diagnostics 与 stage status 分离表达；cache/prefix analysis 必须能区分 profile contract churn 与 dynamic run-state churn。
+
+### Requirement: Ordinary CLI Stage Progression
+
+The agent loop SHALL distinguish ordinary CLI staged workflows from evaluation runner workflows before applying stage acceptance gates.
+
+Agent loop 必须在应用 stage acceptance gate 前区分普通 CLI staged workflows 与 evaluation runner workflows。
+
+#### Scenario: Ordinary CLI workflow auto-advances from accepted evidence / 普通 CLI workflow 根据已接受证据自动推进
+
+- **WHEN** an ordinary CLI engineering workflow stage completes a runtime-accepted tool action
+- **THEN** the agent loop records typed stage evaluation evidence and advances the stage without requiring technical-director acceptance
+- **AND** the next dependent stage becomes ready when its input refs are satisfied
+- **中文** 当普通 CLI engineering workflow stage 完成 runtime 已接受的工具动作时，agent loop 必须记录结构化 stage evaluation evidence，并在不要求技术总监验收的情况下推进该 stage；当依赖 input refs 满足时，下一个依赖 stage 必须变为 ready。
+
+#### Scenario: Evaluation runner workflows keep supervisor acceptance / Evaluation runner workflow 保留 supervisor 验收
+
+- **WHEN** an evaluation or managed runner workflow stage completes tool evidence
+- **THEN** the agent loop MAY require supervisor or technical-director acceptance before downstream expansion according to the profile's stage acceptance mode
+- **中文** 当 evaluation 或 managed runner workflow stage 完成工具证据时，agent loop 可以根据 profile 的 stage acceptance mode 要求 supervisor 或技术总监验收后再扩展下游。
+
+### Requirement: Active Workflow Projection Does Not Fall Back To All Tools
+
+Primary staged workflows SHALL NOT expose every model-visible tool merely because no stage is currently ready.
+
+Primary staged workflows 不得仅因为当前没有 ready stage 就暴露所有 model-visible tools。
+
+#### Scenario: Active workflow without ready stage fails closed / Active workflow 无 ready stage 时安全失败
+
+- **WHEN** a primary staged workflow has unfinished stages but no ready stage and no explicit supervisor gate override
+- **THEN** the agent loop emits a typed workflow orchestration blocker or projects a bounded supervisor recovery action
+- **AND** it does not fall back to all registered model-visible tools
+- **中文** 当 primary staged workflow 存在未完成 stage、但没有 ready stage 且没有显式 supervisor gate override 时，agent loop 必须发出 typed workflow orchestration blocker 或投影有界 supervisor recovery action；不得回退到所有已注册 model-visible tools。
+

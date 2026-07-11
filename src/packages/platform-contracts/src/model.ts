@@ -18,6 +18,7 @@ export interface ModelProviderConfig extends JsonObject {
 export interface ModelProfile extends JsonObject {
   readonly id: ModelProfileId;
   readonly providerId: ModelProviderId;
+  readonly provider?: string;
   readonly model: string;
   readonly temperature?: number;
   readonly cacheHints?: ModelCacheHintCapabilityMetadata;

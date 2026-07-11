@@ -38,7 +38,7 @@ export function createRuntimeModePlan(input: {
   const agentMode = input.request.agentMode ?? "default";
   const factSensitive = input.evidenceFirst.classification.evidenceRequired;
   const mutatingOrGenerated = taskLooksMutating(input.request.prompt) || input.evidenceFirst.classification.intents.includes("generated-artifact");
-  const nonTrivial = factSensitive || mutatingOrGenerated || input.request.toolProjection === "read-write" || input.request.toolProjection === "all";
+  const nonTrivial = factSensitive || mutatingOrGenerated || input.request.toolProjection === "read-write" || input.request.toolProjection === "safe-all" || input.request.toolProjection === "all";
 
   const evidenceBudget = createAgentLoopBudget({
     kind: "evidence",

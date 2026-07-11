@@ -16,6 +16,7 @@ import {
   createSecretRedactionDecision
 } from "@deepseek/policy-sandbox";
 import { kernelError } from "./errors.js";
+import { normalizeResourceLockKey, normalizeWorkspaceResourceLockKey } from "./resource-locks.js";
 
 export interface ExecutionEnvelopeBuildInput {
   readonly request: RuntimeKernelRequest;
@@ -27,11 +28,13 @@ export interface ExecutionEnvelopeBuildInput {
   readonly trace: TraceContext;
   readonly createdAt: string;
   readonly platformContext?: PlatformExecutionContext;
+  readonly resolveWorkspacePath?: WorkspacePathResolver;
 }
 
 export function buildExecutionEnvelope(input: ExecutionEnvelopeBuildInput): ExecutionEnvelope {
   const timeoutMs = input.request.timeoutMs ?? input.manifest.timeoutMs ?? 30_000;
-  const resourceLocks = resourceLocksFor(input.manifest.sideEffect, input.request.input);
+  const resourceLockOptions = input.resolveWorkspacePath ? { resolveWorkspacePath: input.resolveWorkspacePath } : {};
+  const resourceLocks = resourceLocksFor(input.manifest.sideEffect, input.request.input, resourceLockOptions);
   const resourceScope = analyzeResourceScope(input.request.input, input.manifest.sideEffect);
   const secretExposure = createSecretRedactionDecision(input.request.input, { class: "internal" });
   const requestedSandboxProfile = input.platformContext?.sandboxProfile ?? input.manifest.sandboxRequirements?.profile;
@@ -229,13 +232,49 @@ export function validateExecutionEnvelope(envelope: unknown): readonly KernelErr
   return errors;
 }
 
-export function resourceLocksFor(sideEffect: CapabilityManifest["sideEffect"], input: JsonObject): readonly string[] {
+export type WorkspacePathResolver = (workspaceRoot: string, inputPath: string) => { readonly ok: boolean; readonly value?: { readonly relativePath: string } };
+
+export function resourceLocksFor(sideEffect: CapabilityManifest["sideEffect"], input: JsonObject, options: { readonly resolveWorkspacePath?: WorkspacePathResolver } = {}): readonly string[] {
   const locks: string[] = [];
   const path = typeof input.path === "string" ? input.path : undefined;
   const cwd = typeof input.cwd === "string" ? input.cwd : typeof input.workspaceRoot === "string" ? input.workspaceRoot : undefined;
-  if (sideEffect === "write" && path) locks.push(`workspace:${path}`);
-  if (sideEffect === "process" && cwd) locks.push(`process:${cwd}`);
+  const workspaceRoot = typeof input.workspaceRoot === "string" ? input.workspaceRoot : undefined;
+  if (sideEffect === "write" && path) locks.push(`workspace:${workspaceLockKey(path, workspaceRoot, options.resolveWorkspacePath)}`);
+  if (sideEffect === "write" && typeof input.patch === "string") {
+    for (const patchPath of unifiedPatchTargetPaths(input.patch)) {
+      locks.push(`workspace:${workspaceLockKey(patchPath, workspaceRoot, options.resolveWorkspacePath)}`);
+    }
+  }
+  if (sideEffect === "write" && locks.length === 0) locks.push("workspace:.");
+  if (sideEffect === "process") locks.push(`process:${workspaceLockKey(cwd ?? ".", workspaceRoot, options.resolveWorkspacePath)}`);
   return locks;
+}
+
+function workspaceLockKey(path: string, workspaceRoot: string | undefined, resolveWorkspacePath: WorkspacePathResolver | undefined): string {
+  if (workspaceRoot && resolveWorkspacePath) {
+    const resolved = resolveWorkspacePath(workspaceRoot, path);
+    if (resolved.ok) return resolved.value?.relativePath || ".";
+  }
+  return normalizeWorkspaceResourceLockKey(path, workspaceRoot);
+}
+
+function unifiedPatchTargetPaths(patch: string): readonly string[] {
+  const paths: string[] = [];
+  const lines = patch.replace(/\r\n/g, "\n").split("\n");
+  for (let index = 0; index < lines.length - 1; index += 1) {
+    const oldHeader = lines[index];
+    const newHeader = lines[index + 1];
+    if (!oldHeader?.startsWith("--- ") || !newHeader?.startsWith("+++ ")) continue;
+    const path = normalizeUnifiedPatchPath(newHeader.slice(4).trim()) ?? normalizeUnifiedPatchPath(oldHeader.slice(4).trim());
+    if (path) paths.push(path);
+  }
+  return [...new Set(paths)];
+}
+
+function normalizeUnifiedPatchPath(headerPath: string): string | undefined {
+  const path = headerPath.split(/\s+/)[0]?.replace(/\\/g, "/") ?? "";
+  if (!path || path === "/dev/null") return undefined;
+  return path.replace(/^[ab]\//, "");
 }
 
 export function policyMetadataFor(envelope: ExecutionEnvelope, input: JsonObject): JsonObject {

@@ -2,6 +2,7 @@ import type { AgentLoopOutputMode, CliReferenceItem, CliResultList, CliResultLis
 import { CLI_PALETTE_SCHEMA_VERSION } from "@deepseek/platform-contracts";
 import type { CliOptions, CliRunOptions } from "../types.js";
 import { createCliAgentRuntime } from "../host/runtime.js";
+import { resolveCliWorkspaceRoot } from "../host/workspace-root.js";
 
 export type FileManagerAction = "list" | "preview" | "references";
 
@@ -22,10 +23,11 @@ export interface FileManagerResult extends JsonObject {
 }
 
 export async function runFileManagerCommand(options: CliOptions, write: (line: string) => Promise<void>, runOptions: CliRunOptions): Promise<void> {
-  const runtime = await createCliAgentRuntime({ live: options.live, workspaceRoot: process.cwd() }, runOptions);
+  const workspaceRoot = await resolveCliWorkspaceRoot(runOptions);
+  const runtime = await createCliAgentRuntime({ live: options.live, workspaceRoot }, runOptions);
   try {
     const input = fileInput(options);
-    const result = await resolveFileManager(runtime.deps.platform, process.cwd(), input.action, input.query);
+    const result = await resolveFileManager(runtime.deps.platform, workspaceRoot, input.action, input.query);
     for (const line of renderFileManagerResult(result, options.output)) await write(line);
   } finally {
     await runtime.kernel.shutdown("cli-file-manager-completed");
@@ -67,8 +69,9 @@ export function renderFileManagerResult(result: FileManagerResult, output: Agent
 }
 
 async function resolvePreviewPath(platform: PlatformRuntime, workspaceRoot: string, query: string): Promise<string | undefined> {
-  const direct = normalizePath(query);
-  const directContent = await platform.readFile(direct).then(() => direct, () => undefined);
+  const resolved = platform.resolveWorkspacePath(workspaceRoot, query);
+  const direct = resolved.ok && resolved.value ? resolved.value.path : undefined;
+  const directContent = direct ? await platform.readFile(direct).then(() => direct, () => undefined) : undefined;
   if (directContent) return directContent;
   const matches = [...await platform.findFiles(query, workspaceRoot)].sort(compareString);
   return matches[0];

@@ -1,6 +1,7 @@
 import type { AgentLoopTerminalStatus, RuntimeEvent } from "@deepseek/platform-contracts";
 import type { CliInputStream, CliOptions, CliRunOptions } from "../types.js";
 import { createCliAgentRuntime } from "../host/runtime.js";
+import { resolveCliWorkspaceRoot } from "../host/workspace-root.js";
 import { resolveCliModelProfile } from "../host/model-selection.js";
 import type { CliTerminalCapabilityProfile } from "../host/terminal-profile.js";
 import { createInitialChatModeControlState, restoreChatModeControlState, updateChatModeControlState } from "./chat-mode-controls.js";
@@ -75,8 +76,8 @@ export async function runChatCommand(
   terminalProfile: CliTerminalCapabilityProfile,
   runOptions: CliRunOptions
 ): Promise<void> {
-  const workspaceRoot = process.cwd();
-  const runtime = await createCliAgentRuntime({ live: options.live, workspaceRoot, ...(options.modelProvider ? { modelProvider: options.modelProvider } : {}), ...(options.model ? { model: options.model } : {}) }, runOptions);
+  const workspaceRoot = await resolveCliWorkspaceRoot(runOptions);
+  const runtime = await createCliAgentRuntime({ live: options.live, workspaceRoot, ...(options.toolProjection ? { toolProjection: options.toolProjection } : {}), ...(options.toolOptIns ? { toolOptIns: options.toolOptIns } : {}), ...(options.approvalMode ? { approvalMode: options.approvalMode } : {}), ...(options.modelProvider ? { modelProvider: options.modelProvider } : {}), ...(options.model ? { model: options.model } : {}) }, runOptions);
   const profile = resolveCliModelProfile(options);
   const state: ChatSessionState = {
     sessionId: options.sessionId,
@@ -175,6 +176,8 @@ export async function runChatCommand(
         live: options.live,
         ...(reasoning ? { reasoning } : {}),
         ...(referenceContext ? { referenceContext } : {}),
+        ...(options.toolProjection ? { toolProjection: options.toolProjection } : {}),
+        ...(options.toolOptIns ? { toolOptIns: options.toolOptIns } : {}),
         ...(options.timeoutMs ? { timeoutMs: options.timeoutMs } : {})
       }, write, writeInline, bufferedInline, state.activeController.signal, terminalProfile);
       const terminal = finalAgentLoopEvent(events);

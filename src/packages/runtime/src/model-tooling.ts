@@ -64,7 +64,7 @@ export function providerMetadata(request: AgentLoopRequest): ModelProviderEventM
 
 export function modelToolResultText(event: RuntimeEvent | undefined): string {
   if (!event) return "Tool execution produced no terminal event.";
-  if (event.error) return `Tool execution failed: ${event.error.message}`;
+  if (event.error) return modelToolErrorText(event.error);
   const output = event.data.output;
   if (isJsonObjectForRuntime(output)) {
     const evidence = output.evidence;
@@ -83,6 +83,42 @@ export function modelToolResultText(event: RuntimeEvent | undefined): string {
     }
   }
   return JSON.stringify(event.data);
+}
+
+function modelToolErrorText(error: RedactedError): string {
+  const lines = [
+    `Tool execution failed: ${error.message}`,
+    `Error code: ${error.code}.`
+  ];
+  const details = isJsonObjectForRuntime(error.details) ? error.details : undefined;
+  const originalCode = typeof details?.originalCode === "string" ? details.originalCode : undefined;
+  if (originalCode) lines.push(`Original tool code: ${originalCode}.`);
+  if (error.suggestedActions && error.suggestedActions.length > 0) {
+    lines.push("Suggested next actions:");
+    for (const action of error.suggestedActions.slice(0, 3)) lines.push(`- ${action}`);
+  }
+  const compactDetails = compactErrorDetails(details);
+  if (Object.keys(compactDetails).length > 0) {
+    lines.push(`Diagnostic details: ${JSON.stringify(compactDetails)}`);
+  }
+  return lines.join("\n");
+}
+
+function compactErrorDetails(details: JsonObject | undefined): JsonObject {
+  if (!details) return {};
+  const output: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(details)) {
+    if (key === "transaction") continue;
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      output[key] = value;
+    }
+    if (Array.isArray(value)) {
+      output[key] = value
+        .filter((item) => typeof item === "string" || typeof item === "number" || typeof item === "boolean")
+        .slice(0, 8);
+    }
+  }
+  return output as JsonObject;
 }
 
 export function boundedModelText(value: string, limitBytes: number): string {
@@ -128,6 +164,8 @@ export interface ToolFeedbackInput {
   readonly status: ToolFeedbackStatus;
   readonly text: string;
   readonly diagnostics: readonly RedactedError[];
+  readonly correctiveAction?: string;
+  readonly recommendedNextAction?: string;
   readonly trace: TraceContext;
   readonly limitBytes: number;
   readonly continuation?: "continue" | "terminate";
@@ -143,6 +181,8 @@ export function buildToolResultFeedback(input: ToolFeedbackInput): ToolResultFee
     status: input.status,
     preview: toolFeedbackPreview(input.text, input.limitBytes),
     diagnostics: input.diagnostics,
+    ...(input.correctiveAction ? { correctiveAction: input.correctiveAction } : {}),
+    ...(input.recommendedNextAction ? { recommendedNextAction: input.recommendedNextAction } : {}),
     trace: {
       traceId: String(input.trace.traceId),
       correlationId: String(input.trace.correlationId)

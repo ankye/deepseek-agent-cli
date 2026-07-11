@@ -282,9 +282,10 @@ export async function readSweBenchCacheTrace(
       ) {
           lowHitProviderPrefixTooSmallCount += 1;
       }
+      const providerPrefixReuseSignal = hasProviderPrefixHint || providerPrefixHintUnsupported;
       const dynamicTailMiss = latestPromptAssemblyStable
         && hasPipelineHint
-        && hasProviderPrefixHint
+        && providerPrefixReuseSignal
         && providerPrefixFingerprints.size <= 1
         && providerHitExceedsPromptPrefix(hit, latestProviderPrefixTokenEstimate);
       if (dynamicTailMiss) {
@@ -647,7 +648,7 @@ function promptAssemblyCacheablePrefixIsStable(
   providerPrefixFingerprints: ReadonlySet<string>
 ): boolean {
   if (providerPrefixEventCount > 1) {
-    return providerPrefixFingerprints.size <= 1 && toolPlanFingerprints.size <= 1;
+    return providerPrefixFingerprints.size <= 1;
   }
   return promptAssemblyFingerprintsAreStable(sectionOrderFingerprints, budgetFingerprints, toolPlanFingerprints);
 }

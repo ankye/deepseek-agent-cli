@@ -1,8 +1,9 @@
+import { buildReferenceToolArsenalReport } from "@deepseek/core-coding-tools";
 import type { CliEvaluationComparisonSummary, CliEvaluationTaskRunRecord, JsonObject } from "@deepseek/platform-contracts";
 import type { CliModeMatrixSummary } from "./mode-matrix.js";
 
 export interface CliDeliveryCapabilityDimension extends JsonObject {
-  readonly dimensionId: "tool-family" | "mode" | "package" | "evaluation-task" | "deepseek-api" | "memory" | "cache-observability";
+  readonly dimensionId: "tool-family" | "tool-arsenal" | "mode" | "package" | "evaluation-task" | "deepseek-api" | "memory" | "cache-observability";
   readonly score: number;
   readonly targetScore: number;
   readonly passedCount: number;
@@ -29,6 +30,10 @@ export interface CliDeliveryCapabilitySummary extends JsonObject {
   readonly toolFamilyPassedCount?: number;
   readonly toolFamilyTotalCount?: number;
   readonly toolFamilyGatePassed?: boolean;
+  readonly toolArsenalScore?: number;
+  readonly toolArsenalExecutableCount?: number;
+  readonly toolArsenalTotalCount?: number;
+  readonly toolArsenalGatePassed?: boolean;
   readonly modeScore?: number;
   readonly modeCompleteCount?: number;
   readonly modeTotalCount?: number;
@@ -54,6 +59,7 @@ export interface CliDeliveryCapabilitySummary extends JsonObject {
   readonly cacheObservabilityTotalCount?: number;
   readonly cacheObservabilityGatePassed?: boolean;
   readonly blockingFamilyIds: readonly string[];
+  readonly blockingToolArsenalIds: readonly string[];
   readonly blockingModeIds: readonly string[];
   readonly blockingPackageIds: readonly string[];
   readonly blockingEvaluationTaskIds: readonly string[];
@@ -74,11 +80,14 @@ export function collectDeliveryCapabilitySummary(
   const toolMatrix = evaluation?.toolFamilyParityMatrix;
   const packageAggregate = evaluation?.packageScorecardAggregate;
   const packageScorecards = evaluation?.packageScorecards ?? [];
-  if (!toolMatrix && !modeMatrix && !packageAggregate) return undefined;
 
   const targetScore = 0.9;
   const unfinishedPenaltyPerItem = 0.1;
+  const toolArsenal = buildReferenceToolArsenalReport();
   const blockingFamilyIds = toolMatrix?.deliveryCapabilityBlockingFamilyIds.map((id) => String(id)) ?? [];
+  const blockingToolArsenalIds = toolArsenal.entries
+    .filter((entry) => entry.completionState !== "executable")
+    .map((entry) => `${entry.referenceTool}:${entry.deepSeekFamilyId}`);
   const blockingModeIds = modeMatrix?.modeDeliveryCapabilityBlockingModeIds ?? [];
   const blockingPackageIds = packageScorecards.length > 0
     ? packageScorecards.filter((scorecard) => !scorecard.deliveryCapabilityPassed).map((scorecard) => scorecard.packageId)
@@ -89,27 +98,31 @@ export function collectDeliveryCapabilitySummary(
   const blockingCapabilityIds = capabilityTargets.filter((target) => target.status !== "pass").map((target) => target.targetId);
   const unfinishedTargetIds = [
     ...blockingFamilyIds.map((id) => `tool-family:${id}`),
+    ...blockingToolArsenalIds.map((id) => `tool-arsenal:${id}`),
     ...blockingModeIds,
     ...blockingPackageIds.map((id) => `package:${id}`),
     ...blockingEvaluationTaskIds.map((id) => `evaluation-task:${id}`),
     ...blockingCapabilityIds.map((id) => `capability:${id}`)
   ];
   const unfinishedTargetCount = unfinishedTargetIds.length;
-  const dimensions = deliveryDimensions(toolMatrix, modeMatrix, packageAggregate, evaluationTaskRuns, capabilityTargets, targetScore, blockingFamilyIds, blockingModeIds, blockingPackageIds, blockingEvaluationTaskIds);
+  const dimensions = deliveryDimensions(toolMatrix, toolArsenal, modeMatrix, packageAggregate, evaluationTaskRuns, capabilityTargets, targetScore, blockingFamilyIds, blockingToolArsenalIds, blockingModeIds, blockingPackageIds, blockingEvaluationTaskIds);
   const score = roundRatio(Math.max(0, 1 - unfinishedTargetCount * unfinishedPenaltyPerItem));
   const toolGatePassed = toolMatrix ? toolMatrix.deliveryCapabilityPassed : true;
+  const toolArsenalGatePassed = blockingToolArsenalIds.length === 0;
   const packageGatePassed = packageAggregate ? packageAggregate.deliveryCapabilityPassed : true;
   const evaluationTaskGatePassed = evaluationTaskRuns.length === 0 || blockingEvaluationTaskIds.length === 0;
   const capabilityGatePassed = blockingCapabilityIds.length === 0;
-  const complete = dimensions.length > 0 && toolGatePassed && packageGatePassed && evaluationTaskGatePassed && capabilityGatePassed && score >= targetScore;
+  const complete = dimensions.length > 0 && toolGatePassed && toolArsenalGatePassed && packageGatePassed && evaluationTaskGatePassed && capabilityGatePassed && score >= targetScore;
   const solvedEvaluationTaskCount = evaluationTaskRuns.filter((run) => run.outcome === "solved").length;
   const passedCapabilityCount = capabilityTargets.filter((target) => target.status === "pass").length;
   const passedTargetCount = (toolMatrix?.deliveryCapabilityPassedFamilyCount ?? 0)
+    + toolArsenal.executableReferenceToolCount
     + (modeMatrix?.modeDeliveryCapabilityCompletedCount ?? 0)
     + (packageAggregate?.deliveryCapabilityPassedPackageCount ?? 0)
     + solvedEvaluationTaskCount
     + passedCapabilityCount;
   const totalTargetCount = (toolMatrix?.totalFamilyCount ?? 0)
+    + toolArsenal.totalReferenceToolCount
     + (modeMatrix?.modeDeliveryCapabilityTotalCount ?? 0)
     + (packageAggregate?.deliveryCapabilityTotalPackageCount ?? 0)
     + evaluationTaskRuns.length
@@ -137,6 +150,10 @@ export function collectDeliveryCapabilitySummary(
       toolFamilyTotalCount: toolMatrix.totalFamilyCount,
       toolFamilyGatePassed: toolMatrix.deliveryCapabilityPassed
     } : {}),
+    toolArsenalScore: roundRatio(toolArsenal.executableReferenceToolCount / toolArsenal.totalReferenceToolCount),
+    toolArsenalExecutableCount: toolArsenal.executableReferenceToolCount,
+    toolArsenalTotalCount: toolArsenal.totalReferenceToolCount,
+    toolArsenalGatePassed,
     ...(modeMatrix ? {
       modeScore: modeMatrix.modeDeliveryCapabilityScore,
       modeCompleteCount: modeMatrix.modeDeliveryCapabilityCompletedCount,
@@ -168,22 +185,25 @@ export function collectDeliveryCapabilitySummary(
     cacheObservabilityTotalCount: cacheObservability.totalCount,
     cacheObservabilityGatePassed: cacheObservability.gatePassed,
     blockingFamilyIds,
+    blockingToolArsenalIds,
     blockingModeIds,
     blockingPackageIds,
     blockingEvaluationTaskIds,
     blockingCapabilityIds,
-    redaction: { class: "internal", fields: ["blockingFamilyIds", "blockingModeIds", "blockingPackageIds", "blockingEvaluationTaskIds", "blockingCapabilityIds", "unfinishedTargetIds"] }
+    redaction: { class: "internal", fields: ["blockingFamilyIds", "blockingToolArsenalIds", "blockingModeIds", "blockingPackageIds", "blockingEvaluationTaskIds", "blockingCapabilityIds", "unfinishedTargetIds"] }
   };
 }
 
 function deliveryDimensions(
   toolMatrix: Pick<NonNullable<CliEvaluationComparisonSummary["toolFamilyParityMatrix"]>, "deliveryCapabilityScore" | "deliveryCapabilityPassedFamilyCount" | "totalFamilyCount" | "deliveryCapabilityPassed"> | undefined,
+  toolArsenal: ReturnType<typeof buildReferenceToolArsenalReport>,
   modeMatrix: CliModeMatrixSummary | undefined,
   packageAggregate: NonNullable<CliEvaluationComparisonSummary["packageScorecardAggregate"]> | undefined,
   evaluationTaskRuns: readonly CliEvaluationTaskRunRecord[],
   capabilityTargets: readonly CapabilityTarget[],
   targetScore: number,
   blockingFamilyIds: readonly string[],
+  blockingToolArsenalIds: readonly string[],
   blockingModeIds: readonly string[],
   blockingPackageIds: readonly string[],
   blockingEvaluationTaskIds: readonly string[]
@@ -201,6 +221,16 @@ function deliveryDimensions(
       redaction: { class: "internal", fields: ["blockingIds"] }
     });
   }
+  dimensions.push({
+    dimensionId: "tool-arsenal",
+    score: roundRatio(toolArsenal.executableReferenceToolCount / toolArsenal.totalReferenceToolCount),
+    targetScore: 1,
+    passedCount: toolArsenal.executableReferenceToolCount,
+    totalCount: toolArsenal.totalReferenceToolCount,
+    status: blockingToolArsenalIds.length === 0 ? "pass" : "blocked",
+    blockingIds: blockingToolArsenalIds,
+    redaction: { class: "internal", fields: ["blockingIds"] }
+  });
   if (modeMatrix) {
     dimensions.push({
       dimensionId: "mode",

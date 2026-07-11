@@ -4,7 +4,6 @@
 Define the generic staged task execution framework for compiling reusable profiles into replayable DAGs, governing dynamic profile admission, dispatching stages through injected executors, and preserving typed event/ref state for resume, replay, inspection, and scoring.
 
 定义通用 staged task execution 框架，用于将可复用 profiles 编译为可回放 DAG，治理 dynamic profile 准入，通过 injected executors 派发 stages，并保留 typed event/ref state 以支持恢复、回放、检查与评分。
-
 ## Requirements
 ### Requirement: Generic Staged Task Contract / 通用分阶段任务契约
 
@@ -189,3 +188,168 @@ The system SHALL keep executor kinds as a small stable mechanism set and require
 - **THEN** the change documents why existing executors plus stage contract parameters cannot express the required execution mechanism
 - **AND** it adds contract coverage, owner metadata, policy/scope declarations, timeout behavior, redaction behavior, and architecture lint or boundary evidence
 - **中文** 当 contributor 提议新增 executor kind 时，该变更必须说明为什么现有 executors 加 stage contract parameters 无法表达所需 execution mechanism；并增加 contract coverage、owner metadata、policy/scope declarations、timeout behavior、redaction behavior 与 architecture lint 或 boundary evidence。
+
+### Requirement: Primary Workflow Ready-Stage Control / 主工作流 Ready Stage 控制
+
+The runtime SHALL derive an executable ready-stage control record from every primary staged workflow before model dispatch when the workflow has at least one ready stage.
+
+当 primary staged workflow 至少存在一个 ready stage 时，runtime 必须在 model dispatch 前从该 workflow 推导出可执行的 ready-stage control record。
+
+#### Scenario: Ready stage becomes execution control / Ready Stage 变成执行控制
+
+- **WHEN** a selected profile has `workflowPriority: "primary"` and `orchestrationMode: "staged-capability-workflow"`
+- **AND** its compiled staged-task run state has a ready stage
+- **THEN** the runtime records a ready-stage control event before `model.requested`
+- **AND** the control includes workflow graph id, stage id, stage kind, allowed capability ids, progress capability ids, preferred capability id when determinable, no-tool policy, terminal-close policy, and redaction metadata
+- **AND** the control is host-neutral and generic across task families
+- **中文** 当所选 profile 具有 `workflowPriority: "primary"` 与 `orchestrationMode: "staged-capability-workflow"`，且其 compiled staged-task run state 存在 ready stage 时，runtime 必须在 `model.requested` 前记录 ready-stage control event；该 control 必须包含 workflow graph id、stage id、stage kind、allowed capability ids、progress capability ids、可确定时的 preferred capability id、no-tool policy、terminal-close policy 与 redaction metadata；该 control 必须 host-neutral，且对任务族通用。
+
+#### Scenario: No ready stage fails closed when required / 无 Ready Stage 时安全失败
+
+- **WHEN** a primary staged workflow is selected
+- **AND** the workflow cannot compute any ready stage
+- **AND** the task is not already terminal
+- **THEN** the runtime emits a typed workflow diagnostic and does not silently fall back to a generic conversational loop
+- **中文** 当 primary staged workflow 已选择，但 workflow 无法计算任何 ready stage，且 task 尚未终态时，runtime 必须发出 typed workflow diagnostic，不得静默退回通用对话 loop。
+
+### Requirement: Stage Progress Requires Completion-Grade Evidence / Stage 推进需要完成级证据
+
+Ready-stage control SHALL distinguish allowed support capabilities from capabilities that can complete or progress the active stage.
+
+ready-stage control 必须区分允许的辅助 capability 与能够完成或推进 active stage 的 capability。
+
+#### Scenario: Support evidence does not complete mutation stage / 辅助证据不完成变更阶段
+
+- **WHEN** a ready stage allows read/search/list tools as supporting evidence
+- **AND** the stage kind requires mutation-grade, verification-grade, or terminal-capability evidence
+- **THEN** successful support tool execution may be recorded as evidence but MUST NOT complete the stage
+- **AND** the next ready-stage control still names the required progress capability class
+- **中文** 当 ready stage 允许 read/search/list 工具作为辅助证据，但 stage kind 需要 mutation-grade、verification-grade 或 terminal-capability evidence 时，成功的辅助工具执行可以记录为 evidence，但不得完成 stage；下一次 ready-stage control 仍必须指出所需 progress capability class。
+
+### Requirement: Stage Evaluation Gates Success / Stage 评估决定成功
+
+Every staged workflow stage SHALL evaluate its produced outputs and evidence against the stage acceptance policy before the controller marks the stage as succeeded.
+
+每个 staged workflow stage 在 controller 标记 succeeded 前，必须根据 stage acceptance policy 评估其产出的 outputs 与 evidence。
+
+#### Scenario: Output refs alone do not pass a stage / 只有输出引用不算 Stage 通过
+
+- **WHEN** a stage executor returns artifact refs, evidence refs, check refs, diagnostics, or bounded output previews
+- **THEN** the controller records them as produced evidence
+- **AND** the stage remains not succeeded until a stage evaluation result is recorded with status `passed`
+- **AND** statuses `needs-review`, `failed`, and `blocked` MUST NOT be collapsed into success merely because output exists
+- **中文** 当 stage executor 返回 artifact refs、evidence refs、check refs、diagnostics 或有界输出 preview 时，controller 必须将其记录为 produced evidence；只有记录了 status 为 `passed` 的 stage evaluation result 后，stage 才能 succeeded；不得因为存在输出就把 `needs-review`、`failed` 或 `blocked` 压成成功。
+
+#### Scenario: Evaluation result is typed evidence / Evaluation Result 是类型化证据
+
+- **WHEN** a stage evaluation runs
+- **THEN** it records evaluator id, acceptance policy id, status, optional score, threshold when applicable, reason codes, consumed evidence refs, produced diagnostic refs, and redaction metadata
+- **AND** the stage transition event links to that evaluation result
+- **中文** 当 stage evaluation 运行时，必须记录 evaluator id、acceptance policy id、status、可选 score、适用时的 threshold、reason codes、consumed evidence refs、produced diagnostic refs 与 redaction metadata；stage transition event 必须链接该 evaluation result。
+
+#### Scenario: Evaluation can be deterministic or model-assisted / Evaluation 可确定性或模型辅助
+
+- **WHEN** a stage acceptance policy can be checked by schema, exit code, score threshold, diff presence, test result, artifact inspection, or diagnostic code
+- **THEN** evaluation MUST use deterministic checks first
+- **AND** model-assisted review MAY add bounded qualitative judgment only after deterministic evidence is recorded
+- **AND** model-assisted review MUST NOT override deterministic failure without an explicit repair or reviewer policy
+- **中文** 当 stage acceptance policy 可通过 schema、exit code、score threshold、diff presence、test result、artifact inspection 或 diagnostic code 检查时，evaluation 必须先使用确定性检查；模型辅助 review 只能在确定性证据已记录后添加有界质量判断；没有显式 repair 或 reviewer policy 时，模型辅助 review 不得覆盖确定性失败。
+
+### Requirement: Technical Director Acceptance Gates Final Success / 技术总监验收决定最终成功
+
+Every stage or pipeline step SHALL require an explicit technical-director acceptance record before its success state becomes final.
+
+每个 stage 或 pipeline step 在成功状态最终成立前，必须要求显式的技术总监验收记录。
+
+#### Scenario: Passing evaluator is not enough / Evaluator 通过仍不足够
+
+- **WHEN** a stage evaluation returns `passed`
+- **THEN** the controller records the evaluation as proposed acceptance
+- **AND** the stage MUST NOT transition to final `succeeded` until a technical-director acceptance record confirms the acceptance criteria, evidence sufficiency, residual risks, and pass/fail disposition
+- **AND** if the technical director marks evidence insufficient, the stage transitions to `needs-review`, `blocked`, or `failed` according to the recorded disposition
+- **中文** 当 stage evaluation 返回 `passed` 时，controller 必须将该 evaluation 记录为 proposed acceptance；只有技术总监验收记录确认验收标准、证据充分性、残余风险与通过/失败结论后，stage 才能最终转为 `succeeded`；如果技术总监标记证据不足，则 stage 必须根据记录的结论转为 `needs-review`、`blocked` 或 `failed`。
+
+#### Scenario: Acceptance record is auditable / 验收记录可审计
+
+- **WHEN** technical-director acceptance is recorded
+- **THEN** it includes reviewer role `technical-director`, acceptance criteria ids, evaluation result ids, evidence refs reviewed, decision `accepted`, `rejected`, `needs-review`, or `blocked`, rationale, residual risks, timestamp, and redaction metadata
+- **AND** automated director policy may produce the record only when the policy id and deterministic evidence basis are recorded
+- **中文** 当记录技术总监验收时，必须包含 reviewer role `technical-director`、acceptance criteria ids、evaluation result ids、已审 evidence refs、decision `accepted`、`rejected`、`needs-review` 或 `blocked`、rationale、residual risks、timestamp 与 redaction metadata；只有记录 policy id 与确定性证据依据后，自动化 director policy 才能产生该记录。
+
+#### Scenario: Criteria applicability is confirmed each time / 每次都确认验收标准适用性
+
+- **WHEN** a stage or pipeline step reaches evaluation
+- **THEN** the technical-director acceptance record confirms whether the configured acceptance criteria are applicable to the current stage output
+- **AND** if criteria are missing, stale, too weak, or not applicable, the step cannot pass and must record a criteria-defect diagnostic
+- **中文** 当 stage 或 pipeline step 到达 evaluation 时，技术总监验收记录必须确认配置的验收标准是否适用于当前 stage output；如果标准缺失、过期、过弱或不适用，该 step 不得通过，并必须记录 criteria-defect diagnostic。
+
+### Requirement: Engineering Role Workflow Has Evidence-Gated Stages / 工程师 Role Workflow 具备 Evidence-Gated Stages
+
+The staged task execution system SHALL provide a generic engineering role workflow for repository-sensitive coding work.
+
+staged task execution system 必须为 repository-sensitive coding work 提供通用工程师 role workflow。
+
+#### Scenario: Engineering workflow stages are fixed / 工程师 Workflow Stage 固定
+
+- **WHEN** `engineering/coding.v1` is compiled
+- **THEN** its stage order is `understand`, `plan`, `test`, `implement`, `verify`, and `report`
+- **AND** each stage has explicit entry criteria, exit criteria, allowed capabilities, and expected evidence refs
+- **中文** 当 `engineering/coding.v1` 被编译时，其 stage 顺序必须是 `understand`、`plan`、`test`、`implement`、`verify` 与 `report`；每个 stage 必须具备显式 entry criteria、exit criteria、allowed capabilities 与 expected evidence refs。
+
+#### Scenario: Technical director acceptance is required for primary role stage completion / Primary Role Stage 完成需要技术总监验收
+
+- **WHEN** a primary role workflow reports a stage as passed, completed, or accepted
+- **THEN** the stage state includes a technical-director acceptance record with criteria, evidence sufficiency, decision, and residual risk
+- **AND** a stage without sufficient evidence remains `blocked` or `needs-review`, not `passed`
+- **中文** 当 primary role workflow 报告某个 stage 已 passed、completed 或 accepted 时，stage state 必须包含技术总监验收记录，说明 criteria、evidence sufficiency、decision 与 residual risk；证据不足的 stage 必须保持 `blocked` 或 `needs-review`，不得标记为 `passed`。
+
+### Requirement: Staged Task Acceptance Is Policy-Selected
+
+Staged-task execution SHALL support optional supervisor acceptance without making it mandatory for every staged workflow.
+
+Staged-task execution 必须支持可选 supervisor acceptance，但不得让它成为每个 staged workflow 的强制要求。
+
+#### Scenario: Contract fields do not force CLI acceptance gates / Contract 字段不强制 CLI 验收门禁
+
+- **WHEN** a staged task graph is used by an ordinary CLI workflow
+- **THEN** the presence of evaluation or acceptance fields in the contract does not require technical-director acceptance unless the profile opts into supervisor acceptance
+- **中文** 当 staged task graph 被普通 CLI workflow 使用时，contract 中存在 evaluation 或 acceptance 字段并不意味着必须要求技术总监验收，除非 profile 显式 opt into supervisor acceptance。
+
+#### Scenario: Completed stages remain terminal / 已完成 stage 保持终态
+
+- **WHEN** a standard CLI staged workflow marks a stage as `succeeded`
+- **AND** later tool evidence also uses a capability that appeared in the completed stage
+- **THEN** runtime MUST NOT reopen, restart, or emit duplicate success for the completed stage
+- **AND** evidence is considered only against currently ready stages
+- **中文** 当 standard CLI staged workflow 已将某个 stage 标记为 `succeeded`，后续工具证据即使使用了该 stage 曾声明的 capability，runtime 也不得重新打开、重新开始或重复发出该 stage 成功事件；证据只能匹配当前 ready stages。
+
+#### Scenario: Same-response tool calls use latest stage state / 同响应 tool call 使用最新 stage state
+
+- **WHEN** one model response contains multiple tool calls
+- **AND** an earlier tool call advances the active staged workflow
+- **THEN** later tool calls in the same response MUST evaluate against the updated active run state
+- **AND** later tool calls MUST NOT evaluate against the stale run state captured at model-request creation time
+- **中文** 当一次模型响应包含多个 tool call，且前一个 tool call 已推进 active staged workflow 时，后续 tool call 必须基于更新后的 active run state 评估，不得基于 model-request 创建时捕获的旧 run state。
+
+#### Scenario: Automatic workflows close at terminal stage state / Automatic workflow 在 stage 终态关闭
+
+- **WHEN** a standard automatic primary staged workflow has no remaining pending, ready, or running stages
+- **AND** every stage is `succeeded` or `skipped`
+- **THEN** the agent loop MUST emit completion for the workflow turn
+- **AND** it MUST NOT continue requesting model iterations until the iteration budget is exhausted
+- **中文** 当 standard automatic primary staged workflow 没有 pending、ready 或 running stage，且所有 stage 都是 `succeeded` 或 `skipped` 时，agent loop 必须发出 workflow turn completion，不得继续请求模型直到耗尽迭代预算。
+
+#### Scenario: Ordinary plan stages accept planning evidence / 普通 plan stage 接受规划证据
+
+- **WHEN** an ordinary CLI profile declares a `plan` stage with read, search, glob, list, or diff capabilities
+- **THEN** successful runtime evidence from those declared capabilities MAY satisfy the plan stage
+- **AND** mutation, materialization, and repair stages MUST still require mutation-capable evidence
+- **中文** 当普通 CLI profile 声明 `plan` stage 且使用 read/search/glob/list/diff 等 capability 时，这些已声明 capability 的成功 runtime evidence 可以满足 plan stage；但 mutation、materialization 与 repair stage 仍必须要求具备变更能力的证据。
+
+#### Scenario: Read-only evidence stages can complete without mutation / 只读证据 stage 可无变更完成
+
+- **WHEN** a standard CLI staged workflow declares a produce-like stage whose allowed capabilities are all read-only evidence capabilities
+- **THEN** successful evidence from any declared read-only capability MAY satisfy that stage
+- **AND** produce-like stages that declare mutation-capable tools MUST NOT be satisfied by read-only evidence alone
+- **中文** 当 standard CLI staged workflow 声明一个 produce-like stage，且其 allowed capabilities 全部是只读证据能力时，任一已声明只读能力的成功 evidence 可以满足该 stage；但声明了 mutation-capable tools 的 produce-like stage 不得仅由只读 evidence 满足。
+

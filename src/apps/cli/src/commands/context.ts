@@ -17,6 +17,7 @@ import type {
 import { CLI_PALETTE_SCHEMA_VERSION } from "@deepseek/platform-contracts";
 import type { CliOptions, CliRunOptions } from "../types.js";
 import { createCliAgentRuntime } from "../host/runtime.js";
+import { resolveCliWorkspaceRoot } from "../host/workspace-root.js";
 import type { ChatSessionState } from "./chat-state.js";
 import { ensureChatPaletteState } from "./palette-state.js";
 
@@ -84,7 +85,8 @@ export async function runContextCompactorCommand(manager: LosslessContextManager
 }
 
 export async function runContextCommand(options: CliOptions, write: (line: string) => Promise<void>, runOptions: CliRunOptions): Promise<void> {
-  const runtime = await createCliAgentRuntime({ live: options.live, workspaceRoot: process.cwd() }, runOptions);
+  const workspaceRoot = await resolveCliWorkspaceRoot(runOptions);
+  const runtime = await createCliAgentRuntime({ live: options.live, workspaceRoot }, runOptions);
   try {
     const raw = typeof options.contextInput?.raw === "string" ? options.contextInput.raw : "";
     const input = parseContextCompactorInput(raw, options.sessionId);

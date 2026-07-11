@@ -38,6 +38,7 @@ export type StagedTaskRefScope = "workspace" | "session" | "task" | "external";
 export type StagedTaskEventKind =
   | "stage.ready"
   | "stage.started"
+  | "stage.evaluation.required"
   | "stage.succeeded"
   | "stage.failed"
   | "stage.skipped";
@@ -80,6 +81,39 @@ export interface StagedTaskAcceptancePolicy extends JsonObject {
   readonly requiredStatuses?: readonly StagedTaskStageStatus[];
   readonly requiredChecks?: readonly string[];
   readonly scoreThreshold?: number;
+}
+
+export type StagedTaskEvaluationStatus = "passed" | "needs-review" | "failed" | "blocked";
+
+export interface StagedTaskEvaluationResult extends JsonObject {
+  readonly schemaVersion: typeof STAGED_TASK_SCHEMA_VERSION;
+  readonly evaluationId: string;
+  readonly stageId: string;
+  readonly evaluatorId: string;
+  readonly status: StagedTaskEvaluationStatus;
+  readonly score?: number;
+  readonly reason: string;
+  readonly evidenceRefs: readonly string[];
+  readonly evaluatedAt: string;
+  readonly compatibility: StagedTaskCompatibility;
+  readonly redaction: RedactionMetadata;
+}
+
+export type StagedTaskTechnicalDirectorDecision = "accepted" | "rejected" | "needs-review";
+
+export interface StagedTaskTechnicalDirectorAcceptance extends JsonObject {
+  readonly schemaVersion: typeof STAGED_TASK_SCHEMA_VERSION;
+  readonly acceptanceId: string;
+  readonly stageId: string;
+  readonly reviewerId: string;
+  readonly decision: StagedTaskTechnicalDirectorDecision;
+  readonly criteriaApplicable: boolean;
+  readonly evidenceSufficient: boolean;
+  readonly reason: string;
+  readonly evaluationId?: string;
+  readonly acceptedAt: string;
+  readonly compatibility: StagedTaskCompatibility;
+  readonly redaction: RedactionMetadata;
 }
 
 export interface StagedTaskRetryPolicy extends JsonObject {
@@ -137,6 +171,8 @@ export interface StagedTaskStageState extends JsonObject {
   readonly attempts: number;
   readonly inputRefs: readonly string[];
   readonly outputRefs: readonly string[];
+  readonly evaluation?: StagedTaskEvaluationResult;
+  readonly technicalDirectorAcceptance?: StagedTaskTechnicalDirectorAcceptance;
   readonly diagnostics: readonly RedactedError[];
   readonly startedAt?: string;
   readonly completedAt?: string;
@@ -165,6 +201,8 @@ export interface StagedTaskStageEvent extends JsonObject {
   readonly stageId: string;
   readonly at: string;
   readonly outputRefs?: readonly StagedTaskRef[];
+  readonly evaluation?: StagedTaskEvaluationResult;
+  readonly technicalDirectorAcceptance?: StagedTaskTechnicalDirectorAcceptance;
   readonly diagnostics: readonly RedactedError[];
   readonly compatibility: StagedTaskCompatibility;
   readonly redaction: RedactionMetadata;
@@ -174,6 +212,8 @@ export interface StagedTaskExecutionResult extends JsonObject {
   readonly schemaVersion: typeof STAGED_TASK_SCHEMA_VERSION;
   readonly status: "succeeded" | "failed" | "skipped";
   readonly outputRefs: readonly StagedTaskRef[];
+  readonly evaluation?: StagedTaskEvaluationResult;
+  readonly technicalDirectorAcceptance?: StagedTaskTechnicalDirectorAcceptance;
   readonly diagnostics: readonly RedactedError[];
   readonly compatibility: StagedTaskCompatibility;
   readonly redaction: RedactionMetadata;

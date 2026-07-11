@@ -8,23 +8,77 @@ export type CoreCodingToolName =
   | "file.read"
   | "file.write"
   | "file.edit"
+  | "text.replace"
+  | "file.copy"
+  | "file.move"
+  | "file.delete"
+  | "directory.create"
+  | "file.touch"
+  | "file.stat"
+  | "json.read"
+  | "json.patch"
+  | "checksum.hash"
+  | "path.resolve"
+  | "env.inspect"
+  | "command.lookup"
+  | "archive.create"
+  | "archive.extract"
+  | "session.resume"
+  | "session.fork"
+  | "memory.write"
+  | "memory.read"
+  | "compact.summary"
   | "file.list"
+  | "workspace.glob"
+  | "asset.view-local"
   | "search.text"
+  | "code.diagnostics"
+  | "notebook.read"
+  | "patch.apply"
+  | "revert.undo"
   | "shell.run"
   | "shell.output"
   | "shell.kill"
+  | "repl.execute"
   | "git.status"
   | "git.diff"
+  | "git.history-branch"
   | "test.run"
+  | "package.manager"
   | "env.prepare"
-  | "swe.bench.run"
   | "todo.plan"
+  | "user.input"
+  | "mode.plan.enter"
+  | "mode.plan.exit"
+  | "config.manage"
   | "web.fetch"
   | "web.search"
+  | "mcp.tool.call"
+  | "mcp.resource.list"
+  | "mcp.resource.read"
+  | "notebook.edit"
   | "agent.spawn"
   | "agent.continue"
   | "agent.stop"
+  | "task.create"
+  | "task.get"
+  | "task.list"
+  | "task.update"
+  | "task.output"
+  | "team.create"
+  | "team.delete"
+  | "worktree.enter"
+  | "worktree.exit"
+  | "tool.search"
+  | "schedule.cron"
+  | "remote.trigger"
+  | "brief.package"
+  | "synthetic.output"
   | "hook.list"
+  | "hook.run"
+  | "plugin.install"
+  | "plugin.verify"
+  | "command.palette"
   | "skill.list"
   | "skill.activate";
 
@@ -82,6 +136,19 @@ export interface FileEditInput extends JsonObject {
   readonly replacement: string;
   readonly workspaceRoot?: string;
   readonly limitBytes?: number;
+}
+
+export interface TextReplaceInput extends JsonObject {
+  readonly path: string;
+  readonly pattern: string;
+  readonly replacement: string;
+  readonly workspaceRoot?: string;
+  readonly limitBytes?: number;
+  readonly regex?: boolean;
+  readonly caseInsensitive?: boolean;
+  readonly multiline?: boolean;
+  readonly maxReplacements?: number;
+  readonly dryRun?: boolean;
 }
 
 export interface FileListInput extends JsonObject {
@@ -191,7 +258,7 @@ export interface WorkspaceEditTransactionEvidence extends JsonObject {
   readonly turnId?: TurnId;
   readonly capabilityId: CapabilityId;
   readonly path: string;
-  readonly precondition: "exact-match" | "full-write";
+  readonly precondition: "exact-match" | "full-write" | "pattern-match";
   readonly beforeHash: string;
   readonly afterHash: string;
   readonly rollback: JsonObject;
@@ -247,7 +314,7 @@ export interface WebSearchProvider {
   search(input: WebSearchInput): Promise<readonly WebSearchResultItem[]>;
 }
 
-export type AgentSpawnToolProjection = "read-only" | "read-write" | "all";
+export type AgentSpawnToolProjection = "read-only" | "read-write" | "safe-all" | "all";
 
 export interface AgentSpawnRequest extends JsonObject {
   readonly prompt: string;

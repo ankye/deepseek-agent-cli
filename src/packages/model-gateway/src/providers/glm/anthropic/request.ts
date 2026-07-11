@@ -9,12 +9,14 @@ export function buildGlmAnthropicProviderRequest(request: ModelRequest, credenti
   const effectiveTimeoutMs = request.timeoutMs ?? timeoutMs;
   const system = glmAnthropicSystemFrom(request, config);
   const tools = glmAnthropicToolsFrom(request, config);
+  const explicitPrefixHintsEnabled = supportsExplicitPrefixHints(request, config);
   return {
     url: `${config.baseUrl.replace(/\/$/, "")}/v1/messages`,
     method: "POST",
     headers: {
       "content-type": "application/json",
       "anthropic-version": "2023-06-01",
+      ...(explicitPrefixHintsEnabled ? { "anthropic-beta": "prompt-caching-2024-07-31" } : {}),
       ...(credentialValue ? { "x-api-key": credentialValue } : {}),
       ...(config.defaultHeaders ?? {})
     },
@@ -42,13 +44,18 @@ function glmAnthropicSystemFrom(request: ModelRequest, config: ModelProviderConf
   if (systemMessages.length === 0) return undefined;
   if (!supportsExplicitPrefixHints(request, config)) return systemMessages.map((entry) => entry.text).join("\n\n");
 
-  const systemBlocks: JsonObject[] = systemMessages.map((entry) => ({
+  const breakpoint = cacheableProviderPrefixBreakpoint(request.messages ?? []);
+  const cacheableSystemMessages = breakpoint?.role === "user"
+    ? systemMessages.filter((entry) => isCacheableSystemPrefixMessage(entry.message))
+    : systemMessages;
+  if (cacheableSystemMessages.length === 0) return undefined;
+
+  const systemBlocks: JsonObject[] = cacheableSystemMessages.map((entry) => ({
     type: "text",
     text: entry.text
   }));
-  const breakpoint = cacheableProviderPrefixBreakpoint(request.messages ?? []);
   if (breakpoint?.role === "system") {
-    const cacheIndex = systemMessages.findIndex((entry) => entry.message === breakpoint.message);
+    const cacheIndex = cacheableSystemMessages.findIndex((entry) => entry.message === breakpoint.message);
     if (cacheIndex >= 0) {
       systemBlocks[cacheIndex] = {
         ...systemBlocks[cacheIndex]!,
@@ -56,7 +63,7 @@ function glmAnthropicSystemFrom(request: ModelRequest, config: ModelProviderConf
       };
     }
   } else if (breakpoint?.role !== "user") {
-    const cacheIndex = lastCacheableSystemPrefixIndex(systemMessages.map((entry) => entry.message));
+    const cacheIndex = lastCacheableSystemPrefixIndex(cacheableSystemMessages.map((entry) => entry.message));
     if (cacheIndex >= 0) {
       systemBlocks[cacheIndex] = {
         ...systemBlocks[cacheIndex]!,
@@ -75,8 +82,17 @@ function glmAnthropicMessagesFrom(request: ModelRequest, config: ModelProviderCo
   const breakpoint = supportsExplicitPrefixHints(request, config)
     ? cacheableProviderPrefixBreakpoint(sourceMessages)
     : undefined;
+  const pendingDynamicSystemMessages: JsonObject[] = [];
   for (const message of sourceMessages) {
-    if (message.role === "system") continue;
+    if (message.role === "system") {
+      if (breakpoint?.role === "user" && !isCacheableSystemPrefixMessage(message)) {
+        pendingDynamicSystemMessages.push({
+          role: "user",
+          content: `Runtime guidance:\n${message.content}`
+        });
+      }
+      continue;
+    }
     if (message.role === "tool") {
       messages.push({
         role: "user",
@@ -106,11 +122,13 @@ function glmAnthropicMessagesFrom(request: ModelRequest, config: ModelProviderCo
       };
       if (message === breakpoint?.message) {
         messages.push(withMessageCacheBreakpoint(providerMessage));
+        messages.push(...pendingDynamicSystemMessages.splice(0));
       } else {
         messages.push(providerMessage);
       }
     }
   }
+  messages.push(...pendingDynamicSystemMessages);
   const providerMessages = messages.length === 0 ? [{ role: "user", content: request.prompt }] : messages;
   if (!supportsExplicitPrefixHints(request, config)) return providerMessages;
   if (breakpoint?.role === "user") return providerMessages;
@@ -165,7 +183,6 @@ function glmAnthropicToolFrom(tool: JsonObject): JsonObject | undefined {
 function glmAnthropicToolsFrom(request: ModelRequest, config: ModelProviderConfig): readonly JsonObject[] {
   const tools = request.tools?.map(glmAnthropicToolFrom).filter((tool): tool is JsonObject => Boolean(tool)) ?? [];
   if (tools.length === 0 || !supportsExplicitPrefixHints(request, config)) return tools;
-  if (cacheableProviderPrefixBreakpoint(request.messages ?? [])?.role === "user") return tools;
   return withToolSchemaCacheBreakpoint(tools);
 }
 

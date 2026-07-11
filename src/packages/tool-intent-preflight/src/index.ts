@@ -1,6 +1,7 @@
 import type {
   CapabilityId,
   JsonObject,
+  PlatformRuntime,
   ToolIntent,
   ToolIntentDiagnostic,
   ToolIntentPreflightRequest,
@@ -9,74 +10,70 @@ import type {
   ToolIntentProviderProfile,
   ToolIntentRepairAction
 } from "@deepseek/platform-contracts";
-import { MAX_EXECUTION_TIMEOUT_MS, asId } from "@deepseek/platform-contracts";
+import { asId } from "@deepseek/platform-contracts";
+import { deepSeekToolIntentProfile } from "./provider-profiles.js";
 
-const defaultPathFields = ["path", "file", "filePath", "target", "cwd"];
-const deepSeekProviderId = asId<"modelProvider">("provider-deepseek");
-const workspaceExecutionTools = new Set(["core.shell.run", "core.test.run", "core.repl.execute", "core.package.manager", "core.env.prepare", "core.swe.bench.run"]);
-const maxAutoRepairedSweBenchRangeSize = 300;
+const defaultPathFields = ["path", "file", "filePath", "sourcePath", "targetPath", "target", "cwd"];
+const workspaceExecutionTools = new Set(["core.shell.run", "core.test.run", "core.repl.execute", "core.package.manager", "core.env.prepare"]);
+const workspaceScopedTools = new Set([
+  "core.file.read",
+  "core.file.write",
+  "core.file.edit",
+  "core.text.replace",
+  "core.file.copy",
+  "core.file.move",
+  "core.file.delete",
+  "core.directory.create",
+  "core.file.touch",
+  "core.file.stat",
+  "core.json.read",
+  "core.json.patch",
+  "core.checksum.hash",
+  "core.path.resolve",
+  "core.archive.create",
+  "core.archive.extract",
+  "core.file.list",
+  "core.workspace.glob",
+  "core.asset.view-local",
+  "core.search.text",
+  "core.code.diagnostics",
+  "core.notebook.read",
+  "core.notebook.edit",
+  "core.patch.apply",
+  "core.revert.undo",
+  "core.git.status",
+  "core.git.diff",
+  "core.git.history-branch",
+  ...workspaceExecutionTools
+]);
+const literalMutationPathTools = new Set([
+  "core.file.write",
+  "core.file.edit",
+  "core.text.replace",
+  "core.file.copy",
+  "core.file.move",
+  "core.file.delete",
+  "core.directory.create",
+  "core.file.touch",
+  "core.json.patch",
+  "core.archive.create",
+  "core.archive.extract",
+  "core.patch.apply"
+]);
 
-export const deepSeekToolIntentProfile: ToolIntentProviderProfile = {
-  providerId: deepSeekProviderId,
-  pathFields: ["path", "file", "filePath", "target", "cwd"],
-  toolNameAliases: {
-    readFile: "core.file.read",
-    read_file: "core.file.read",
-    "fs.readFile": "core.file.read",
-    core_file_read: "core.file.read",
-    core_file_write: "core.file.write",
-    core_file_edit: "core.file.edit",
-    core_file_list: "core.file.list",
-    core_file_search: "core.search.text",
-    file_search: "core.search.text",
-    search_file: "core.search.text",
-    search_files: "core.search.text",
-    searchText: "core.search.text",
-    search_text: "core.search.text",
-    grep: "core.search.text",
-    core_search_text: "core.search.text",
-    core_shell_run: "core.shell.run",
-    shell_run: "core.shell.run",
-    run_shell: "core.shell.run",
-    core_repl_execute: "core.repl.execute",
-    repl_execute: "core.repl.execute",
-    core_package_manager: "core.package.manager",
-    package_manager: "core.package.manager",
-    core_shell_output: "core.shell.output",
-    shell_output: "core.shell.output",
-    core_shell_kill: "core.shell.kill",
-    shell_kill: "core.shell.kill",
-    core_git_status: "core.git.status",
-    git_status: "core.git.status",
-    core_git_diff: "core.git.diff",
-    git_diff: "core.git.diff",
-    core_test_run: "core.test.run",
-    test_run: "core.test.run",
-    core_todo_plan: "core.todo.plan",
-    todo_plan: "core.todo.plan",
-    core_web_fetch: "core.web.fetch",
-    web_fetch: "core.web.fetch",
-    core_web_search: "core.web.search",
-    web_search: "core.web.search",
-    core_agent_spawn: "core.agent.spawn",
-    agent_spawn: "core.agent.spawn",
-    core_agent_continue: "core.agent.continue",
-    agent_continue: "core.agent.continue",
-    core_agent_stop: "core.agent.stop",
-    agent_stop: "core.agent.stop",
-    core_hook_list: "core.hook.list",
-    hook_list: "core.hook.list",
-    core_skill_list: "core.skill.list",
-    skill_list: "core.skill.list",
-    core_skill_activate: "core.skill.activate",
-    skill_activate: "core.skill.activate"
-  },
-  unwrapArgumentsField: "arguments",
-  strictJsonArguments: false
-};
+export type WorkspacePathResolver = PlatformRuntime["resolveWorkspacePath"];
+
+export interface ToolIntentPreflightOptions {
+  readonly resolveWorkspacePath?: WorkspacePathResolver;
+}
+
+export { deepSeekProviderId, deepSeekToolIntentProfile } from "./provider-profiles.js";
 
 export class DeterministicToolIntentPreflight implements ToolIntentPreflightService {
-  constructor(private readonly profiles: readonly ToolIntentProviderProfile[] = [deepSeekToolIntentProfile]) {}
+  constructor(
+    private readonly profiles: readonly ToolIntentProviderProfile[] = [deepSeekToolIntentProfile],
+    private readonly options: ToolIntentPreflightOptions = {}
+  ) {}
 
   async check(request: ToolIntentPreflightRequest): Promise<ToolIntentPreflightResult> {
     const repairs: ToolIntentRepairAction[] = [];
@@ -103,10 +100,18 @@ export class DeterministicToolIntentPreflight implements ToolIntentPreflightServ
     for (const field of request.pathFields ?? profile?.pathFields ?? defaultPathFields) {
       const value = repairedInput[field];
       if (typeof value !== "string") continue;
-      const normalized = normalizeWorkspacePath(value, request.workspaceRoot, request.platform, field);
+      const preserveLiteralExecutorPath = literalMutationPathTools.has(String(capabilityId)) && field !== "cwd";
+      const normalized = normalizeWorkspacePath(value, request.workspaceRoot, request.platform, field, this.options.resolveWorkspacePath, preserveLiteralExecutorPath);
       diagnostics.push(...normalized.diagnostics);
       repairs.push(...normalized.repairs);
       if (normalized.value) repairedInput[field] = normalized.value.executorValue;
+    }
+    if (shouldDefaultWorkspaceRoot(capabilityId, repairedInput, request.workspaceRoot, Boolean(this.options.resolveWorkspacePath))) {
+      const workspaceRoot = repairedInput.workspaceRoot;
+      if (workspaceRoot !== request.workspaceRoot) {
+        repairedInput.workspaceRoot = request.workspaceRoot;
+        repairs.push(repair("workspace-root-defaulted", "workspaceRoot", typeof workspaceRoot === "string" ? workspaceRoot : "", request.workspaceRoot));
+      }
     }
     if (workspaceExecutionTools.has(String(capabilityId))) {
       const cwd = repairedInput.cwd;
@@ -114,37 +119,7 @@ export class DeterministicToolIntentPreflight implements ToolIntentPreflightServ
         repairedInput.cwd = ".";
         repairs.push(repair("workspace-cwd-defaulted", "cwd", typeof cwd === "string" ? cwd : "", "."));
       }
-      const workspaceRoot = repairedInput.workspaceRoot;
-      if (workspaceRoot !== request.workspaceRoot) {
-        repairedInput.workspaceRoot = request.workspaceRoot;
-        repairs.push(repair("workspace-root-defaulted", "workspaceRoot", typeof workspaceRoot === "string" ? workspaceRoot : "", request.workspaceRoot));
-      }
     }
-    if (String(capabilityId) === "core.swe.bench.run") {
-      const timeoutMs = repairedInput.timeoutMs;
-      if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs)) {
-        repairedInput.timeoutMs = MAX_EXECUTION_TIMEOUT_MS;
-        repairs.push(repair("workspace-tool-timeout-defaulted", "timeoutMs", typeof timeoutMs === "number" ? String(timeoutMs) : "", String(MAX_EXECUTION_TIMEOUT_MS)));
-      } else if (timeoutMs !== MAX_EXECUTION_TIMEOUT_MS) {
-        repairedInput.timeoutMs = MAX_EXECUTION_TIMEOUT_MS;
-        repairs.push(repair("workspace-tool-timeout-normalized", "timeoutMs", String(timeoutMs), String(MAX_EXECUTION_TIMEOUT_MS)));
-      }
-      const userPrompt = stringFromJsonObject(request.providerHints, "userPrompt");
-      if (shouldNormalizeSweBenchRunExecutionIntent(userPrompt, repairedInput)) {
-        repairedInput.dryRun = false;
-        repairedInput.execute = true;
-        repairs.push(repair("swe-bench-run-execution-normalized", "dryRun", "true", "false"));
-        repairs.push(repair("swe-bench-run-execution-normalized", "execute", String(preparedIntent.input.execute ?? ""), "true"));
-      }
-      const range = sweBenchTaskRangeFromPrompt(userPrompt);
-      const taskNumber = numberFromUnknown(repairedInput.taskNumber);
-      if (range && taskNumber === range.start && !Array.isArray(repairedInput.taskNumbers)) {
-        const taskNumbers = rangeNumbers(range.start, range.end);
-        repairedInput.taskNumbers = taskNumbers;
-        repairs.push(repair("swe-bench-task-range-normalized", "taskNumbers", String(taskNumber), taskNumbers.join(",")));
-      }
-    }
-
     if (diagnostics.length > 0) {
       return result("rejected", request, diagnostics, repairs, undefined, capabilityId, profile);
     }
@@ -165,6 +140,18 @@ export class DeterministicToolIntentPreflight implements ToolIntentPreflightServ
   }
 }
 
+function shouldDefaultWorkspaceRoot(
+  capabilityId: CapabilityId,
+  input: Record<string, unknown>,
+  workspaceRoot: string,
+  hasPlatformResolver: boolean
+): boolean {
+  return (workspaceExecutionTools.has(String(capabilityId)) || hasPlatformResolver) &&
+    workspaceRoot.length > 0 &&
+    workspaceScopedTools.has(String(capabilityId)) &&
+    input.workspaceRoot !== workspaceRoot;
+}
+
 export function prepareProviderIntent(
   intent: ToolIntent,
   profile?: ToolIntentProviderProfile
@@ -173,7 +160,7 @@ export function prepareProviderIntent(
   const repairs: ToolIntentRepairAction[] = [];
   const diagnostics: ToolIntentDiagnostic[] = [];
   let name = intent.name;
-  const alias = stringFromJsonObject(profile.toolNameAliases, name);
+  const alias = toolNameAliasFromProfile(profile, name);
   if (alias && alias !== name) {
     repairs.push(repair("provider-tool-alias-normalized", "name", name, alias));
     name = alias;
@@ -204,11 +191,25 @@ export function prepareProviderIntent(
   };
 }
 
+function toolNameAliasFromProfile(profile: ToolIntentProviderProfile, name: string): string | undefined {
+  const exact = stringFromJsonObject(profile.toolNameAliases, name);
+  if (exact) return exact;
+  const aliases = profile.toolNameAliases;
+  if (!aliases) return undefined;
+  const normalizedName = name.toLowerCase();
+  for (const [alias, capabilityId] of Object.entries(aliases)) {
+    if (alias.toLowerCase() === normalizedName && typeof capabilityId === "string") return capabilityId;
+  }
+  return undefined;
+}
+
 export function normalizeWorkspacePath(
   value: string,
   workspaceRoot: string,
   platform: ToolIntentPreflightRequest["platform"],
-  field = "path"
+  field = "path",
+  resolveWorkspacePath?: WorkspacePathResolver,
+  preserveLiteralExecutorPath = false
 ): { readonly value?: { readonly modelValue: string; readonly executorValue: string }; readonly repairs: readonly ToolIntentRepairAction[]; readonly diagnostics: readonly ToolIntentDiagnostic[] } {
   const repairs: ToolIntentRepairAction[] = [];
   const diagnostics: ToolIntentDiagnostic[] = [];
@@ -220,6 +221,14 @@ export function normalizeWorkspacePath(
   if (isHomePath(trimmed)) {
     diagnostics.push(diagnostic("TOOL_INTENT_HOME_PATH_REJECTED", "Home-directory paths are not workspace-safe", field));
     return { diagnostics, repairs };
+  }
+  const unsafeSyntaxDiagnostic = unsafeWorkspacePathSyntaxDiagnostic(trimmed, field);
+  if (unsafeSyntaxDiagnostic) {
+    diagnostics.push(unsafeSyntaxDiagnostic);
+    return { diagnostics, repairs };
+  }
+  if (resolveWorkspacePath) {
+    return normalizeWorkspacePathWithPlatform(trimmed, value, workspaceRoot, platform, field, resolveWorkspacePath, preserveLiteralExecutorPath);
   }
   let next = trimmed;
   if (isAbsolutePath(trimmed)) {
@@ -282,6 +291,50 @@ export function normalizeWorkspacePath(
   };
 }
 
+function normalizeWorkspacePathWithPlatform(
+  trimmed: string,
+  originalValue: string,
+  workspaceRoot: string,
+  platform: ToolIntentPreflightRequest["platform"],
+  field: string,
+  resolveWorkspacePath: WorkspacePathResolver,
+  preserveLiteralExecutorPath: boolean
+): { readonly value?: { readonly modelValue: string; readonly executorValue: string }; readonly repairs: readonly ToolIntentRepairAction[]; readonly diagnostics: readonly ToolIntentDiagnostic[] } {
+  const resolved = resolveWorkspacePath(workspaceRoot, trimmed);
+  if (!resolved.ok || !resolved.value) {
+    const code = resolved.error?.code === "PLATFORM_PATH_OUTSIDE_ROOT" && isAbsolutePath(trimmed)
+      ? "TOOL_INTENT_ABSOLUTE_PATH_REJECTED"
+      : "TOOL_INTENT_PLATFORM_PATH_REJECTED";
+    return {
+      diagnostics: [diagnostic(code, resolved.error?.message ?? "Path was rejected by platform workspace resolution.", field)],
+      repairs: []
+    };
+  }
+  const literalExecutorValue = (!isAbsolutePath(trimmed) || preserveLiteralExecutorPath)
+    ? literalWorkspaceExecutorPath(trimmed, workspaceRoot, platform)
+    : undefined;
+  const executorValue = literalExecutorValue ?? (resolved.value.relativePath.length > 0 ? resolved.value.relativePath : ".");
+  return {
+    value: {
+      modelValue: resolved.value.path,
+      executorValue
+    },
+    diagnostics: [],
+    repairs: [repair("path-normalized", field, originalValue, resolved.value.path, executorValue)]
+  };
+}
+
+function literalWorkspaceExecutorPath(
+  value: string,
+  workspaceRoot: string,
+  platform: ToolIntentPreflightRequest["platform"]
+): string | undefined {
+  if (isAbsolutePath(value)) return workspaceRelativeFromAbsolute(value, workspaceRoot, platform)?.executorValue;
+  const prefixTrimmed = value.startsWith("./") || value.startsWith(".\\") ? value.slice(2) : value;
+  const parts = prefixTrimmed.split(/[\\/]+/).filter((part) => part.length > 0 && part !== ".");
+  return parts.length > 0 ? parts.join("/") : ".";
+}
+
 function result(
   status: ToolIntentPreflightResult["status"],
   request: ToolIntentPreflightRequest,
@@ -334,44 +387,6 @@ function stringFromJsonObject(value: JsonObject | undefined, key: string): strin
   return typeof found === "string" ? found : undefined;
 }
 
-function numberFromUnknown(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
-}
-
-function shouldNormalizeSweBenchRunExecutionIntent(prompt: string | undefined, input: Record<string, unknown>): boolean {
-  if (input.dryRun !== true) return false;
-  if (input.resumeOnly === true) return false;
-  if (!prompt || !/swe[- ]?bench\s+lite/i.test(prompt)) return false;
-  if (/\b(?:dry\s*-?\s*run|dryrun)\b/i.test(prompt)) return false;
-  if (/(?:只|仅)?(?:预览|演练|试算)|不要执行|不执行|别执行|无需执行|review[- ]?only|resume[- ]?only/i.test(prompt)) return false;
-  return /(?:完成|跑通|运行|执行|测试|修复|canary|run|complete|execute|solve|test)/i.test(prompt);
-}
-
-function sweBenchTaskRangeFromPrompt(prompt: string | undefined): { readonly start: number; readonly end: number } | undefined {
-  if (!prompt || !/swe[- ]?bench\s+lite/i.test(prompt)) return undefined;
-  const normalized = prompt.replace(/[０-９]/g, (char) => String(char.charCodeAt(0) - 0xff10));
-  const patterns = [
-    /第\s*(\d{1,3})\s*(?:到|至|-|~)\s*第?\s*(\d{1,3})\s*(?:题|个|项|task|tasks|instance|instances)?/i,
-    /\b(?:task|tasks|instance|instances)\s*(\d{1,3})\s*(?:to|-|~)\s*(\d{1,3})\b/i
-  ];
-  for (const pattern of patterns) {
-    const match = pattern.exec(normalized);
-    if (!match) continue;
-    const start = Number(match[1]);
-    const end = Number(match[2]);
-    if (!Number.isInteger(start) || !Number.isInteger(end) || start <= 0 || end < start) continue;
-    if (end - start + 1 > maxAutoRepairedSweBenchRangeSize) continue;
-    return { start, end };
-  }
-  return undefined;
-}
-
-function rangeNumbers(start: number, end: number): readonly number[] {
-  const values: number[] = [];
-  for (let value = start; value <= end; value += 1) values.push(value);
-  return values;
-}
-
 function providerSafeToolName(value: string): string {
   return /^[a-zA-Z0-9_-]+$/.test(value) ? value : value.replace(/[^a-zA-Z0-9_-]/g, "_");
 }
@@ -382,6 +397,19 @@ function isJsonObject(value: unknown): value is JsonObject {
 
 function isHomePath(value: string): boolean {
   return value === "~" || value.startsWith("~/") || value.startsWith("~\\");
+}
+
+function unsafeWorkspacePathSyntaxDiagnostic(value: string, field: string): ToolIntentDiagnostic | undefined {
+  if (/\0/.test(value)) {
+    return diagnostic("TOOL_INTENT_NULL_BYTE_REJECTED", "Null bytes are not allowed in workspace paths", field);
+  }
+  if (looksLikeWindowsDriveRelative(value)) {
+    return diagnostic("TOOL_INTENT_AMBIGUOUS_PLATFORM_PATH", "Drive-relative paths are ambiguous and rejected", field);
+  }
+  if (value.split(/[\\/]+/).some((part) => part === "..")) {
+    return diagnostic("TOOL_INTENT_PARENT_TRAVERSAL_REJECTED", "Parent traversal is not workspace-safe", field);
+  }
+  return undefined;
 }
 
 function isAbsolutePath(value: string): boolean {

@@ -33,6 +33,8 @@ export interface SweBenchChildTraceSummary extends JsonObject {
   readonly terminalKind?: string;
   readonly terminalStatus?: string;
   readonly terminalReason?: string;
+  readonly lastStageId?: string;
+  readonly lastProgressMarker?: string;
   readonly iterationCount: number;
   readonly modelRequestCount: number;
   readonly usageEventCount: number;
@@ -41,7 +43,10 @@ export interface SweBenchChildTraceSummary extends JsonObject {
   readonly sourceMutationCount: number;
   readonly shellCommandCount: number;
   readonly testCommandCount: number;
+  readonly focusedTestCommandCount: number;
+  readonly broadTestCommandCount: number;
   readonly successfulTestCommandCount: number;
+  readonly invalidTestToolCommandCount: number;
   readonly testFailureDetails?: readonly SweBenchChildTraceTestFailureDetail[];
   readonly blockerFindings: readonly SweBenchChildTraceBlockerFinding[];
   readonly redaction: { readonly class: "internal"; readonly fields?: readonly string[] };
@@ -53,6 +58,8 @@ export function summarizeSweBenchChildTrace(stdout: string, traceOutputPath: str
   let terminalKind = "";
   let terminalStatus = "";
   let terminalReason = "";
+  let lastStageId = "";
+  let lastProgressMarker = "";
   let terminalLockedByManagedBudget = false;
   let iterationCount = 0;
   let modelRequestCount = 0;
@@ -62,12 +69,21 @@ export function summarizeSweBenchChildTrace(stdout: string, traceOutputPath: str
   let sourceMutationCount = 0;
   let shellCommandCount = 0;
   let testCommandCount = 0;
+  let focusedTestCommandCount = 0;
+  let broadTestCommandCount = 0;
   let successfulTestCommandCount = 0;
+  let budgetTestCommandCount = 0;
+  let budgetSuccessfulTestCommandCount = 0;
+  let invalidTestToolCommandCount = 0;
   let testSuccessEvidenceKnown = false;
+  let budgetTestSuccessEvidenceKnown = false;
   const gateCodes = new Set<string>();
   const outputCodes = new Set<string>();
   const countedSourceMutationToolCallIds = new Set<string>();
   const testToolCallIds = new Set<string>();
+  const invalidTestToolCallIds = new Set<string>();
+  let anonymousTestToolResultBudget = 0;
+  let anonymousInvalidTestToolResultBudget = 0;
   const testFailureDetails = new Map<string, SweBenchChildTraceTestFailureDetail>();
   for (const line of stdout.split(/\r?\n/)) {
     if (line.trim().length === 0) continue;
@@ -82,12 +98,16 @@ export function summarizeSweBenchChildTrace(stdout: string, traceOutputPath: str
     const event = isJsonObject(parsed.event) ? parsed.event : parsed;
     const kind = stringField(event, "kind");
     const data = isJsonObject(event.data) ? event.data : {};
+    const stageId = stringField(data, "stageId") || stringField(data, "stage") || stringField(data, "currentStage") || stringField(data, "lastStageId");
+    const progressMarker = stringField(data, "progressMarker") || stringField(data, "lastProgressMarker") || stringField(data, "marker");
+    if (stageId) lastStageId = stageId;
+    if (progressMarker) lastProgressMarker = progressMarker;
     const iteration = numberField(data, "iteration") ?? numberField(data, "iterations");
     if (iteration !== undefined) iterationCount = Math.max(iterationCount, iteration);
     if (kind === "model.requested") modelRequestCount += 1;
     if (kind === "agent.loop.budget.consumed") {
       const gate = stringField(data, "gate");
-      const readyForHarnessGate = gate === "SWE_BENCH_READY_FOR_HARNESS_GATE";
+      const readyForHarnessGate = isReadyForHarnessGate(gate);
       const locksTerminal = isTerminalManagedBudgetGate(gate);
       if (!terminalLockedByManagedBudget || locksTerminal) {
         terminalKind = kind;
@@ -108,10 +128,10 @@ export function summarizeSweBenchChildTrace(stdout: string, traceOutputPath: str
       if (budgetSourceInspection !== undefined) sourceInspectionToolCount = Math.max(sourceInspectionToolCount, budgetSourceInspection);
       if (budgetSourceMutation !== undefined) sourceMutationCount = Math.max(sourceMutationCount, budgetSourceMutation);
       if (budgetShellCommands !== undefined) shellCommandCount = Math.max(shellCommandCount, budgetShellCommands);
-      if (budgetTestCommands !== undefined) testCommandCount = Math.max(testCommandCount, budgetTestCommands);
+      if (budgetTestCommands !== undefined) budgetTestCommandCount = Math.max(budgetTestCommandCount, budgetTestCommands);
       if (budgetSuccessfulTestCommands !== undefined) {
-        testSuccessEvidenceKnown = true;
-        successfulTestCommandCount = Math.max(successfulTestCommandCount, budgetSuccessfulTestCommands);
+        budgetTestSuccessEvidenceKnown = true;
+        budgetSuccessfulTestCommandCount = Math.max(budgetSuccessfulTestCommandCount, budgetSuccessfulTestCommands);
       }
     }
     if (kind === "usage.updated") usageEventCount += 1;
@@ -125,17 +145,47 @@ export function summarizeSweBenchChildTrace(stdout: string, traceOutputPath: str
         shellCommandCount += 1;
         if (isStandardTestCommand(shellCommand.command, shellCommand.args)) {
           testCommandCount += 1;
+          if (isFocusedLowCostTestCommand(shellCommand.command, shellCommand.args)) focusedTestCommandCount += 1;
+          if (isBroadTestCommand(shellCommand.command, shellCommand.args)) broadTestCommandCount += 1;
           if (toolCallId) testToolCallIds.add(toolCallId);
         }
       } else if (isTestRunTool(toolName) && commandFromToolIntent(data)) {
-        testCommandCount += 1;
-        if (toolCallId) testToolCallIds.add(toolCallId);
+        const testToolCommand = commandFromToolIntent(data);
+        if (testToolCommand && isStandardTestCommand(testToolCommand.command, testToolCommand.args)) {
+          testCommandCount += 1;
+          if (isFocusedLowCostTestCommand(testToolCommand.command, testToolCommand.args)) focusedTestCommandCount += 1;
+          if (isBroadTestCommand(testToolCommand.command, testToolCommand.args)) broadTestCommandCount += 1;
+          if (toolCallId) {
+            testToolCallIds.add(toolCallId);
+          } else {
+            anonymousTestToolResultBudget += 1;
+          }
+        } else {
+          invalidTestToolCommandCount += 1;
+          if (toolCallId) {
+            invalidTestToolCallIds.add(toolCallId);
+          } else {
+            anonymousInvalidTestToolResultBudget += 1;
+          }
+          outputCodes.add("SWE_BENCH_INVALID_TEST_TOOL_COMMAND_GATE");
+        }
       }
     }
     if (kind === "model.tool.result") {
       const toolName = toolNameFromToolResult(data);
       const toolCallId = stringField(data, "toolCallId");
       recordTestFailureDetail(testFailureDetails, testFailureDetailFromToolResult(data, toolCallId, toolName));
+      if (stringField(data, "terminalKind") === "swe-bench-invalid-test-tool-command.rejected") {
+        if (toolCallId) {
+          if (!invalidTestToolCallIds.has(toolCallId)) invalidTestToolCommandCount += 1;
+        } else if (anonymousInvalidTestToolResultBudget > 0) {
+          anonymousInvalidTestToolResultBudget -= 1;
+        } else {
+          invalidTestToolCommandCount += 1;
+        }
+        if (toolCallId) invalidTestToolCallIds.add(toolCallId);
+        outputCodes.add("SWE_BENCH_INVALID_TEST_TOOL_COMMAND_GATE");
+      }
       if (isSourceMutationTool(toolName) && stringField(data, "terminalKind") === "capability.completed") {
         const sourceMutationToolCallId = toolCallId || `source-mutation-result:${lineCount}`;
         if (!countedSourceMutationToolCallIds.has(sourceMutationToolCallId)) {
@@ -143,15 +193,19 @@ export function summarizeSweBenchChildTrace(stdout: string, traceOutputPath: str
           sourceMutationCount += 1;
         }
       }
-      const isKnownTestResult = isTestRunTool(toolName) || (toolCallId.length > 0 && testToolCallIds.has(toolCallId));
+      const isIdentifiedTestResult = toolCallId.length > 0 && testToolCallIds.has(toolCallId);
+      const isAnonymousTestRunToolResult = toolCallId.length === 0 && isTestRunTool(toolName) && anonymousTestToolResultBudget > 0;
+      const isCountedTestResult = isIdentifiedTestResult || isAnonymousTestRunToolResult;
+      const isKnownTestResult = isCountedTestResult || (toolCallId.length > 0 && testToolCallIds.has(toolCallId));
       if (isKnownTestResult) {
         const succeeded = testToolResultSucceeded(data);
-        if (succeeded !== undefined) {
+        if (isCountedTestResult && succeeded !== undefined) {
           testSuccessEvidenceKnown = true;
           if (succeeded) {
             successfulTestCommandCount += 1;
             clearStalePythonSetupCodes(outputCodes);
           }
+          if (isAnonymousTestRunToolResult) anonymousTestToolResultBudget -= 1;
         }
         for (const code of diagnosticCodesFromToolResultOutput(data)) outputCodes.add(code);
       }
@@ -165,6 +219,17 @@ export function summarizeSweBenchChildTrace(stdout: string, traceOutputPath: str
       terminalReason = stringField(data, "reason");
     }
   }
+  const normalizedBudgetTestCommandCount = Math.max(0, budgetTestCommandCount - invalidTestToolCommandCount);
+  const normalizedBudgetSuccessfulTestCommandCount = Math.max(0, Math.min(
+    normalizedBudgetTestCommandCount,
+    budgetSuccessfulTestCommandCount - invalidTestToolCommandCount
+  ));
+  testCommandCount = Math.max(testCommandCount, normalizedBudgetTestCommandCount);
+  successfulTestCommandCount = Math.min(
+    testCommandCount,
+    Math.max(successfulTestCommandCount, normalizedBudgetSuccessfulTestCommandCount)
+  );
+  testSuccessEvidenceKnown = testSuccessEvidenceKnown || (budgetTestSuccessEvidenceKnown && testCommandCount > 0);
   const diagnosticCodes = childTraceDiagnosticCodes({
     invalidLineCount,
     terminalKind,
@@ -175,6 +240,7 @@ export function summarizeSweBenchChildTrace(stdout: string, traceOutputPath: str
     shellCommandCount,
     testCommandCount,
     successfulTestCommandCount,
+    invalidTestToolCommandCount,
     testSuccessEvidenceKnown
   });
   return {
@@ -185,6 +251,8 @@ export function summarizeSweBenchChildTrace(stdout: string, traceOutputPath: str
     ...(terminalKind ? { terminalKind } : {}),
     ...(terminalStatus ? { terminalStatus } : {}),
     ...(terminalReason ? { terminalReason } : {}),
+    ...(lastStageId ? { lastStageId } : {}),
+    ...(lastProgressMarker ? { lastProgressMarker } : {}),
     iterationCount,
     modelRequestCount,
     usageEventCount,
@@ -193,7 +261,10 @@ export function summarizeSweBenchChildTrace(stdout: string, traceOutputPath: str
     sourceMutationCount,
     shellCommandCount,
     testCommandCount,
+    focusedTestCommandCount,
+    broadTestCommandCount,
     successfulTestCommandCount,
+    invalidTestToolCommandCount,
     ...(testFailureDetails.size > 0 ? { testFailureDetails: [...testFailureDetails.values()] } : {}),
     blockerFindings: childTraceBlockerFindings(evaluateAgenticEvaluationBlockers({
       diagnosticCodes,
@@ -203,7 +274,8 @@ export function summarizeSweBenchChildTrace(stdout: string, traceOutputPath: str
       sourceMutationCount,
       shellCommandCount,
       testCommandCount,
-      successfulTestCommandCount
+      successfulTestCommandCount,
+      invalidTestToolCommandCount
     })),
     redaction: { class: "internal", fields: ["tracePath"] }
   };
@@ -392,6 +464,24 @@ function isTestRunTool(toolName: string): boolean {
   return toolName === "core.test.run" || toolName === "test.run";
 }
 
+function isFocusedLowCostTestCommand(command: string, args: readonly string[]): boolean {
+  const text = normalizedCommandText(command, args);
+  return /(?:^|\s)(?:[\w.-]+\/)*(?:tests?|spec|__tests__)(?:\/|[\w.-]*\.(?:py|js|jsx|ts|tsx|mjs|cjs)|\s|$)/i.test(text) ||
+    /::[\w.[\]-]+/.test(text) ||
+    /(?:^|\s)-k\s+\S+/.test(text) ||
+    /(?:^|\s)(?:--testNamePattern|--runTestsByPath|--testPathPattern)(?:=|\s+)\S+/.test(text) ||
+    /(?:^|\s)(?:[\w./\\-]+\.(?:py|js|jsx|ts|tsx|mjs|cjs|go|rs))(?:\s|$|::)/i.test(text);
+}
+
+function isBroadTestCommand(command: string, args: readonly string[]): boolean {
+  if (!isStandardTestCommand(command, args)) return false;
+  return !isFocusedLowCostTestCommand(command, args);
+}
+
+function normalizedCommandText(command: string, args: readonly string[]): string {
+  return [command, ...args].join(" ").replace(/\\/g, "/").replace(/\s+/g, " ").trim();
+}
+
 function isSourceInspectionTool(toolName: string): boolean {
   return toolName === "core.file.read" || toolName === "core.file.list" || toolName === "core.search.text" || toolName === "core.workspace.glob";
 }
@@ -417,17 +507,22 @@ function childTraceDiagnosticCodes(input: {
   readonly shellCommandCount: number;
   readonly testCommandCount: number;
   readonly successfulTestCommandCount: number;
+  readonly invalidTestToolCommandCount: number;
   readonly testSuccessEvidenceKnown: boolean;
 }): readonly string[] {
   const codes: string[] = [];
+  const invalidTestToolUsageRecovered = input.invalidTestToolCommandCount > 0 &&
+    input.testCommandCount > 0 &&
+    input.successfulTestCommandCount > 0 &&
+    input.gateCodes.some(isReadyForHarnessGate);
   if (input.invalidLineCount > 0) codes.push("SWE_BENCH_CHILD_TRACE_INVALID_JSONL");
+  if (input.invalidTestToolCommandCount > 0 && !invalidTestToolUsageRecovered) codes.push("SWE_BENCH_INVALID_TEST_TOOL_COMMAND_GATE");
   if (input.terminalKind === "agent.loop.failed") codes.push("SWE_BENCH_CHILD_TRACE_TERMINAL_FAILED");
   if (
-    input.modelRequestCount >= 12 &&
     input.sourceMutationCount > 0 &&
     input.successfulTestCommandCount > 0 &&
     input.terminalKind !== "agent.loop.completed" &&
-    !input.gateCodes.includes("SWE_BENCH_READY_FOR_HARNESS_GATE")
+    !input.gateCodes.some(isReadyForHarnessGate)
   ) {
     codes.push("SWE_BENCH_READY_FOR_HARNESS_GATE_MISSING");
   }
@@ -442,8 +537,15 @@ function childTraceDiagnosticCodes(input: {
     ) continue;
     codes.push(gateCode);
   }
-  for (const outputCode of input.outputCodes) codes.push(outputCode);
+  for (const outputCode of input.outputCodes) {
+    if (outputCode === "SWE_BENCH_INVALID_TEST_TOOL_COMMAND_GATE" && invalidTestToolUsageRecovered) continue;
+    codes.push(outputCode);
+  }
   return [...new Set(codes)];
+}
+
+function isReadyForHarnessGate(gate: string): boolean {
+  return gate === "SWE_BENCH_READY_FOR_HARNESS_GATE" || gate === "EXTERNAL_SCORE_READY_GATE";
 }
 
 function clearStalePythonSetupCodes(codes: Set<string>): void {

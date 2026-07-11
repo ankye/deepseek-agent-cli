@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { InMemoryCapabilityRegistry } from "@deepseek/capability-registry";
 import { coreToolIds, registerCoreCodingTools } from "@deepseek/core-coding-tools";
+import { NodePlatformRuntime } from "@deepseek/platform-abstraction";
 import { asId } from "@deepseek/platform-contracts";
 import type { CapabilityExecutionContext, ExecutionEnvelope, TraceContext } from "@deepseek/platform-contracts";
 import { analyzeResourceScope, createSandboxAuditEvidence, createSandboxRequirement, createSecretRedactionDecision } from "@deepseek/policy-sandbox";
@@ -98,6 +99,47 @@ describe("fake platform matrix", () => {
     const safe = platform.resolveWorkspacePath("C:/workspace/windows", "src/index.ts");
     assert.equal(safe.ok, true);
     assert.equal(safe.value?.relativePath.replace(/\\/g, "/"), "src/index.ts");
+  });
+
+  it("canonicalizes workspace relative paths according to platform filesystem semantics", () => {
+    const windows = createFakePlatformMatrix().find((platform) => platform.os === "windows");
+    const linux = createFakePlatformMatrix().find((platform) => platform.os === "linux" && platform.environmentKind === "local");
+    assert.ok(windows);
+    assert.ok(linux);
+
+    const windowsPath = windows.resolveWorkspacePath("C:/Workspace/Repo", "Src/Readme.MD");
+    const linuxPath = linux.resolveWorkspacePath("/workspace/linux", "Src/Readme.MD");
+
+    assert.equal(windowsPath.ok, true);
+    assert.equal(windowsPath.value?.relativePath.replace(/\\/g, "/"), "src/readme.md");
+    assert.equal(linuxPath.ok, true);
+    assert.equal(linuxPath.value?.relativePath.replace(/\\/g, "/"), "Src/Readme.MD");
+  });
+
+  it("resolves Node platform workspace paths with declared OS semantics", () => {
+    const windows = new NodePlatformRuntime("windows", { environmentKind: "local", noLocalShell: true });
+    const linux = new NodePlatformRuntime("linux", { environmentKind: "local", noLocalShell: true });
+
+    const windowsContained = windows.resolveWorkspacePath("C:/Workspace/Repo", "C:/workspace/repo/Src/Readme.MD");
+    const windowsOutsideDrive = windows.resolveWorkspacePath("C:/Workspace/Repo", "D:/workspace/repo/Src/Readme.MD");
+    const linuxContained = linux.resolveWorkspacePath("/workspace/repo", "/workspace/repo/Src/Readme.MD");
+    const linuxCaseMismatch = linux.resolveWorkspacePath("/Workspace/Repo", "/workspace/repo/Src/Readme.MD");
+
+    assert.equal(windowsContained.ok, true);
+    assert.equal(windowsContained.value?.relativePath.replace(/\\/g, "/"), "src/readme.md");
+    assert.equal(windowsOutsideDrive.ok, false);
+    assert.equal(linuxContained.ok, true);
+    assert.equal(linuxContained.value?.relativePath.replace(/\\/g, "/"), "Src/Readme.MD");
+    assert.equal(linuxCaseMismatch.ok, false);
+  });
+
+  it("resolves Node macOS case-equivalent absolute paths without parent traversal", () => {
+    const macos = new NodePlatformRuntime("macos", { environmentKind: "local", noLocalShell: true });
+    const resolved = macos.resolveWorkspacePath("/Workspace/Repo", "/workspace/repo/Src/Readme.MD");
+
+    assert.equal(resolved.ok, true);
+    assert.equal(resolved.value?.relativePath.replace(/\\/g, "/"), "src/readme.md");
+    assert.equal(resolved.value?.relativePath.includes(".."), false);
   });
 
   it("covers core tool path, search, process, and output bounding behavior across the fake matrix", async () => {

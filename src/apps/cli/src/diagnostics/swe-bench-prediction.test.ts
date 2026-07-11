@@ -16,6 +16,15 @@ class FakeSweBenchPlatform extends FakePlatformRuntime {
   harnessErrorLogByInstanceId = new Map<string, string>();
   harnessTestOutputByInstanceId = new Map<string, string>();
   fallbackLocalBuildOnDockerImageMiss = false;
+  gitDiffStdout = [
+    "diff --git a/src/example.py b/src/example.py",
+    "--- a/src/example.py",
+    "+++ b/src/example.py",
+    "@@ -1,2 +1,2 @@",
+    "-result = old_value",
+    "+result = new_value",
+    ""
+  ].join("\n");
 
   override async writeFile(path: string, content: string): Promise<void> {
     this.writes.push({ path, content });
@@ -41,15 +50,7 @@ class FakeSweBenchPlatform extends FakePlatformRuntime {
     if (command === "git" && args[0] === "diff") {
       return {
         exitCode: 0,
-        stdout: [
-          "diff --git a/src/example.py b/src/example.py",
-          "--- a/src/example.py",
-          "+++ b/src/example.py",
-          "@@ -1,2 +1,2 @@",
-          "-result = old_value",
-          "+result = new_value",
-          ""
-        ].join("\n"),
+        stdout: this.gitDiffStdout,
         stderr: "",
         metadata: fakeProviderMetadata()
       };
@@ -191,6 +192,42 @@ describe("SWE-bench prediction adapter", () => {
     assert.equal(JSON.stringify(summary).includes("GLM_ANTHROPIC_API_KEY"), false);
   });
 
+  it("fails prediction before harness when the candidate patch contains debug residue", async () => {
+    const platform = new FakeSweBenchPlatform("fake");
+    platform.gitDiffStdout = [
+      "diff --git a/src/example.py b/src/example.py",
+      "--- a/src/example.py",
+      "+++ b/src/example.py",
+      "@@ -1,2 +1,3 @@",
+      " result = new_value",
+      "+print(\"DEBUG result\", result)",
+      ""
+    ].join("\n");
+    await platform.writeFile("/workspace/instance.json", JSON.stringify({
+      instance_id: "demo__repo-1",
+      repo: "demo/repo",
+      base_commit: "0123456789abcdef0123456789abcdef01234567",
+      problem_statement: "Demo issue should update the placeholder value."
+    }));
+
+    const summary = await collectSweBenchPrediction({
+      action: "predict",
+      dryRun: false,
+      live: true,
+      instanceFile: "/workspace/instance.json",
+      repoDir: "/workspace/repo",
+      outputPath: "/workspace/predictions/glm.jsonl",
+      modelProvider: "glm",
+      model: "glm-5.1",
+      extraArgs: [],
+      platform
+    });
+
+    assert.equal(summary.status, "fail");
+    assert.equal(summary.diagnostics.some((entry) => entry.code === "SWE_BENCH_PATCH_QUALITY_FAILED"), true);
+    assert.equal(platform.writes.some((write) => write.path === "/workspace/predictions/glm.jsonl"), false);
+  });
+
   it("passes the managed SWE-bench execution profile to the child CLI", async () => {
     const platform = new FakeSweBenchPlatform("fake");
     await platform.writeFile("/workspace/instance.json", JSON.stringify({
@@ -226,6 +263,12 @@ describe("SWE-bench prediction adapter", () => {
     assert.equal(prompt.includes("After patch, run that reproduction or an equivalent focused regression"), true);
     assert.equal(prompt.includes("Verification cost budget: use the cheapest command that can falsify the patch first"), true);
     assert.equal(prompt.includes("After a passing focused standard test, stop local testing and leave broader scoring to the supervisor harness"), true);
+    assert.equal(prompt.includes("Managed child tool matrix:"), true);
+    assert.equal(prompt.includes("environment: supervisor-prepared checkout; do not call core.env.prepare"), true);
+    assert.equal(prompt.includes("environment: core.env.prepare"), false);
+    assert.equal(prompt.includes("mutation: core.file.write, core.file.edit, core.patch.apply"), true);
+    assert.equal(prompt.includes("verification: core.test.run"), true);
+    assert.equal(prompt.includes("Runner stages: prepare -> understand -> change -> verify -> score -> package -> return"), true);
   });
 
   it("passes previous patch status to supervised repair prompts", async () => {
@@ -265,12 +308,70 @@ describe("SWE-bench prediction adapter", () => {
     const child = platform.executedCommands.find((entry) => entry.command === process.execPath);
     const runIndex = child?.args.indexOf("run") ?? -1;
     const prompt = runIndex >= 0 ? child?.args[runIndex + 1] ?? "" : "";
+    const contextIndex = child?.args.indexOf("--additional-user-context-file") ?? -1;
+    const contextPath = contextIndex >= 0 ? child?.args[contextIndex + 1] ?? "" : "";
+    const context = contextPath ? await platform.readFile(contextPath) : "";
 
-    assert.equal(prompt.includes("Previous supervised attempt feedback"), true);
-    assert.equal(prompt.includes("Previous patch status: non-empty patchBytes=624"), true);
-    assert.equal(prompt.includes("tests/test_demo.py::test_expected_fix"), true);
-    assert.equal(prompt.includes("Official harness failure excerpts"), true);
-    assert.equal(prompt.includes("ValueError: could not convert string to float: 'no'"), true);
+    assert.equal(prompt.includes("Previous supervised attempt feedback"), false);
+    assert.equal(context.includes("Previous supervised attempt feedback"), true);
+    assert.equal(context.includes("Previous patch status: non-empty patchBytes=624"), true);
+    assert.equal(context.includes("tests/test_demo.py::test_expected_fix"), true);
+    assert.equal(context.includes("Official harness failure excerpts"), true);
+    assert.equal(context.includes("ValueError: could not convert string to float: 'no'"), true);
+  });
+
+  it("keeps the base supervised prompt as a stable prefix when adding repair feedback", async () => {
+    const platform = new FakeSweBenchPlatform("fake");
+    await platform.writeFile("/workspace/instance.json", JSON.stringify({
+      instance_id: "demo__repo-1",
+      repo: "demo/repo",
+      base_commit: "0123456789abcdef0123456789abcdef01234567",
+      problem_statement: "Demo issue should update the placeholder value."
+    }));
+
+    await collectSweBenchPrediction({
+      action: "predict",
+      dryRun: false,
+      live: true,
+      instanceFile: "/workspace/instance.json",
+      repoDir: "/workspace/repo",
+      outputPath: "/workspace/predictions/glm.jsonl",
+      modelProvider: "glm",
+      model: "glm-5.1",
+      extraArgs: [],
+      platform
+    });
+    const basePrompt = childRunPrompt(platform);
+
+    const repairPlatform = new FakeSweBenchPlatform("fake");
+    await repairPlatform.writeFile("/workspace/instance.json", JSON.stringify({
+      instance_id: "demo__repo-1",
+      repo: "demo/repo",
+      base_commit: "0123456789abcdef0123456789abcdef01234567",
+      problem_statement: "Demo issue should update the placeholder value."
+    }));
+    await collectSweBenchPrediction({
+      action: "predict",
+      dryRun: false,
+      live: true,
+      instanceFile: "/workspace/instance.json",
+      repoDir: "/workspace/repo",
+      outputPath: "/workspace/predictions/glm.jsonl",
+      modelProvider: "glm",
+      model: "glm-5.1",
+      repairContext: {
+        attemptNumber: 2,
+        previousRunId: "unit-eval-1",
+        failingTests: ["tests/test_demo.py::test_expected_fix"],
+        previousPatchBytes: 624,
+        redaction: { class: "internal", fields: ["failingTests"] }
+      },
+      extraArgs: [],
+      platform: repairPlatform
+    });
+    const repairPrompt = childRunPrompt(repairPlatform);
+
+    assert.equal(repairPrompt, basePrompt);
   });
 
   it("preserves child CLI traces and appends supervised prediction records", async () => {
@@ -398,6 +499,43 @@ describe("SWE-bench prediction adapter", () => {
     assert.equal(summary.childTrace?.toolIntentCount, 1);
     assert.equal(summary.diagnostics.some((entry) => entry.code === "SWE_BENCH_CHILD_TRACE_TERMINAL_FAILED"), true);
     assert.equal(JSON.stringify(summary).includes("raw model body"), false);
+  });
+
+  it("warns and summarizes when the supervised child trace has no terminal event", async () => {
+    const platform = new FakeSweBenchPlatform("fake");
+    platform.agentStdout = [
+      JSON.stringify({ kind: "model.requested", data: { iteration: 1 } }),
+      JSON.stringify({ kind: "usage.updated", data: { inputTokens: 100, outputTokens: 10 } }),
+      ""
+    ].join("\n");
+    await platform.writeFile("/workspace/instance.json", JSON.stringify({
+      instance_id: "demo__repo-1",
+      repo: "demo/repo",
+      base_commit: "0123456789abcdef0123456789abcdef01234567",
+      problem_statement: "Demo issue should update the placeholder value."
+    }));
+
+    const summary = await collectSweBenchPrediction({
+      action: "predict",
+      dryRun: false,
+      live: true,
+      instanceFile: "/workspace/instance.json",
+      repoDir: "/workspace/repo",
+      outputPath: "/workspace/predictions/glm.jsonl",
+      traceOutputPath: "/workspace/traces/demo__repo-1.jsonl",
+      modelProvider: "glm",
+      model: "glm-5.1",
+      extraArgs: [],
+      platform
+    });
+
+    assert.equal(summary.status, "warn");
+    assert.equal(summary.childTrace?.terminalKind, undefined);
+    assert.equal(summary.childTrace?.modelRequestCount, 1);
+    assert.equal(summary.childTrace?.usageEventCount, 1);
+    assert.equal(summary.diagnostics.some((entry) => entry.code === "SWE_BENCH_CHILD_TRACE_TERMINAL_MISSING"), true);
+    const diagnostic = summary.diagnostics.find((entry) => entry.code === "SWE_BENCH_CHILD_TRACE_TERMINAL_MISSING");
+    assert.equal((diagnostic?.metadata as JsonObject | undefined)?.modelRequestCount, 1);
   });
 
   it("warns when the supervised child trace has no model-authored SWE verification command", async () => {
@@ -605,6 +743,166 @@ describe("SWE-bench prediction adapter", () => {
     assert.equal(summary.status, "warn");
     assert.equal(summary.childTrace?.diagnosticCodes.includes("SWE_BENCH_TEST_ENV_DEPENDENCY_INCOMPATIBLE"), true);
     assert.equal(summary.diagnostics.some((entry) => entry.code === "SWE_BENCH_TEST_ENV_DEPENDENCY_INCOMPATIBLE"), true);
+  });
+
+  it("does not count non-test core.test.run commands as child verification", async () => {
+    const platform = new FakeSweBenchPlatform("fake");
+    platform.agentStdout = [
+      JSON.stringify({ kind: "model.requested", data: { iteration: 1 } }),
+      JSON.stringify({
+        kind: "model.tool.intent",
+        data: {
+          toolCallId: "call-invalid-test-tool",
+          name: "core.test.run",
+          input: {
+            command: "cat",
+            args: ["django/forms/widgets.py"]
+          },
+          iteration: 1
+        }
+      }),
+      JSON.stringify({
+        kind: "model.tool.result",
+        data: {
+          toolCallId: "call-invalid-test-tool",
+          toolName: "core.test.run",
+          terminalKind: "capability.completed",
+          evidence: {
+            status: "success",
+            metadata: { exitCode: 0 }
+          }
+        }
+      }),
+      JSON.stringify({
+        kind: "agent.loop.budget.consumed",
+        data: {
+          budget: { kind: "model-iteration", stopReason: "swe-bench-request-budget-exceeded" },
+          gate: "SWE_BENCH_REQUEST_BUDGET_GATE",
+          modelRequestCount: 12,
+          testCommandCount: 1,
+          successfulTestCommandCount: 1
+        }
+      }),
+      ""
+    ].join("\n");
+    await platform.writeFile("/workspace/instance.json", JSON.stringify({
+      instance_id: "demo__repo-1",
+      repo: "demo/repo",
+      base_commit: "0123456789abcdef0123456789abcdef01234567",
+      problem_statement: "Demo issue should update the placeholder value."
+    }));
+
+    const summary = await collectSweBenchPrediction({
+      action: "predict",
+      dryRun: false,
+      live: true,
+      instanceFile: "/workspace/instance.json",
+      repoDir: "/workspace/repo",
+      outputPath: "/workspace/predictions/glm.jsonl",
+      traceOutputPath: "/workspace/traces/demo__repo-1.jsonl",
+      modelProvider: "glm",
+      model: "glm-5.1",
+      extraArgs: [],
+      platform
+    });
+
+    assert.equal(summary.status, "warn");
+    assert.equal(summary.childTrace?.testCommandCount, 0);
+    assert.equal(summary.childTrace?.successfulTestCommandCount, 0);
+    assert.equal(summary.childTrace?.invalidTestToolCommandCount, 1);
+    assert.equal(summary.childTrace?.diagnosticCodes.includes("SWE_BENCH_INVALID_TEST_TOOL_COMMAND_GATE"), true);
+    assert.equal(summary.diagnostics.some((entry) => entry.code === "SWE_BENCH_INVALID_TEST_TOOL_COMMAND_GATE"), true);
+  });
+
+  it("does not keep invalid test tool usage as blocking after a later standard test succeeds", async () => {
+    const platform = new FakeSweBenchPlatform("fake");
+    platform.agentStdout = [
+      JSON.stringify({
+        kind: "model.tool.intent",
+        data: {
+          toolCallId: "call-invalid-test-tool",
+          name: "core.test.run",
+          input: {
+            command: "cat",
+            args: ["src/example.py"]
+          },
+          iteration: 4
+        }
+      }),
+      JSON.stringify({
+        kind: "model.tool.result",
+        data: {
+          toolCallId: "call-invalid-test-tool",
+          toolName: "core.test.run",
+          terminalKind: "swe-bench-invalid-test-tool-command.rejected",
+          evidence: {
+            status: "failed",
+            metadata: { exitCode: 1 }
+          }
+        }
+      }),
+      JSON.stringify({
+        kind: "model.tool.intent",
+        data: {
+          toolCallId: "call-standard-test",
+          name: "core.test.run",
+          input: {
+            command: "python",
+            args: ["-m", "pytest", "tests/test_demo.py", "-q"]
+          },
+          iteration: 5
+        }
+      }),
+      JSON.stringify({
+        kind: "model.tool.result",
+        data: {
+          toolCallId: "call-standard-test",
+          toolName: "core.test.run",
+          terminalKind: "capability.completed",
+          evidence: {
+            status: "success",
+            metadata: { exitCode: 0 }
+          }
+        }
+      }),
+      JSON.stringify({
+        kind: "agent.loop.budget.consumed",
+        data: {
+          budget: { kind: "verification", stopReason: "swe-bench-ready-for-harness" },
+          gate: "SWE_BENCH_READY_FOR_HARNESS_GATE",
+          modelRequestCount: 5,
+          testCommandCount: 1,
+          successfulTestCommandCount: 1
+        }
+      }),
+      ""
+    ].join("\n");
+    await platform.writeFile("/workspace/instance.json", JSON.stringify({
+      instance_id: "demo__repo-1",
+      repo: "demo/repo",
+      base_commit: "0123456789abcdef0123456789abcdef01234567",
+      problem_statement: "Demo issue should update the placeholder value."
+    }));
+
+    const summary = await collectSweBenchPrediction({
+      action: "predict",
+      dryRun: false,
+      live: true,
+      instanceFile: "/workspace/instance.json",
+      repoDir: "/workspace/repo",
+      outputPath: "/workspace/predictions/glm.jsonl",
+      traceOutputPath: "/workspace/traces/demo__repo-1.jsonl",
+      modelProvider: "glm",
+      model: "glm-5.1",
+      extraArgs: [],
+      platform
+    });
+
+    assert.equal(summary.childTrace?.testCommandCount, 1);
+    assert.equal(summary.childTrace?.successfulTestCommandCount, 1);
+    assert.equal(summary.childTrace?.invalidTestToolCommandCount, 1);
+    assert.equal(summary.childTrace?.diagnosticCodes.includes("SWE_BENCH_INVALID_TEST_TOOL_COMMAND_GATE"), false);
+    assert.equal(summary.diagnostics.some((entry) => entry.code === "SWE_BENCH_INVALID_TEST_TOOL_COMMAND_GATE"), false);
   });
 
   it("runs the official harness for a prediction and records the resolved report", async () => {
@@ -1883,6 +2181,128 @@ describe("SWE-bench prediction adapter", () => {
     assert.equal(metadata?.uniqueProviderPrefixFingerprintCount, 2);
   });
 
+  it("keeps prefix-busted diagnostics when provider prefix and stage tool plans both drift", async () => {
+    const platform = new FakeSweBenchPlatform("fake");
+    await platform.writeFile("/workspace/predictions/glm.jsonl", JSON.stringify({
+      instance_id: "demo__repo-1",
+      model_name_or_path: "glm-5.2",
+      model_patch: "diff --git a/src/example.py b/src/example.py\n"
+    }) + "\n");
+    await platform.writeFile("/workspace/traces/glm-run.jsonl", [
+      JSON.stringify({
+        kind: "prompt.assembled",
+        data: {
+          fingerprint: "whole:first",
+          trace: {
+            replay: {
+              sectionOrderFingerprint: "sections:stable",
+              budgetFingerprint: "budget:stable",
+              toolPlanFingerprint: "tools:read"
+            },
+            pipeline: {
+              pipelineFingerprint: "pipeline:first",
+              providerPrefixFingerprint: "provider-prefix:first",
+              providerPrefixMessageCount: 12,
+              providerPrefixTokenEstimate: 2200
+            }
+          }
+        }
+      }),
+      JSON.stringify({
+        kind: "model.requested",
+        data: {
+          contextPipeline: { pipelineFingerprint: "pipeline:first" },
+          providerRequestReplay: {
+            selectedHistoryMessageCount: 14,
+            historyMessageCount: 0,
+            toolCallLinkage: { assistantToolCallCount: 0, toolResultCount: 0 }
+          }
+        }
+      }),
+      JSON.stringify({
+        kind: "usage.updated",
+        data: {
+          inputTokens: 900,
+          metadata: {
+            cache: {
+              hitTokens: 0,
+              missTokens: 900,
+              hitRate: 0,
+              pipelineFingerprint: "pipeline:first",
+              explicitPrefixCacheHint: { status: "sent" }
+            }
+          }
+        }
+      }),
+      JSON.stringify({
+        kind: "prompt.assembled",
+        data: {
+          fingerprint: "whole:second",
+          trace: {
+            replay: {
+              sectionOrderFingerprint: "sections:stable",
+              budgetFingerprint: "budget:stable",
+              toolPlanFingerprint: "tools:edit"
+            },
+            pipeline: {
+              pipelineFingerprint: "pipeline:second",
+              providerPrefixFingerprint: "provider-prefix:second",
+              providerPrefixMessageCount: 12,
+              providerPrefixTokenEstimate: 2200
+            }
+          }
+        }
+      }),
+      JSON.stringify({
+        kind: "model.requested",
+        data: {
+          contextPipeline: { pipelineFingerprint: "pipeline:second" },
+          providerRequestReplay: {
+            selectedHistoryMessageCount: 15,
+            historyMessageCount: 1,
+            toolCallLinkage: { assistantToolCallCount: 0, toolResultCount: 0 }
+          }
+        }
+      }),
+      JSON.stringify({
+        kind: "usage.updated",
+        data: {
+          inputTokens: 900,
+          metadata: {
+            cache: {
+              hitTokens: 0,
+              missTokens: 900,
+              hitRate: 0,
+              pipelineFingerprint: "pipeline:second",
+              explicitPrefixCacheHint: { status: "sent" }
+            }
+          }
+        }
+      }),
+      ""
+    ].join("\n"));
+
+    const summary = await collectSweBenchPrediction({
+      action: "evaluate",
+      dryRun: false,
+      live: false,
+      outputPath: "/workspace/predictions/glm.jsonl",
+      reportDir: "/workspace/harness",
+      runId: "glm-run",
+      instanceIds: ["demo__repo-1"],
+      cacheTracePath: "/workspace/traces/glm-run.jsonl",
+      cacheHitTarget: 0.8,
+      harnessPython: "/workspace/.deepseek/swebench-venv/bin/python",
+      extraArgs: [],
+      platform
+    });
+
+    assert.equal(summary.evaluation?.cache?.promptAssembly.stableReplayFingerprint, false);
+    assert.equal(summary.evaluation?.cache?.promptAssembly.stableProviderPrefixFingerprint, false);
+    assert.equal(summary.evaluation?.cache?.promptAssembly.uniqueToolPlanFingerprintCount, 2);
+    assert.equal(summary.diagnostics.some((entry) => entry.code === "PROMPT_CACHE_PREFIX_BUSTED"), true);
+  });
+
   it("classifies stable visible tool schemas as a provider cache gap when low hits persist", async () => {
     const platform = new FakeSweBenchPlatform("fake");
     await platform.writeFile("/workspace/predictions/glm.jsonl", JSON.stringify({
@@ -2480,6 +2900,106 @@ describe("SWE-bench prediction adapter", () => {
     assert.equal(metadata?.effectiveStableCacheHitTokens, 9700);
     assert.equal(metadata?.maxProviderPrefixTokenEstimate, 2265);
     assert.equal(metadata?.lowHitDynamicTailMissTokens, 28000);
+  });
+
+  it("classifies automatic provider prefix reuse as dynamic tail miss when explicit prefix hints are unsupported", async () => {
+    const platform = new FakeSweBenchPlatform("fake");
+    await platform.writeFile("/workspace/predictions/deepseek.jsonl", JSON.stringify({
+      instance_id: "demo__repo-1",
+      model_name_or_path: "deepseek-v4-flash",
+      model_patch: "diff --git a/src/example.py b/src/example.py\n"
+    }) + "\n");
+    await platform.writeFile("/workspace/traces/deepseek-run.jsonl", [
+      JSON.stringify({
+        kind: "prompt.assembled",
+        data: {
+          fingerprint: "whole:first",
+          trace: {
+            replay: {
+              sectionOrderFingerprint: "sections:stable",
+              budgetFingerprint: "budget:stable",
+              toolPlanFingerprint: "tools:stable"
+            },
+            pipeline: {
+              pipelineFingerprint: "pipeline:test",
+              providerPrefixFingerprint: "provider-prefix:stable",
+              providerPrefixMessageCount: 12,
+              providerPrefixTokenEstimate: 1667
+            }
+          }
+        }
+      }),
+      JSON.stringify({
+        kind: "model.requested",
+        data: {
+          contextPipeline: { pipelineFingerprint: "pipeline:test" },
+          providerRequestReplay: {
+            visibleToolCount: 61,
+            selectedHistoryMessageCount: 16,
+            historyMessageCount: 8,
+            toolCallLinkage: { assistantToolCallCount: 4, toolResultCount: 4 }
+          }
+        }
+      }),
+      JSON.stringify({
+        kind: "prompt.assembled",
+        data: {
+          fingerprint: "whole:second",
+          trace: {
+            replay: {
+              sectionOrderFingerprint: "sections:stable",
+              budgetFingerprint: "budget:stable",
+              toolPlanFingerprint: "tools:stable"
+            },
+            pipeline: {
+              pipelineFingerprint: "pipeline:test",
+              providerPrefixFingerprint: "provider-prefix:stable",
+              providerPrefixMessageCount: 12,
+              providerPrefixTokenEstimate: 1667
+            }
+          }
+        }
+      }),
+      JSON.stringify({
+        kind: "usage.updated",
+        data: {
+          inputTokens: 11659,
+          metadata: {
+            cache: {
+              hitTokens: 3200,
+              missTokens: 8459,
+              hitRate: 0.274466077708207,
+              pipelineFingerprint: "pipeline:test",
+              explicitPrefixCacheHint: {
+                status: "unsupported",
+                reasonCode: "PROVIDER_AUTOMATIC_PREFIX_CACHE_ONLY",
+                redaction: { class: "internal" }
+              }
+            }
+          }
+        }
+      }),
+      ""
+    ].join("\n"));
+
+    const summary = await collectSweBenchPrediction({
+      action: "evaluate",
+      dryRun: false,
+      live: false,
+      outputPath: "/workspace/predictions/deepseek.jsonl",
+      reportDir: "/workspace/harness",
+      runId: "deepseek-run",
+      instanceIds: ["demo__repo-1"],
+      cacheTracePath: "/workspace/traces/deepseek-run.jsonl",
+      cacheHitTarget: 0.9,
+      harnessPython: "/workspace/.deepseek/swebench-venv/bin/python",
+      extraArgs: [],
+      platform
+    });
+
+    assert.equal(summary.evaluation?.cache?.provider.lowHitDynamicTailMissCount, 1);
+    assert.equal(summary.evaluation?.cache?.provider.effectiveStableCacheHitTokens, 3200);
+    assert.equal(summary.diagnostics.some((entry) => entry.code === "SWE_BENCH_PROVIDER_CACHE_DYNAMIC_TAIL_MISS"), true);
   });
 
   it("classifies unbounded provider history after a framework gate", async () => {
@@ -3182,6 +3702,107 @@ describe("SWE-bench prediction adapter", () => {
     assert.equal(summary.diagnostics.some((entry) => entry.code === "PROMPT_CACHE_PREFIX_BUSTED"), false);
   });
 
+  it("does not report stage-scoped tool projection changes as prompt cache prefix drift when provider prefix is stable", async () => {
+    const platform = new FakeSweBenchPlatform("fake");
+    await platform.writeFile("/workspace/predictions/glm.jsonl", JSON.stringify({
+      instance_id: "demo__repo-1",
+      model_name_or_path: "glm-5.2",
+      model_patch: "diff --git a/src/example.py b/src/example.py\n"
+    }) + "\n");
+    await platform.writeFile("/workspace/traces/glm-run.jsonl", [
+      JSON.stringify({
+        kind: "prompt.assembled",
+        data: {
+          fingerprint: "whole:read-stage",
+          trace: {
+            replay: {
+              sectionOrderFingerprint: "sections:read-stage",
+              budgetFingerprint: "budget:read-stage",
+              toolPlanFingerprint: "tools:read"
+            },
+            pipeline: {
+              pipelineFingerprint: "pipeline:stable-provider-prefix",
+              providerPrefixFingerprint: "provider-prefix:stable-framework",
+              providerPrefixMessageCount: 13,
+              providerPrefixTokenEstimate: 2089
+            }
+          }
+        }
+      }),
+      JSON.stringify({
+        kind: "usage.updated",
+        data: {
+          inputTokens: 900,
+          metadata: {
+            cache: {
+              hitTokens: 100,
+              missTokens: 900,
+              hitRate: 0.1,
+              pipelineFingerprint: "pipeline:stable-provider-prefix",
+              explicitPrefixCacheHint: { status: "sent" }
+            }
+          }
+        }
+      }),
+      JSON.stringify({
+        kind: "prompt.assembled",
+        data: {
+          fingerprint: "whole:edit-stage",
+          trace: {
+            replay: {
+              sectionOrderFingerprint: "sections:edit-stage",
+              budgetFingerprint: "budget:edit-stage",
+              toolPlanFingerprint: "tools:edit"
+            },
+            pipeline: {
+              pipelineFingerprint: "pipeline:stable-provider-prefix",
+              providerPrefixFingerprint: "provider-prefix:stable-framework",
+              providerPrefixMessageCount: 13,
+              providerPrefixTokenEstimate: 2089
+            }
+          }
+        }
+      }),
+      JSON.stringify({
+        kind: "usage.updated",
+        data: {
+          inputTokens: 900,
+          metadata: {
+            cache: {
+              hitTokens: 100,
+              missTokens: 900,
+              hitRate: 0.1,
+              pipelineFingerprint: "pipeline:stable-provider-prefix",
+              explicitPrefixCacheHint: { status: "sent" }
+            }
+          }
+        }
+      }),
+      ""
+    ].join("\n"));
+
+    const summary = await collectSweBenchPrediction({
+      action: "evaluate",
+      dryRun: false,
+      live: false,
+      outputPath: "/workspace/predictions/glm.jsonl",
+      reportDir: "/workspace/harness",
+      runId: "glm-run",
+      instanceIds: ["demo__repo-1"],
+      cacheTracePath: "/workspace/traces/glm-run.jsonl",
+      cacheHitTarget: 0.8,
+      harnessPython: "/workspace/.deepseek/swebench-venv/bin/python",
+      extraArgs: [],
+      platform
+    });
+
+    assert.equal(summary.evaluation?.cache?.promptAssembly.stableReplayFingerprint, false);
+    assert.equal(summary.evaluation?.cache?.promptAssembly.stableProviderPrefixFingerprint, true);
+    assert.equal(summary.evaluation?.cache?.promptAssembly.uniqueToolPlanFingerprintCount, 2);
+    assert.equal(summary.evaluation?.cache?.provider.lowHitPromptAssemblyDriftCount, 0);
+    assert.equal(summary.diagnostics.some((entry) => entry.code === "PROMPT_CACHE_PREFIX_BUSTED"), false);
+  });
+
   it("separates stable prompt assembly from context projection cache misses", async () => {
     const platform = new FakeSweBenchPlatform("fake");
     await platform.writeFile("/workspace/predictions/glm.jsonl", JSON.stringify({
@@ -3660,6 +4281,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function argAfter(args: readonly string[], flag: string): string | undefined {
   const index = args.indexOf(flag);
   return index >= 0 ? args[index + 1] : undefined;
+}
+
+function childRunPrompt(platform: FakeSweBenchPlatform): string {
+  const child = platform.executedCommands.find((entry) => entry.command === process.execPath);
+  const runIndex = child?.args.indexOf("run") ?? -1;
+  return runIndex >= 0 ? child?.args[runIndex + 1] ?? "" : "";
 }
 
 function argsAfterListFlag(args: readonly string[], flag: string): readonly string[] {

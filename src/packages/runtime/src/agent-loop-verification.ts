@@ -120,7 +120,7 @@ export async function runFinalVerification(input: FinalVerificationInput): Promi
 }
 
 async function verifyOutputContract(input: FinalVerificationInput): Promise<AgentLoopOutputContractVerification | undefined> {
-  const contract = input.request.outputContract;
+  const contract = input.request.outputContract ?? inferredFileArtifactOutputContract(input.request.prompt);
   if (!contract) return undefined;
   const base = contract.kind === "json-object"
     ? verifyJsonObjectContract(contract, input.assistantText)
@@ -176,6 +176,10 @@ function verifyCommandPlanContract(contract: AgentLoopOutputContract, assistantT
 async function verifyJsonFileContract(input: FinalVerificationInput, contract: AgentLoopOutputContract): Promise<AgentLoopOutputContractVerification> {
   const resolved = resolveContractPath(input, contract);
   if (resolved instanceof Error) return outputContractResult(contract, contract.required ? "fail" : "not_applicable", [], [contractDiagnostic("OUTPUT_PATH_REJECTED", resolved.message)], []);
+  const exactPath = await verifyCaseExactWorkspacePath(input, contract.path ?? "", resolved);
+  if (exactPath.diagnostics.length > 0) {
+    return outputContractResult(contract, contract.required ? "fail" : "not_applicable", [resolved], exactPath.diagnostics, []);
+  }
   const content = await input.deps.platform.readFile(resolved).catch((error: unknown) => error instanceof Error ? error : new Error("Unable to read output JSON file."));
   if (content instanceof Error) {
     return outputContractResult(contract, contract.required ? "fail" : "not_applicable", [resolved], [contractDiagnostic("OUTPUT_FILE_READ_FAILED", content.message)], []);
@@ -190,6 +194,10 @@ async function verifyJsonFileContract(input: FinalVerificationInput, contract: A
 async function verifyFileContract(input: FinalVerificationInput, contract: AgentLoopOutputContract): Promise<AgentLoopOutputContractVerification> {
   const resolved = resolveContractPath(input, contract);
   if (resolved instanceof Error) return outputContractResult(contract, contract.required ? "fail" : "not_applicable", [], [contractDiagnostic("OUTPUT_PATH_REJECTED", resolved.message)], []);
+  const exactPath = await verifyCaseExactWorkspacePath(input, contract.path ?? "", resolved);
+  if (exactPath.diagnostics.length > 0) {
+    return outputContractResult(contract, contract.required ? "fail" : "not_applicable", [resolved], exactPath.diagnostics, []);
+  }
   const content = await input.deps.platform.readFile(resolved).catch((error: unknown) => error instanceof Error ? error : new Error("Unable to read output file."));
   if (content instanceof Error) {
     return outputContractResult(contract, contract.required ? "fail" : "not_applicable", [resolved], [contractDiagnostic("OUTPUT_FILE_READ_FAILED", content.message)], []);
@@ -242,6 +250,8 @@ async function verifyArtifactExpectation(input: FinalVerificationInput, expectat
   }
   const resolved = resolveExpectationPath(input, expectation.path);
   if (resolved instanceof Error) return expectationResult(expectation, index, [], [contractDiagnostic("OUTPUT_EXPECTATION_PATH_REJECTED", resolved.message)], []);
+  const exactPath = await verifyCaseExactWorkspacePath(input, expectation.path, resolved);
+  if (exactPath.diagnostics.length > 0) return expectationResult(expectation, index, [resolved], exactPath.diagnostics, []);
   const content = await input.deps.platform.readFile(resolved).catch((error: unknown) => error instanceof Error ? error : new Error("Unable to read expected artifact."));
   if (content instanceof Error) {
     return expectationResult(expectation, index, [resolved], [contractDiagnostic("OUTPUT_EXPECTATION_ARTIFACT_MISSING", content.message)], []);
@@ -288,9 +298,93 @@ async function expectationContentTarget(input: FinalVerificationInput, expectati
   if (!expectation.path) return { content: input.assistantText };
   const resolved = resolveExpectationPath(input, expectation.path);
   if (resolved instanceof Error) return resolved;
+  const exactPath = await verifyCaseExactWorkspacePath(input, expectation.path, resolved);
+  if (exactPath.diagnostics.length > 0) return new Error(exactPath.diagnostics[0]?.message ?? "Expected path casing did not match.");
   const content = await input.deps.platform.readFile(resolved).catch((error: unknown) => error instanceof Error ? error : new Error("Unable to read expectation target."));
   if (content instanceof Error) return content;
   return { content, path: resolved };
+}
+
+function inferredFileArtifactOutputContract(prompt: string): AgentLoopOutputContract | undefined {
+  if (!fileMutationRequested(prompt)) return undefined;
+  const paths = requestedPathLiterals(prompt);
+  if (paths.length === 0) return undefined;
+  return {
+    schemaVersion: "1.0.0",
+    kind: "file",
+    required: true,
+    description: "Requested workspace artifact paths must exist exactly as written by the user.",
+    ...(paths[0] ? { path: paths[0] } : {}),
+    verificationExpectations: paths.map((path) => ({
+      schemaVersion: "1.0.0",
+      kind: "artifact",
+      required: true,
+      description: `Requested artifact path must exist exactly: ${path}`,
+      path,
+      redaction: { class: "internal", fields: ["path", "description"] }
+    })),
+    redaction: { class: "internal", fields: ["path", "verificationExpectations.path", "verificationExpectations.description"] }
+  };
+}
+
+function fileMutationRequested(prompt: string): boolean {
+  if (/不要(?:修改|写入|编辑|删除|创建|生成)|不应(?:修改|写入|编辑|删除|创建|生成)|不应该(?:修改|写入|编辑|删除|创建|生成)|do not (?:modify|write|edit|delete|create|generate)/i.test(prompt)) {
+    return false;
+  }
+  return /\b(update|write|edit|create|modify|fix|repair|refactor|add|remove|delete)\b/i.test(prompt)
+    || /更新|写入|编辑|修改|修复|新增|创建|删除|补齐|生成/.test(prompt);
+}
+
+function requestedPathLiterals(prompt: string): readonly string[] {
+  const paths = new Set<string>();
+  for (const match of prompt.matchAll(/(?:^|[\s"'`，。；：、,;:(（])((?:\.\/)?(?:(?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+|[A-Za-z0-9_.-]+\.[A-Za-z0-9][A-Za-z0-9_.-]*))(?=$|[\s"'`，。；：、,;:)）])/g)) {
+    const path = match[1]?.replace(/^\.\//, "");
+    if (path && isWorkspaceArtifactPathLiteral(path)) paths.add(path);
+  }
+  return [...paths];
+}
+
+function isWorkspaceArtifactPathLiteral(path: string): boolean {
+  if (path.includes("://") || path.startsWith("../") || path.includes("/../")) return false;
+  if (/^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+){2,}$/.test(path)) return false;
+  if (/^(?:core|runtime|workflow|agent|model|tool|capability|diagnostics|rubric)\./i.test(path)) return false;
+  return true;
+}
+
+async function verifyCaseExactWorkspacePath(input: FinalVerificationInput, requestedPath: string, resolvedPath: string): Promise<{ readonly diagnostics: readonly RedactedError[] }> {
+  if (!requestedPath) return { diagnostics: [] };
+  const workspace = resolveExpectationPath(input, ".");
+  if (workspace instanceof Error) return { diagnostics: [contractDiagnostic("OUTPUT_EXPECTATION_CWD_REJECTED", workspace.message)] };
+  const actualPaths = await input.deps.platform.findFiles("", workspace).catch(() => []);
+  const normalizedExpected = normalizePathForContract(resolvedPath);
+  if (actualPaths.some((path) => normalizePathForContract(path) === normalizedExpected)) return { diagnostics: [] };
+  const caseMismatch = actualPaths.find((path) => normalizePathForContract(path).toLowerCase() === normalizedExpected.toLowerCase());
+  if (caseMismatch) {
+    return {
+      diagnostics: [contractDiagnostic(
+        "OUTPUT_EXPECTATION_ARTIFACT_CASE_MISMATCH",
+        `Expected artifact path ${requestedPath} exactly, but found ${relativeContractPath(workspace, caseMismatch)} with different casing.`,
+        { expectedPath: requestedPath, actualPath: relativeContractPath(workspace, caseMismatch) }
+      )]
+    };
+  }
+  return {
+    diagnostics: [contractDiagnostic(
+      "OUTPUT_EXPECTATION_ARTIFACT_MISSING",
+      `Expected artifact path ${requestedPath} was not found exactly.`,
+      { expectedPath: requestedPath }
+    )]
+  };
+}
+
+function normalizePathForContract(path: string): string {
+  return path.replace(/\\/g, "/").replace(/\/+/g, "/").replace(/\/$/, "");
+}
+
+function relativeContractPath(root: string, path: string): string {
+  const normalizedRoot = normalizePathForContract(root);
+  const normalizedPath = normalizePathForContract(path);
+  return normalizedPath.startsWith(`${normalizedRoot}/`) ? normalizedPath.slice(normalizedRoot.length + 1) : normalizedPath;
 }
 
 function expectationResult(

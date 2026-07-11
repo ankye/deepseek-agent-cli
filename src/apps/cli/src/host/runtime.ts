@@ -2,18 +2,20 @@ import type { RuntimeDependencies, RuntimeKernel } from "@deepseek/platform-cont
 import {
   CredentialAuthModelCredentialProvider,
   createDeepSeekCredentialAuthServiceFromEnv,
-  deepSeekLiveCredentialProcessEnv,
-  glmAnthropicLiveCredentialProcessEnv
+  deepSeekLiveCredentialResolution,
+  glmAnthropicLiveCredentialResolution
 } from "@deepseek/credential-auth-management";
 import { FetchModelProviderTransport, GlmAnthropicProvider, OpenAIModelProviderTransport, StaticCredentialProvider, glmAnthropicCredentialRef } from "@deepseek/model-gateway";
 import { DurablePermanentMemoryProvider, FilesystemPermanentMemoryStorageAdapter, PersistentJsonlLosslessContextManager } from "@deepseek/memory-cache-management";
 import { NodePlatformRuntime } from "@deepseek/platform-abstraction";
+import { HeadlessApprovalBroker } from "@deepseek/policy-sandbox";
 import { createDefaultRuntimeKernel, loadUserHooks, registerRuntimeCoreTools } from "@deepseek/runtime";
 import { PersistentFilesystemSessionStore, userSessionsDirectory } from "@deepseek/session-store";
 import { createDeterministicRuntimeDependencies, createLiveCliDependencies } from "@deepseek/testing-regression";
 import type { CliRunOptions, CliRuntimeFactoryOptions } from "../types.js";
 import { registerCliEnvironmentCapabilities } from "./environment-capabilities.js";
 import { registerCliSweBenchRunCapabilities } from "./swe-bench-run-capabilities.js";
+import { resolveCliWorkspaceRoot } from "./workspace-root.js";
 
 export { registerCliEnvironmentCapabilities } from "./environment-capabilities.js";
 export { registerCliSweBenchRunCapabilities } from "./swe-bench-run-capabilities.js";
@@ -21,10 +23,11 @@ export { registerCliSweBenchRunCapabilities } from "./swe-bench-run-capabilities
 export async function createCliAgentRuntime(options: CliRuntimeFactoryOptions, runOptions: CliRunOptions): Promise<{ readonly deps: RuntimeDependencies; readonly kernel: RuntimeKernel }> {
   if (runOptions.createRuntime) return runOptions.createRuntime(options);
   const platform = new NodePlatformRuntime();
-  const liveCredentialEnv = options.live && options.modelProvider !== "glm" ? await deepSeekLiveCredentialProcessEnv(platform, options.workspaceRoot) : undefined;
-  const deps: RuntimeDependencies = options.live
-    ? await createLiveRuntimeDependencies(options, platform, liveCredentialEnv)
+  const liveCredential = options.live && options.modelProvider !== "glm" ? await deepSeekLiveCredentialResolution(platform, options.workspaceRoot) : undefined;
+  const baseDeps: RuntimeDependencies = options.live
+    ? await createLiveRuntimeDependencies(options, platform, liveCredential)
     : createCliSessionDependenciesBase(platform);
+  const deps = applyCliApprovalMode(baseDeps, options);
   await loadUserHooks(options.workspaceRoot, deps, platform).catch((error: unknown) => {
     console.warn(`deepseek: user hook loading failed: ${error instanceof Error ? error.message : String(error)}`);
   });
@@ -37,14 +40,15 @@ export async function createCliAgentRuntime(options: CliRuntimeFactoryOptions, r
 async function createLiveRuntimeDependencies(
   options: CliRuntimeFactoryOptions,
   platform: NodePlatformRuntime,
-  deepSeekEnv: Awaited<ReturnType<typeof deepSeekLiveCredentialProcessEnv>> | undefined
+  deepSeekCredential: Awaited<ReturnType<typeof deepSeekLiveCredentialResolution>> | undefined
 ): Promise<RuntimeDependencies> {
-  const allowWorkspaceWrites = options.toolProjection === "read-write" || options.toolProjection === "all";
-  const allowWorkspaceProcesses = options.toolProjection === "all";
+  const allowWorkspaceWrites = options.toolProjection === "read-write" || options.toolProjection === "safe-all" || options.toolProjection === "all";
+  const allowWorkspaceProcesses = options.toolProjection === "read-write" || options.toolProjection === "safe-all" || options.toolProjection === "all";
   if (options.modelProvider === "glm") {
-    const glmEnv = await glmAnthropicLiveCredentialProcessEnv(platform, options.workspaceRoot);
+    const glmCredential = await glmAnthropicLiveCredentialResolution(platform, options.workspaceRoot);
+    const glmEnv = glmCredential.env;
     const token = firstNonEmpty(glmEnv.GLM_ANTHROPIC_API_KEY, glmEnv.ZHIPU_API_KEY);
-    return withCliPermanentMemory({
+    const deps = withCliPermanentMemory({
       ...createLiveCliDependencies({
         workspaceRoot: options.workspaceRoot,
         timeoutMs: 90_000,
@@ -57,23 +61,44 @@ async function createLiveRuntimeDependencies(
         ...(token ? { credentials: new StaticCredentialProvider(token, glmAnthropicCredentialRef) } : {})
       })
     });
+    await recordCredentialResolution(deps, glmCredential.summary);
+    return deps;
   }
-  return withCliPermanentMemory(createLiveCliDependencies({
+  const credential = deepSeekCredential ?? await deepSeekLiveCredentialResolution(platform, options.workspaceRoot);
+  const deps = withCliPermanentMemory(createLiveCliDependencies({
     workspaceRoot: options.workspaceRoot,
-    credentials: new CredentialAuthModelCredentialProvider(await createDeepSeekCredentialAuthServiceFromEnv(deepSeekEnv)),
+    credentials: new CredentialAuthModelCredentialProvider(await createDeepSeekCredentialAuthServiceFromEnv(credential.env)),
     transport: new OpenAIModelProviderTransport(),
     timeoutMs: 90_000,
     allowWorkspaceWrites,
     allowWorkspaceProcesses
   }));
+  await recordCredentialResolution(deps, credential.summary);
+  return deps;
 }
 
-export async function resolveSessionDependencies(runOptions: CliRunOptions, workspaceRoot = process.cwd()): Promise<RuntimeDependencies> {
+async function recordCredentialResolution(
+  deps: RuntimeDependencies,
+  summary: Awaited<ReturnType<typeof deepSeekLiveCredentialResolution>>["summary"]
+): Promise<void> {
+  await deps.observability.emit({
+    kind: "audit",
+    at: new Date(0).toISOString(),
+    name: "credential.resolution",
+    fields: { ...summary },
+    dataPrivacyClass: "secret",
+    redaction: { class: "secret", fields: ["fields.env"] },
+    persistence: { scope: "local-diagnostics", retainLocal: true, allowExport: false }
+  });
+}
+
+export async function resolveSessionDependencies(runOptions: CliRunOptions, workspaceRoot?: string): Promise<RuntimeDependencies> {
+  const resolvedWorkspaceRoot = workspaceRoot ?? await resolveCliWorkspaceRoot(runOptions);
   if (runOptions.createRuntime) {
-    const runtime = await runOptions.createRuntime({ live: false, workspaceRoot });
+    const runtime = await runOptions.createRuntime({ live: false, workspaceRoot: resolvedWorkspaceRoot });
     return runtime.deps;
   }
-  return createCliSessionDependencies(workspaceRoot);
+  return createCliSessionDependencies(resolvedWorkspaceRoot);
 }
 
 async function createCliSessionDependencies(workspaceRoot = process.cwd()): Promise<RuntimeDependencies> {
@@ -101,6 +126,17 @@ function createCliSessionDependenciesBase(platform = new NodePlatformRuntime()):
 
 function withCliPermanentMemory(deps: RuntimeDependencies): RuntimeDependencies {
   return { ...deps, memory: createPersistentPermanentMemoryProvider() };
+}
+
+function applyCliApprovalMode(deps: RuntimeDependencies, options: CliRuntimeFactoryOptions): RuntimeDependencies {
+  if (options.approvalMode !== "trusted") return deps;
+  return {
+    ...deps,
+    approvals: new HeadlessApprovalBroker({
+      defaultApproved: true,
+      defaultSource: "automation"
+    })
+  };
 }
 
 function createPersistentPermanentMemoryProvider(): DurablePermanentMemoryProvider {

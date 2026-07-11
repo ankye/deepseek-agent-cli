@@ -165,7 +165,8 @@ function normalizeUsage(value: unknown, provider: ModelProviderEventMetadata): M
   const promptDetails = isJsonObject(value.prompt_tokens_details) ? value.prompt_tokens_details : {};
   const reasoningTokens = numberValue(details.reasoning_tokens);
   const hitTokens = numberValue(value.prompt_cache_hit_tokens) ?? numberValue(promptDetails.cached_tokens);
-  const missTokens = numberValue(value.prompt_cache_miss_tokens);
+  const explicitMissTokens = numberValue(value.prompt_cache_miss_tokens);
+  const missTokens = explicitMissTokens ?? (hitTokens !== undefined ? Math.max(0, inputTokens - hitTokens) : undefined);
   return {
     inputTokens,
     outputTokens,

@@ -1,7 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import type { AgentLoopBudget, AgentLoopProjectRuleEvidence, AgentPhasePlan, AgentReasoningEffortMapping, AgentWorkOrder, CapabilityManifest, ContextPipelineManifest, EvidenceFirstRuntimeContext, EvidenceItem, EvidenceSourceCoverage, EvidenceTaskClassification, JsonObject, PromptAssemblyInput, PromptSection, SelfRepairAttemptRecord, SelfRepairFailureClassification, SelfRepairOutcomeSummary, SelfRepairVerificationSummary, TaskDecisionRequest } from "@deepseek/platform-contracts";
+import type { AgentLoopBudget, AgentLoopProjectRuleEvidence, AgentPhasePlan, AgentReasoningEffortMapping, AgentWorkOrder, CapabilityManifest, ContextPipelineManifest, EvidenceFirstRuntimeContext, EvidenceItem, EvidenceSourceCoverage, EvidenceTaskClassification, JsonObject, ModelChatMessage, PromptAssemblyInput, PromptSchedulingNextAction, PromptSection, SelfRepairAttemptRecord, SelfRepairFailureClassification, SelfRepairOutcomeSummary, SelfRepairVerificationSummary, TaskDecisionRequest, ToolDecisionRecord } from "@deepseek/platform-contracts";
 import { AGENT_MODE_COMPATIBILITY, AGENT_MODE_SCHEMA_VERSION, CONTEXT_PIPELINE_SCHEMA_VERSION, EVIDENCE_FIRST_COMPATIBILITY, EVIDENCE_FIRST_SCHEMA_VERSION, SELF_REPAIR_COMPATIBILITY, SELF_REPAIR_SCHEMA_VERSION, TASK_DELIVERY_FLOW_COMPATIBILITY, TASK_DELIVERY_FLOW_SCHEMA_VERSION, asId } from "@deepseek/platform-contracts";
+import { coreToolManifests } from "@deepseek/core-coding-tools";
 import { createDefaultPromptAssembler, replayPromptAssembly, type PromptSectionProviderRegistration } from "../src/index.js";
 
 describe("prompt assembly", () => {
@@ -121,10 +122,241 @@ describe("prompt assembly", () => {
 
     assert.equal(modeContext?.cacheHint?.policy, "stable");
     assert.equal(phasePlan?.cacheHint?.policy, "stable");
-    assert.equal(toolPolicy?.cacheHint?.policy, "stable");
-    assert.equal(result.trace.pipeline?.providerPrefixMessageCount, result.messages.filter((message) => message.cacheHint?.policy === "stable").length);
+    assert.equal(toolPolicy?.cacheHint?.policy, "ephemeral");
+    assert.equal(result.trace.pipeline?.providerPrefixMessageCount, result.messages.findIndex((message) => message.cacheHint?.policy !== "stable"));
     assert.equal(result.trace.pipeline?.cacheHintSummary.stable, result.trace.pipeline?.providerPrefixMessageCount);
-    assert.equal((result.trace.pipeline?.providerPrefixTokenEstimate ?? 0) > 500, true);
+    assert.equal((result.trace.pipeline?.providerPrefixTokenEstimate ?? 0) > 300, true);
+  });
+
+  it("keeps dynamic tool projection guidance out of the provider stable prefix", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const common = {
+      prompt: "fix issue",
+      contextPipelineManifest: pipelineManifest(),
+      phasePlan: agentPhasePlan(),
+      reasoningEffortMapping: reasoningMapping()
+    };
+    const readStage = await assembler.assemble(input({
+      ...common,
+      availableTools: [capability("core.file.read"), capability("core.workspace.glob")]
+    }));
+    const editStage = await assembler.assemble(input({
+      ...common,
+      availableTools: [capability("core.file.edit", "write"), capability("core.test.run", "process")]
+    }));
+    const readToolPolicyIndex = readStage.messages.findIndex((message) => message.content.includes("Tool visibility policy:"));
+    const editToolPolicyIndex = editStage.messages.findIndex((message) => message.content.includes("Tool visibility policy:"));
+
+    assert.equal(readStage.trace.pipeline?.providerPrefixFingerprint, editStage.trace.pipeline?.providerPrefixFingerprint);
+    assert.equal(readToolPolicyIndex >= (readStage.trace.pipeline?.providerPrefixMessageCount ?? 0), true);
+    assert.equal(editToolPolicyIndex >= (editStage.trace.pipeline?.providerPrefixMessageCount ?? 0), true);
+    assert.notEqual(readStage.trace.replay.toolPlanFingerprint, editStage.trace.replay.toolPlanFingerprint);
+  });
+
+  it("keeps dynamic file mutation output contracts out of the provider stable prefix", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const common = {
+      prompt: "Update README.md and openspec/spec.md with bilingual guidance",
+      contextPipelineManifest: pipelineManifest(),
+      phasePlan: agentPhasePlan()
+    };
+    const writeStage = await assembler.assemble(input({
+      ...common,
+      availableTools: [capability("core.file.read"), capability("core.file.write", "write")]
+    }));
+    const editStage = await assembler.assemble(input({
+      ...common,
+      availableTools: [capability("core.file.read"), capability("core.file.edit", "write"), capability("core.patch.apply", "write")]
+    }));
+    const writeContract = writeStage.messages.find((message) => message.content.includes("File mutation output contract:"));
+    const editContract = editStage.messages.find((message) => message.content.includes("File mutation output contract:"));
+    const writeContractIndex = writeStage.messages.findIndex((message) => message.content.includes("File mutation output contract:"));
+    const editContractIndex = editStage.messages.findIndex((message) => message.content.includes("File mutation output contract:"));
+
+    assert.equal(writeStage.trace.pipeline?.providerPrefixFingerprint, editStage.trace.pipeline?.providerPrefixFingerprint);
+    assert.equal(writeContract?.cacheHint?.policy, "ephemeral");
+    assert.equal(editContract?.cacheHint?.policy, "ephemeral");
+    assert.equal(writeContractIndex >= (writeStage.trace.pipeline?.providerPrefixMessageCount ?? 0), true);
+    assert.equal(editContractIndex >= (editStage.trace.pipeline?.providerPrefixMessageCount ?? 0), true);
+    assert.notEqual(writeContract?.content, editContract?.content);
+  });
+
+  it("keeps task intent and profile contracts stable across tool projection changes", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const common = {
+      prompt: "Resolve SWE-bench instance demo__repo-1.",
+      contextPipelineManifest: pipelineManifest(),
+      phasePlan: agentPhasePlan(),
+      profilePolicy: profileWorkflowPolicy()
+    };
+    const readOnly = await assembler.assemble(input({
+      ...common,
+      toolPolicy: "read-only",
+      availableTools: [capability("core.file.read", "read")]
+    }));
+    const safeAll = await assembler.assemble(input({
+      ...common,
+      toolPolicy: "safe-all",
+      availableTools: [
+        capability("core.file.read", "read"),
+        capability("core.swe.bench.run", "process"),
+        capability("core.file.edit", "write")
+      ]
+    }));
+    const readOnlyProfile = readOnly.messages.find((message) => message.content.includes("Agent profile workflow:"));
+    const safeAllProfile = safeAll.messages.find((message) => message.content.includes("Agent profile workflow:"));
+    const readOnlyIntent = readOnly.messages.find((message) => message.content.includes("Task intent contract:"));
+    const safeAllIntent = safeAll.messages.find((message) => message.content.includes("Task intent contract:"));
+
+    assert.equal(readOnly.trace.pipeline?.providerPrefixFingerprint, safeAll.trace.pipeline?.providerPrefixFingerprint);
+    assert.equal(readOnlyProfile?.content, safeAllProfile?.content);
+    assert.equal(readOnlyIntent?.content, safeAllIntent?.content);
+    assert.equal(readOnlyProfile?.content.includes("Model-visible workflow capabilities:"), false);
+    assert.equal(readOnlyIntent?.content.includes("Model-visible route capabilities:"), false);
+    assert.notEqual(readOnly.trace.replay.toolPlanFingerprint, safeAll.trace.replay.toolPlanFingerprint);
+  });
+
+  it("projects every manifest-declared semantic alias into the tool policy guidance", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const result = await assembler.assemble(input({
+      prompt: "inspect tool guidance",
+      toolPolicy: "safe-all",
+      availableTools: coreToolManifests().filter((manifest) => manifest.projection?.modelVisible !== false)
+    }));
+    const toolPolicy = result.messages.find((message) => message.content.includes("Tool visibility policy: safe-all"));
+    const visibleCapabilityIds = new Set(result.toolPlan.visibleTools.map((tool) => {
+      const metadata = tool.metadata;
+      return typeof metadata === "object" && metadata !== null ? String((metadata as { capabilityId?: unknown }).capabilityId ?? "") : "";
+    }));
+    const aliases = coreToolManifests()
+      .filter((manifest) => visibleCapabilityIds.has(String(manifest.id)))
+      .flatMap((manifest) => stringArray(manifest.projection?.modelAliases));
+
+    assert.ok(toolPolicy);
+    assert.equal(aliases.length > 0, true);
+    for (const alias of aliases) {
+      assert.equal(toolPolicy?.content.includes(`${alias} ->`), true, alias);
+    }
+  });
+
+  it("keeps tool policy guidance names identical to projected tool schema names", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const result = await assembler.assemble(input({
+      prompt: "inspect tool schema names",
+      toolPolicy: "safe-all",
+      toolOptIns: ["network"],
+      availableTools: coreToolManifests().filter((manifest) => manifest.projection?.modelVisible !== false)
+    }));
+    const toolPolicy = result.messages.find((message) => message.content.includes("Tool visibility policy: safe-all"));
+    const projected = result.toolPlan.visibleTools.map((tool) => {
+      const fn = tool.function;
+      const metadata = tool.metadata;
+      return {
+        name: typeof fn === "object" && fn !== null ? String((fn as { name?: unknown }).name ?? "") : "",
+        capabilityId: typeof metadata === "object" && metadata !== null ? String((metadata as { capabilityId?: unknown }).capabilityId ?? "") : ""
+      };
+    });
+
+    assert.ok(toolPolicy);
+    assert.equal(projected.length > 0, true);
+    for (const tool of projected) {
+      assert.equal(tool.name.length > 0, true, tool.capabilityId);
+      assert.equal(toolPolicy?.content.includes(`${tool.name} (capability ${tool.capabilityId})`), true, `${tool.name} should match guidance for ${tool.capabilityId}`);
+    }
+  });
+
+  it("uses provider-safe names that DeepSeek preflight can repair back to capability ids", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const result = await assembler.assemble(input({
+      prompt: "inspect preflight-compatible tool names",
+      toolPolicy: "safe-all",
+      toolOptIns: ["network"],
+      availableTools: coreToolManifests().filter((manifest) => manifest.projection?.modelVisible !== false)
+    }));
+
+    assert.equal(result.toolPlan.visibleToolCount > 0, true);
+    for (const tool of result.toolPlan.visibleTools) {
+      const fn = tool.function;
+      const metadata = tool.metadata;
+      const name = typeof fn === "object" && fn !== null ? String((fn as { name?: unknown }).name ?? "") : "";
+      const capabilityId = typeof metadata === "object" && metadata !== null ? String((metadata as { capabilityId?: unknown }).capabilityId ?? "") : "";
+
+      assert.equal(name, capabilityId.replace(/[^A-Za-z0-9_-]/g, "_"), capabilityId);
+    }
+  });
+
+  it("projects web fetch only when the host explicitly opts into network tools", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const webFetch = coreToolManifests().find((manifest) => String(manifest.id) === "core.web.fetch");
+    assert.ok(webFetch);
+
+    const defaultProjection = await assembler.assemble(input({
+      prompt: "fetch docs",
+      toolPolicy: "safe-all",
+      availableTools: [webFetch]
+    }));
+    assert.equal(defaultProjection.toolPlan.visibleToolCount, 0);
+
+    const networkProjection = await assembler.assemble(input({
+      prompt: "fetch docs",
+      toolPolicy: "safe-all",
+      toolOptIns: ["network"],
+      availableTools: [webFetch]
+    }));
+    const toolPolicy = networkProjection.messages.find((message) => message.content.includes("Tool visibility policy: safe-all"));
+
+    assert.equal(networkProjection.toolPlan.visibleToolCount, 1);
+    assert.equal(toolPolicy?.content.includes("Tool opt-ins: network."), true);
+    assert.equal(toolPolicy?.content.includes("WebFetch -> core_web_fetch"), true);
+  });
+
+  it("allows governed test execution but not arbitrary shell execution in read-write tool policy", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const result = await assembler.assemble(input({
+      prompt: "edit and verify",
+      toolPolicy: "read-write",
+      availableTools: [
+        capability("core.file.read", "read"),
+        capability("core.file.edit", "write"),
+        capability("core.test.run", "process", ["process:test"]),
+        capability("core.shell.run", "process", ["process:run"])
+      ]
+    }));
+
+    const names = result.toolPlan.visibleTools.map((tool) => {
+      const fn = tool.function;
+      return typeof fn === "object" && fn !== null ? String((fn as { name?: unknown }).name ?? "") : "";
+    });
+    const toolPolicy = result.messages.find((message) => message.content.includes("Tool visibility policy: read-write"));
+    assert.equal(names.includes("core_test_run"), true);
+    assert.equal(names.includes("core_shell_run"), false);
+    assert.equal(toolPolicy?.content.includes("core_test_run"), true);
+    assert.equal(toolPolicy?.content.includes("core_shell_run"), false);
+  });
+
+  it("keeps external connector tools hidden from all projection unless host policy opts them in", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const result = await assembler.assemble(input({
+      prompt: "edit and inspect",
+      toolPolicy: "safe-all",
+      availableTools: [
+        capability("core.file.edit", "write"),
+        capability("core.test.run", "process", ["process:test"]),
+        capability("core.web.search", "network", ["network"]),
+        capability("mcp.browser.inspect", "read", ["browser"]),
+        capability("provider.image.generate", "network", ["media"])
+      ]
+    }));
+
+    const names = result.toolPlan.visibleTools.map((tool) => {
+      const fn = tool.function;
+      return typeof fn === "object" && fn !== null ? String((fn as { name?: unknown }).name ?? "") : "";
+    });
+    assert.equal(names.includes("core_file_edit"), true);
+    assert.equal(names.includes("core_test_run"), true);
+    assert.equal(names.includes("core_web_search"), false);
+    assert.equal(names.includes("mcp_browser_inspect"), false);
+    assert.equal(names.includes("provider_image_generate"), false);
   });
 
   it("surfaces profile workflow policy as stable orchestration guidance", async () => {
@@ -147,6 +379,10 @@ describe("prompt assembly", () => {
     assert.equal(profileMessage?.content.includes("Workflow priority: primary"), true);
     assert.equal(profileMessage?.content.includes("Orchestration mode: staged-capability-workflow"), true);
     assert.equal(profileMessage?.content.includes("Primary orchestration capabilities: core.env.prepare, core.swe.bench.run"), true);
+    assert.equal(profileMessage?.content.includes("Required capability families: package.manager, benchmark.run, file.read"), true);
+    assert.equal(profileMessage?.content.includes("Capability compiler status: ready"), true);
+    assert.equal(profileSection?.provenance?.capabilityCompilerStatus, "ready");
+    assert.deepEqual(profileSection?.provenance?.requiredFamilyIds, ["package.manager", "benchmark.run", "file.read"]);
     assert.deepEqual(providerIds.slice(0, 4), [
       "core.mode-context",
       "core.profile-workflow",
@@ -170,9 +406,49 @@ describe("prompt assembly", () => {
     const profileMessage = result.messages.find((message) => message.content.includes("Agent profile workflow:"));
 
     assert.equal(profileMessage?.content.includes("Primary orchestration capabilities: core.env.prepare, core.swe.bench.run, core.file.read"), true);
-    assert.equal(profileMessage?.content.includes("Model-visible workflow capabilities: core.file.read"), true);
-    assert.equal(profileMessage?.content.includes("Projection-limited workflow capabilities: core.swe.bench.run"), true);
-    assert.equal(profileMessage?.content.includes("Unregistered workflow capabilities: core.env.prepare"), true);
+    assert.equal(profileMessage?.content.includes("Resolved compiler capabilities: core.env.prepare, core.swe.bench.run, core.file.read"), true);
+    assert.equal(profileMessage?.content.includes("Model-visible workflow capabilities:"), false);
+    assert.equal(profileMessage?.content.includes("Projection-limited workflow capabilities:"), false);
+    assert.equal(profileMessage?.content.includes("Unregistered workflow capabilities:"), false);
+  });
+
+  it("does not report compiler-resolved workflow capabilities as unregistered when the active projection hides them", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const result = await assembler.assemble(input({
+      prompt: "Fix the fixture and verify it.",
+      phasePlan: agentPhasePlan(),
+      profilePolicy: {
+        ...profileWorkflowPolicy(),
+        role: "engineering-agent",
+        workflowGraphId: "workflow/engineering.coding.v1",
+        workflowCapabilityIds: ["core.file.read", "core.shell.run", "core.file.edit"],
+        requiredFamilyIds: ["file.read", "shell.run", "file.edit"],
+        capabilityAffordanceCompiler: {
+          schemaVersion: "1.0.0",
+          compilerId: "cli.profile.capability-affordance.compiler.v1",
+          status: "ready",
+          profileId: "engineering/coding.v1",
+          workflowGraphId: "workflow/engineering.coding.v1",
+          requiredFamilyIds: ["file.read", "shell.run", "file.edit"],
+          resolvedCapabilityIds: ["core.file.read", "core.shell.run", "core.file.edit"],
+          missingCapabilityIds: [],
+          projectionStatus: "ready",
+          source: "core-coding-tools.catalog",
+          redaction: { class: "internal" }
+        },
+        antiTailoring: false
+      },
+      toolPolicy: "read-only",
+      availableTools: [
+        capability("core.file.read", "read")
+      ]
+    }));
+    const profileMessage = result.messages.find((message) => message.content.includes("Agent profile workflow:"));
+
+    assert.equal(profileMessage?.content.includes("Resolved compiler capabilities: core.file.read, core.shell.run, core.file.edit"), true);
+    assert.equal(profileMessage?.content.includes("Model-visible workflow capabilities:"), false);
+    assert.equal(profileMessage?.content.includes("Projection-limited workflow capabilities:"), false);
+    assert.equal(profileMessage?.content.includes("Unregistered workflow capabilities:"), false);
   });
 
   it("surfaces profile workflow stages as stable orchestration guidance", async () => {
@@ -194,6 +470,72 @@ describe("prompt assembly", () => {
     assert.deepEqual(profileSection?.provenance?.workflowStageIds, ["understand", "verify"]);
   });
 
+  it("surfaces engineering repair criteria for boundary and negative regression coverage", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const result = await assembler.assemble(input({
+      prompt: "Fix the string normalization bug and verify it.",
+      contextPipelineManifest: pipelineManifest(),
+      phasePlan: agentPhasePlan(),
+      profilePolicy: {
+        ...profileWorkflowPolicy(),
+        profileId: "engineering/coding.v1",
+        role: "engineering-agent",
+        workflowGraphId: "workflow/engineering.coding.v1",
+        workflowCapabilityIds: ["core.file.read", "core.file.edit", "core.test.run", "core.git.diff"],
+        requiredFamilyIds: ["file.read", "file.edit", "build.test-lint-typecheck", "git.status-diff"],
+        workflowStages: [
+          {
+            id: "plan",
+            objective: "Plan a repository-grounded repair.",
+            capabilityIds: ["core.file.read"],
+            entryCriteria: ["repository evidence identified"],
+            exitCriteria: [
+              "regression test plan names the observed failure plus boundary and negative cases implied by the contract"
+            ]
+          },
+          {
+            id: "implement",
+            objective: "Apply the governed repair.",
+            capabilityIds: ["core.file.edit"],
+            entryCriteria: ["test plan recorded"],
+            exitCriteria: [
+              "focused regression coverage materialized before implementation for the observed failure and edge cases"
+            ]
+          },
+          {
+            id: "verify",
+            objective: "Verify the repair evidence.",
+            capabilityIds: ["core.test.run", "core.git.diff"],
+            entryCriteria: ["repair applied"],
+            exitCriteria: [
+              "verification evidence covers happy path, boundary, and negative regression cases before completion"
+            ]
+          }
+        ],
+        capabilityAffordanceCompiler: {
+          schemaVersion: "1.0.0",
+          compilerId: "cli.profile.capability-affordance.compiler.v1",
+          status: "ready",
+          profileId: "engineering/coding.v1",
+          workflowGraphId: "workflow/engineering.coding.v1",
+          requiredFamilyIds: ["file.read", "file.edit", "build.test-lint-typecheck", "git.status-diff"],
+          resolvedCapabilityIds: ["core.file.read", "core.file.edit", "core.test.run", "core.git.diff"],
+          missingCapabilityIds: [],
+          projectionStatus: "ready",
+          source: "core-coding-tools.catalog",
+          redaction: { class: "internal" }
+        },
+        antiTailoring: false
+      }
+    }));
+    const profileMessage = result.messages.find((message) => message.content.includes("Agent profile workflow:"));
+
+    assert.equal(profileMessage?.cacheHint?.policy, "stable");
+    assert.equal(profileMessage?.content.includes("observed failure plus boundary and negative cases implied by the contract"), true);
+    assert.equal(profileMessage?.content.includes("observed failure and edge cases"), true);
+    assert.equal(profileMessage?.content.includes("happy path, boundary, and negative regression cases"), true);
+  });
+
   it("surfaces dynamic profile workflow run state outside the stable provider prefix", async () => {
     const assembler = createDefaultPromptAssembler();
     const result = await assembler.assemble(input({
@@ -210,6 +552,106 @@ describe("prompt assembly", () => {
     assert.equal(stateMessage?.content.includes("stage:understand:succeeded refs=ref:workflow-understand-evidence attempts=1"), true);
     assert.equal(stateMessage?.content.includes("stage:verify:ready refs=none attempts=0"), true);
     assert.equal(result.trace.pipeline?.providerPrefixMessageCount, result.messages.filter((message) => message.cacheHint?.policy === "stable" && message.role === "system").length);
+  });
+
+  it("surfaces dynamic tool decision board guidance outside the stable provider prefix", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const result = await assembler.assemble(input({
+      prompt: "Read outside workspace again.",
+      contextPipelineManifest: pipelineManifest(),
+      toolDecisionBoard: toolDecisionBoard()
+    }));
+    const boardMessage = result.messages.find((message) => message.content.includes("Tool decision board summary:"));
+    const boardSection = result.sections.find((section) => section.providerId === "core.tool-decision-board" && section.included);
+
+    assert.equal(boardMessage?.cacheHint?.policy, "ephemeral");
+    assert.equal(boardMessage?.content.includes("Repeated rejected intent count: 2"), true);
+    assert.equal(boardMessage?.content.includes("preflight.rejected core.file.read -> corrected input or different projected tool"), true);
+    assert.equal(boardMessage?.content.includes("Projection evidence:"), true);
+    assert.equal(boardMessage?.content.includes("core.file.edit hidden stage-boundary"), true);
+    assert.equal(boardMessage?.content.includes("core.test.run unavailable workflow-capability-unregistered"), true);
+    assert.deepEqual(boardSection?.provenance?.recommendedNextActions, ["corrected input or different projected tool"]);
+    assert.equal(result.trace.pipeline?.providerPrefixMessageCount, result.messages.filter((message) => message.cacheHint?.policy === "stable" && message.role === "system").length);
+  });
+
+  it("keeps shared board cache contract stable while dynamic board records stay in the tail", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const first = await assembler.assemble(input({
+      prompt: "Read outside workspace again.",
+      contextPipelineManifest: pipelineManifest(),
+      toolDecisionBoard: toolDecisionBoard()
+    }));
+    const dynamicRecord: ToolDecisionRecord = {
+      ...toolDecisionBoard().records[0],
+      kind: "feedback",
+      status: "rejected",
+      recordId: "tool-decision:dynamic",
+      reasonCode: "stage.repair-requested",
+      recommendedNextAction: "return-to-change-stage",
+      timestamp: new Date(0).toISOString(),
+      metadata: {}
+    };
+    const secondBoard = {
+      ...toolDecisionBoard(),
+      boardId: "tool-decision-board:other",
+      iteration: 9,
+      repeatedRejectedIntentCount: 7,
+      recommendedNextActions: ["return-to-change-stage"],
+      records: [
+        ...toolDecisionBoard().records,
+        dynamicRecord
+      ]
+    };
+    const second = await assembler.assemble(input({
+      prompt: "Read outside workspace again.",
+      contextPipelineManifest: pipelineManifest(),
+      toolDecisionBoard: secondBoard
+    }));
+    const contract = first.messages.find((message) => message.content.includes("Shared board cache contract:"));
+    const dynamic = first.messages.find((message) => message.content.includes("Tool decision board summary:"));
+
+    assert.equal(contract?.cacheHint?.policy, "stable");
+    assert.equal(contract?.content.includes("stable-prefix partition"), true);
+    assert.equal(contract?.content.includes("dynamic-tail partition"), true);
+    assert.equal(contract?.content.includes("tool-decision-board:test"), false);
+    assert.equal(dynamic?.cacheHint?.policy, "ephemeral");
+    assert.equal(first.trace.pipeline?.providerPrefixFingerprint, second.trace.pipeline?.providerPrefixFingerprint);
+    assert.equal(first.trace.pipeline?.providerPrefixTokenEstimate, second.trace.pipeline?.providerPrefixTokenEstimate);
+  });
+
+  it("bounds provider dynamic history after the stable task prompt", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const prompt = "Resolve SWE-bench instance demo__repo-1.";
+    const history: ModelChatMessage[] = [{ role: "user", content: prompt }];
+    for (let index = 0; index < 10; index += 1) {
+      const id = `tool-${index}`;
+      history.push({
+        role: "assistant",
+        content: "",
+        toolCalls: [{ id, name: "core_file_read", input: { path: `file-${index}.py`, offset: index, limit: 40 } }]
+      });
+      history.push({
+        role: "tool",
+        toolCallId: id,
+        toolName: "core.file.read",
+        content: `tool result ${index}\n${"line\n".repeat(40)}`
+      });
+    }
+    history.push({ role: "user", content: "Use the latest evidence and mutate next.", cacheHint: { policy: "no-store" } });
+
+    const result = await assembler.assemble(input({
+      prompt,
+      history,
+      contextPipelineManifest: pipelineManifest(),
+      availableTools: [capability("core.file.read"), capability("core.file.edit", "write")]
+    }));
+    const stablePromptIndex = result.messages.findIndex((message) => message.role === "user" && message.content === prompt);
+    const dynamicTail = result.messages.slice(stablePromptIndex + 1);
+
+    assert.equal(stablePromptIndex >= 0, true);
+    assert.equal(dynamicTail.length <= 8, true);
+    assert.equal(dynamicTail.some((message) => message.content.includes("tool result 9")), true);
+    assert.equal(dynamicTail.some((message) => message.content.includes("tool result 0")), false);
   });
 
   it("surfaces a deterministic task intent contract in the stable provider prefix", async () => {
@@ -263,7 +705,9 @@ describe("prompt assembly", () => {
     assert.equal(stateMessage?.cacheHint?.policy, "ephemeral");
     assert.equal(stateMessage?.content.includes("stage:understand:succeeded"), true);
     assert.equal(stateMessage?.content.includes("stage:change:ready"), true);
-    assert.equal(stateMessage?.content.includes("primary=mutation-grade edit/patch/write or bounded blocker"), true);
+    assert.equal(stateMessage?.content.includes("progress=core.file.edit, core.patch.apply"), true);
+    assert.equal(stateMessage?.content.includes("required=core.file.edit|core.patch.apply"), true);
+    assert.equal(stateMessage?.content.includes("primary=mutation-grade edit/patch or bounded blocker"), true);
     assert.equal(stateMessage?.content.includes("read/search/list-only exploration is supporting evidence, not completion-grade progress"), true);
   });
 
@@ -319,8 +763,8 @@ describe("prompt assembly", () => {
 
     assert.equal(result.messages.at(-1)?.role, "user");
     assert.equal(result.messages.at(-1)?.cacheHint?.policy, "stable");
-    assert.equal(result.trace.pipeline?.providerPrefixMessageCount, result.messages.length);
-    assert.equal(result.trace.pipeline?.cacheHintSummary.stable, result.messages.length);
+    assert.equal(result.trace.pipeline?.providerPrefixMessageCount, result.messages.findIndex((message) => message.cacheHint?.policy !== "stable"));
+    assert.equal(result.trace.pipeline?.cacheHintSummary.stable, result.trace.pipeline?.providerPrefixMessageCount);
     assert.equal(
       (result.trace.pipeline?.providerPrefixTokenEstimate ?? 0) > stableTaskPrompt.split(/\s+/).length,
       true
@@ -347,6 +791,305 @@ describe("prompt assembly", () => {
     assert.equal(stableSystemAfterVolatile, undefined);
     assert.equal(result.messages.some((message) => message.role === "system" && message.content.includes("Self-repair operating rules:")), true);
     assert.equal(result.trace.pipeline?.providerPrefixMessageCount, result.messages.filter((message) => message.role === "system" && message.cacheHint?.policy === "stable").length);
+  });
+
+  it("bounds dynamic provider history while preserving recent tool-call pairs", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const prompt = "Resolve SWE task.";
+    const history: ModelChatMessage[] = [{ role: "user", content: prompt }];
+    for (let index = 1; index <= 8; index += 1) {
+      history.push(
+        { role: "assistant", content: "", toolCalls: [{ id: `tool-${index}`, name: "core_file_read", input: { path: `file-${index}.py` } }] },
+        { role: "tool", toolCallId: `tool-${index}`, toolName: "core.file.read", content: `tool result ${index}` },
+        { role: "assistant", content: `inspection note ${index}` }
+      );
+    }
+    const result = await assembler.assemble(input({
+      prompt,
+      history,
+      contextPipelineManifest: pipelineManifest(),
+      phasePlan: agentPhasePlan()
+    }));
+    const dynamicHistory = result.messages.slice(result.messages.findIndex((message) => message.content === prompt) + 1);
+
+    assert.equal(result.messages.find((message) => message.content === prompt)?.cacheHint?.policy, "stable");
+    assert.equal(dynamicHistory.length <= 6, true);
+    assert.equal(dynamicHistory.some((message) => message.content === "tool result 1"), false);
+    assert.equal(dynamicHistory.some((message) => message.content.includes("tool result 8")), true);
+    assert.equal(
+      dynamicHistory.filter((message) => message.role === "assistant").reduce((count, message) => count + (message.toolCalls?.length ?? 0), 0),
+      dynamicHistory.filter((message) => message.role === "tool").length
+    );
+  });
+
+  it("preserves the middle of the latest bounded source window for mutation decisions", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const prompt = "Resolve SWE task.";
+    const targetContext = "cright[-right.shape[0]:, -right.shape[1]:] = right";
+    const sourceWindow = [
+      "def _cstack(left, right):",
+      "    " + "leading source context ".repeat(30),
+      `    ${targetContext}`,
+      "    " + "trailing source context ".repeat(30)
+    ].join("\n");
+    const history: ModelChatMessage[] = [
+      { role: "user", content: prompt },
+      {
+        role: "assistant",
+        content: "",
+        toolCalls: [{
+          id: "source-window",
+          name: "core_file_read",
+          input: { path: "astropy/modeling/separable.py", offset: 100, limit: 200 }
+        }]
+      },
+      {
+        role: "tool",
+        toolCallId: "source-window",
+        toolName: "core.file.read",
+        content: sourceWindow
+      }
+    ];
+
+    const result = await assembler.assemble(input({
+      prompt,
+      history,
+      contextPipelineManifest: pipelineManifest(),
+      phasePlan: agentPhasePlan()
+    }));
+    const sourceMessage = result.messages.find((message) => message.toolCallId === "source-window");
+
+    assert.equal(sourceWindow.length > 360, true);
+    assert.equal(sourceMessage?.content.includes(targetContext), true);
+  });
+
+  it("retains the latest successful source inspection pair through mutation retries", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const prompt = "Resolve SWE task.";
+    const targetContext = "cright[-right.shape[0]:, -right.shape[1]:] = right";
+    const history: ModelChatMessage[] = [
+      { role: "user", content: prompt },
+      {
+        role: "assistant",
+        content: "",
+        toolCalls: [{
+          id: "source-window",
+          name: "core_file_read",
+          input: { path: "astropy/modeling/separable.py", offset: 100, limit: 200 }
+        }]
+      },
+      {
+        role: "tool",
+        toolCallId: "source-window",
+        toolName: "core.file.read",
+        content: targetContext
+      }
+    ];
+    for (let index = 1; index <= 3; index += 1) {
+      history.push(
+        {
+          role: "assistant",
+          content: "",
+          toolCalls: [{
+            id: `failed-edit-${index}`,
+            name: "core_file_edit",
+            input: { path: "astropy/modeling/separable.py", expected: `stale ${index}`, replacement: `replacement ${index}` }
+          }]
+        },
+        {
+          role: "tool",
+          toolCallId: `failed-edit-${index}`,
+          toolName: "core.file.edit",
+          content: "EDIT_PRECONDITION_FAILED: expected text was not found."
+        },
+        {
+          role: "user",
+          content: `Mutation retry ${index}: use the exact source window already collected.`
+        }
+      );
+    }
+
+    const result = await assembler.assemble(input({
+      prompt,
+      history,
+      contextPipelineManifest: pipelineManifest(),
+      phasePlan: agentPhasePlan()
+    }));
+    const dynamicHistory = result.messages.slice(result.messages.findIndex((message) => message.content === prompt) + 1);
+
+    assert.equal(dynamicHistory.length <= 8, true);
+    assert.equal(dynamicHistory.some((message) => message.toolCallId === "source-window"), true);
+    assert.equal(dynamicHistory.some((message) => message.content.includes(targetContext)), true);
+  });
+
+  it("keeps source evidence and the latest failed mutation while tightening provider history", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const prompt = "Resolve SWE task.";
+    const targetContext = "cright[-right.shape[0]:, -right.shape[1]:] = right";
+    const history: ModelChatMessage[] = [
+      { role: "user", content: prompt },
+      {
+        role: "assistant",
+        content: "",
+        toolCalls: [{
+          id: "source-window",
+          name: "core_file_read",
+          input: { path: "astropy/modeling/separable.py", offset: 100, limit: 120 }
+        }]
+      },
+      {
+        role: "tool",
+        toolCallId: "source-window",
+        toolName: "core.file.read",
+        content: targetContext
+      },
+      { role: "assistant", content: "The source evidence is sufficient for mutation." },
+      {
+        role: "assistant",
+        content: "",
+        toolCalls: [{
+          id: "failed-edit",
+          name: "core_file_edit",
+          input: { path: "astropy/modeling/separable.py", expected: "stale", replacement: "replacement" }
+        }]
+      },
+      {
+        role: "tool",
+        toolCallId: "failed-edit",
+        toolName: "core.file.edit",
+        content: "EDIT_PRECONDITION_FAILED: expected text was not found.\nnearestContext=cright[-right.shape[0]:, -right.shape[1]:] = right"
+      },
+      {
+        role: "user",
+        content: "Mutation retry: use the nearestContext from the failed edit and the retained source evidence."
+      }
+    ];
+
+    const result = await assembler.assemble(input({
+      prompt,
+      history,
+      contextPipelineManifest: pipelineManifest(),
+      phasePlan: agentPhasePlan()
+    }));
+    const dynamicHistory = result.messages.slice(result.messages.findIndex((message) => message.content === prompt) + 1);
+
+    assert.equal(dynamicHistory.length <= 6, true);
+    assert.equal(dynamicHistory.some((message) => message.toolCallId === "source-window"), true);
+    assert.equal(dynamicHistory.some((message) => message.toolCallId === "failed-edit"), true);
+    assert.equal(dynamicHistory.some((message) => message.content.includes("Mutation retry:")), true);
+    assert.equal(dynamicHistory.some((message) => message.content.includes(targetContext)), true);
+  });
+
+  it("bounds append-only provider history for provider prefix cache reuse", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const prompt = "Resolve SWE task.";
+    const history: ModelChatMessage[] = [{ role: "user", content: prompt }];
+    for (let index = 1; index <= 10; index += 1) {
+      history.push(
+        { role: "assistant", content: "", toolCalls: [{ id: `tool-${index}`, name: "core_file_read", input: { path: `file-${index}.py` } }] },
+        { role: "tool", toolCallId: `tool-${index}`, toolName: "core.file.read", content: `tool result ${index}` },
+        { role: "assistant", content: `analysis ${index}` }
+      );
+    }
+    const result = await assembler.assemble(input({
+      prompt,
+      history,
+      contextPipelineManifest: pipelineManifest(),
+      phasePlan: agentPhasePlan()
+    }));
+    const dynamicHistory = result.messages.slice(result.messages.findIndex((message) => message.content === prompt) + 1);
+
+    assert.equal(dynamicHistory.length <= 8, true);
+    assert.equal(dynamicHistory.some((message) => message.content === "tool result 1"), false);
+    assert.equal(dynamicHistory.some((message) => message.content.includes("tool result 10")), true);
+    assert.equal(dynamicHistory.at(-1)?.content, "analysis 10");
+  });
+
+  it("compacts older tool results in provider history while preserving the latest tool result", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const prompt = "Resolve SWE task.";
+    const longOutput = Array.from({ length: 160 }, (_, index) => `traceback line ${index}: repeated failure context`).join("\n");
+    const history: ModelChatMessage[] = [{ role: "user", content: prompt }];
+    for (let index = 1; index <= 5; index += 1) {
+      history.push(
+        { role: "assistant", content: "", toolCalls: [{ id: `tool-${index}`, name: "core_test_run", input: { command: "pytest", args: [`test_${index}.py`] } }] },
+        { role: "tool", toolCallId: `tool-${index}`, toolName: "core.test.run", content: `tool result ${index}\n${longOutput}` },
+        { role: "assistant", content: `analysis ${index}` }
+      );
+    }
+    const result = await assembler.assemble(input({
+      prompt,
+      history,
+      contextPipelineManifest: pipelineManifest(),
+      phasePlan: agentPhasePlan()
+    }));
+    const dynamicHistory = result.messages.slice(result.messages.findIndex((message) => message.content === prompt) + 1);
+    const toolMessages = dynamicHistory.filter((message) => message.role === "tool");
+    const dynamicChars = dynamicHistory.reduce((count, message) => count + message.content.length, 0);
+
+    assert.equal(toolMessages.some((message) => message.content.includes("tool result 5")), true);
+    assert.equal(toolMessages.some((message) => message.content.includes("traceback line 159")), true);
+    assert.equal(toolMessages.some((message) => message.content.includes("tool result 4") && message.content.includes("traceback line 159")), false);
+    assert.equal(toolMessages.some((message) => message.content.includes("compacted older tool result")), true);
+    assert.equal(dynamicChars < 2_200, true);
+  });
+
+  it("drops orphaned assistant tool-call messages when bounding provider history", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const prompt = "Resolve SWE task.";
+    const history: ModelChatMessage[] = [
+      { role: "user", content: prompt },
+      { role: "assistant", content: "", toolCalls: [{ id: "tool-old", name: "core_file_read", input: { path: "old.py" } }] },
+      { role: "tool", toolCallId: "tool-old", toolName: "core.file.read", content: "old tool result" }
+    ];
+    for (let index = 1; index <= 11; index += 1) history.push({ role: "assistant", content: `newer note ${index}` });
+    const result = await assembler.assemble(input({
+      prompt,
+      history,
+      contextPipelineManifest: pipelineManifest(),
+      phasePlan: agentPhasePlan()
+    }));
+    const dynamicHistory = result.messages.slice(result.messages.findIndex((message) => message.content === prompt) + 1);
+    const toolIds = new Set(dynamicHistory.filter((message) => message.role === "tool").map((message) => message.toolCallId));
+
+    for (const message of dynamicHistory) {
+      for (const toolCall of message.toolCalls ?? []) {
+        assert.equal(toolIds.has(toolCall.id), true);
+      }
+    }
+  });
+
+  it("preserves recent runtime correction messages when bounding provider history", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const prompt = "Resolve SWE task.";
+    const history: ModelChatMessage[] = [{ role: "user", content: prompt }];
+    for (let index = 1; index <= 22; index += 1) {
+      history.push(
+        { role: "assistant", content: "", toolCalls: [{ id: `tool-${index}`, name: "core_file_read", input: { path: `file-${index}.py` } }] },
+        { role: "tool", toolCallId: `tool-${index}`, toolName: "core.file.read", content: `tool result ${index}` },
+        { role: "assistant", content: `inspection note ${index}` }
+      );
+    }
+    history.push(
+      { role: "assistant", content: "", toolCalls: [{ id: "bad-edit", name: "core_file_edit", input: { path: "target.py", expected: "same", replacement: "same" } }] },
+      { role: "tool", toolCallId: "bad-edit", toolName: "core.file.edit", content: "WORKFLOW_INVALID_MUTATION_INTENT: expected and replacement are identical." },
+      { role: "user", content: "WORKFLOW_INVALID_MUTATION_INTENT_REJECTED.\nRejected mutation input:\n{\n  \"expected\": \"same\",\n  \"replacement\": \"same\"\n}\nNext action: use a real diff." },
+      { role: "assistant", content: "", toolCalls: [{ id: "refresh", name: "core_search_text", input: { pattern: "target", glob: "target.py" } }] },
+      { role: "tool", toolCallId: "refresh", toolName: "core.search.text", content: "target.py:10: target evidence" }
+    );
+
+    const result = await assembler.assemble(input({
+      prompt,
+      history,
+      contextPipelineManifest: pipelineManifest(),
+      phasePlan: agentPhasePlan()
+    }));
+    const dynamicHistory = result.messages.slice(result.messages.findIndex((message) => message.content === prompt) + 1);
+
+    assert.equal(dynamicHistory.length <= 64, true);
+    assert.equal(dynamicHistory.some((message) => message.content.includes("WORKFLOW_INVALID_MUTATION_INTENT_REJECTED")), true);
+    assert.equal(dynamicHistory.some((message) => message.content.includes("\"expected\": \"same\"")), true);
+    assert.equal(dynamicHistory.some((message) => message.toolCallId === "refresh"), true);
   });
 
   it("keeps provider stable-prefix fingerprints stable across session and turn ids", async () => {
@@ -395,6 +1138,136 @@ describe("prompt assembly", () => {
     assert.equal(first.messages.some((message) => message.content.includes("task-brief:first")), false);
   });
 
+  it("projects only the authoritative scheduling next action instead of board noise", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const noisyBoard = noisyToolDecisionBoard();
+    const result = await assembler.assemble(input({
+      prompt: "fix issue",
+      schedulingNextAction: schedulingNextAction({
+        actionClass: "mutation",
+        stageId: "change",
+        requiredNextAction: "core.patch.apply",
+        allowedCapabilityIds: ["core.patch.apply"],
+        acceptedEvidenceRefs: ["evidence:focused-read"]
+      }),
+      toolDecisionBoard: noisyBoard,
+      availableTools: [capability("core.patch.apply", "write"), capability("core.file.read")]
+    }));
+    const visible = result.messages.map((message) => message.content).join("\n");
+    const section = result.sections.find((candidate) => candidate.providerId === "core.scheduling-next-action");
+
+    assert.equal(section?.included, true);
+    assert.equal(visible.includes("Scheduling next action:"), true);
+    assert.equal(visible.includes("Action class: mutation"), true);
+    assert.equal(visible.includes("Required next action: core.patch.apply"), true);
+    assert.equal(visible.includes("Allowed capabilities: core.patch.apply"), true);
+    assert.equal(visible.includes("Provider tool schemas may include additional workflow tools for cache stability; only the allowed capabilities above are executable for this next action."), true);
+    assert.equal(visible.includes("Calling any other tool will be rejected before execution."), true);
+    assert.equal(visible.includes("Evidence refs: evidence:focused-read"), true);
+    assert.equal(visible.includes("cache hit rate collapsed to 12%"), false);
+    assert.equal(visible.includes("technical director residual risk should not be visible"), false);
+    assert.equal(visible.includes("stale rejected action should not be visible"), false);
+    assert.equal(visible.includes("RAW_SECRET_TOOL_OUTPUT_SHOULD_NOT_LEAK"), false);
+    assert.equal(section?.provenance?.nextActionFingerprint !== undefined, true);
+  });
+
+  it("tells mutation-only stages not to continue source inspection", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const result = await assembler.assemble(input({
+      prompt: "apply the accepted source fix",
+      schedulingNextAction: schedulingNextAction({
+        actionClass: "mutation",
+        stageId: "change",
+        requiredNextAction: "core.file.edit|core.patch.apply",
+        allowedCapabilityIds: ["core.file.read", "core.file.edit", "core.patch.apply", "core.shell.run"],
+        acceptedEvidenceRefs: ["evidence:focused-read"]
+      }),
+      availableTools: [
+        capability("core.file.edit", "write"),
+        capability("core.patch.apply", "write"),
+        capability("core.file.read"),
+        capability("core.shell.run", "process")
+      ]
+    }));
+    const visible = result.messages.map((message) => message.content).join("\n");
+
+    assert.equal(visible.includes("Mutation-only stage: do not call read, search, list, glob, shell, or test tools."), true);
+    assert.equal(visible.includes("Use core.file.edit or core.patch.apply now, based on the accepted evidence refs."), true);
+  });
+
+  it("tells verification stages to run the required test tool instead of inspecting or diffing", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const result = await assembler.assemble(input({
+      prompt: "verify the accepted source fix",
+      schedulingNextAction: schedulingNextAction({
+        actionClass: "standard-verification",
+        stageId: "verify",
+        requiredNextAction: "core.test.run",
+        allowedCapabilityIds: ["core.test.run", "core.shell.run", "core.git.diff"],
+        acceptedEvidenceRefs: ["evidence:patch"]
+      }),
+      availableTools: [
+        capability("core.test.run", "process"),
+        capability("core.shell.run", "process"),
+        capability("core.git.diff"),
+        capability("core.file.read")
+      ]
+    }));
+    const visible = result.messages.map((message) => message.content).join("\n");
+
+    assert.equal(visible.includes("Required next action overrides broader allowed capability lists."), true);
+    assert.equal(visible.includes("Verification-only stage: call core.test.run with a standard repository test command now."), true);
+    assert.equal(visible.includes("Do not call read, search, list, glob, shell, git diff, or mutation tools for this verification action."), true);
+  });
+
+  it("tells focused-evidence stages to prefer bounded focused reads", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const result = await assembler.assemble(input({
+      prompt: "inspect the target file",
+      schedulingNextAction: schedulingNextAction({
+        actionClass: "focused-evidence",
+        stageId: "understand",
+        requiredNextAction: "core.file.read",
+        allowedCapabilityIds: ["core.file.read"],
+        acceptedEvidenceRefs: []
+      }),
+      availableTools: [capability("core.file.read"), capability("core.search.text")]
+    }));
+    const visible = result.messages.map((message) => message.content).join("\n");
+
+    assert.equal(visible.includes("Preferred evidence shape: one bounded focused source read"), true);
+    assert.equal(visible.includes("Use offset/limit when reading source files"), true);
+  });
+
+  it("keeps generic mutation tool contracts in the stable prefix", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const result = await assembler.assemble(input({
+      prompt: "apply the smallest source change",
+      schedulingNextAction: schedulingNextAction({
+        actionClass: "mutation",
+        stageId: "change",
+        requiredNextAction: "core.file.edit|core.patch.apply",
+        allowedCapabilityIds: ["core.file.edit", "core.patch.apply"],
+        acceptedEvidenceRefs: ["evidence:focused-read"]
+      }),
+      profilePolicy: {
+        ...profileWorkflowPolicyWithProduceRunState(),
+        workflowCapabilityIds: ["core.file.read", "core.file.edit", "core.patch.apply"]
+      },
+      availableTools: [capability("core.file.edit", "write"), capability("core.patch.apply", "write")]
+    }));
+    const visible = result.messages.map((message) => message.content).join("\n");
+    const contract = result.messages.find((message) => message.content.includes("Mutation tool contract:"));
+    const scheduling = result.messages.find((message) => message.content.includes("Scheduling next action:"));
+
+    assert.equal(contract?.cacheHint?.policy, "stable");
+    assert.equal(visible.includes("Mutation shape: make one real source change using current accepted evidence"), true);
+    assert.equal(visible.includes("For core.file.edit, copy exact current expected text from accepted evidence"), true);
+    assert.equal(visible.includes("For core.patch.apply, provide a complete unified diff with file headers and at least one hunk"), true);
+    assert.equal(visible.includes("Do not send empty patches, no-op edits, placeholder hunks, or stale context"), true);
+    assert.equal(scheduling?.content.includes("Mutation shape:"), false);
+  });
+
   it("keeps stable project instructions from truncating the provider prefix", async () => {
     const assembler = createDefaultPromptAssembler();
     const result = await assembler.assemble(input({
@@ -411,7 +1284,7 @@ describe("prompt assembly", () => {
     assert.equal(projectInstructions?.cacheHint?.policy, "stable");
     assert.equal(modeContext?.cacheHint?.policy, "stable");
     assert.equal(phasePlan?.cacheHint?.policy, "stable");
-    assert.equal(result.trace.pipeline?.providerPrefixMessageCount, result.messages.filter((message) => message.cacheHint?.policy === "stable").length);
+    assert.equal(result.trace.pipeline?.providerPrefixMessageCount, result.messages.findIndex((message) => message.cacheHint?.policy !== "stable"));
     assert.equal(result.trace.pipeline?.cacheHintSummary.stable, result.trace.pipeline?.providerPrefixMessageCount);
   });
 
@@ -461,8 +1334,67 @@ describe("prompt assembly", () => {
     const contract = result.messages.find((message) => message.role === "system" && message.content.includes("File mutation output contract:"));
     assert.ok(contract);
     assert.equal(contract.content.includes("text-only answer is incomplete"), true);
+    assert.equal(contract.content.includes("Preserve any requested path literals exactly, including case."), true);
+    assert.equal(contract.content.includes("Requested path literals: README.md, openspec/spec.md."), true);
     assert.equal(contract.content.includes("core_file_write"), true);
     assert.equal(result.messages.at(-1)?.content, "Update README.md and openspec/spec.md with bilingual guidance");
+  });
+
+  it("adds the file mutation output contract for chat-mode staged engineering writes", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const result = await assembler.assemble(input({
+      mode: "chat",
+      prompt: "生成 docs/USAGE.md 和 examples/config.json",
+      availableTools: [capability("core.file.read")],
+      profilePolicy: {
+        ...profileWorkflowPolicy(),
+        profileId: "engineering/coding.v1",
+        role: "engineering-agent",
+        workflowGraphId: "workflow/engineering.coding.v1",
+        workflowCapabilityIds: ["core.file.read", "core.file.write", "core.file.edit", "core.patch.apply"],
+        requiredFamilyIds: ["file.read", "file.write", "file.edit", "patch.apply"]
+      }
+    }));
+
+    const contract = result.messages.find((message) => message.role === "system" && message.content.includes("File mutation output contract:"));
+    assert.ok(contract);
+    assert.equal(contract.content.includes("Preserve any requested path literals exactly, including case."), true);
+    assert.equal(contract.content.includes("Requested path literals: docs/USAGE.md, examples/config.json."), true);
+  });
+
+  it("does not add file mutation contracts for read-only parent-path boundary prompts", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const result = await assembler.assemble(input({
+      prompt: "检查当前任务目录，说明为什么不应该修改 ../outside-scope.txt，并给出安全替代方案，不要修改任何文件。",
+      availableTools: [
+        capability("core.file.read"),
+        capability("core.file.list")
+      ]
+    }));
+
+    const contract = result.messages.find((message) => message.role === "system" && message.content.includes("File mutation output contract:"));
+    assert.equal(contract, undefined);
+  });
+
+  it("makes file mutation contracts stage-aware after evidence collection", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const result = await assembler.assemble(input({
+      mode: "chat",
+      prompt: "生成 docs/USAGE.md 和 examples/config.json",
+      availableTools: [
+        capability("core.file.read"),
+        capability("core.file.write", "write"),
+        capability("core.file.edit", "write"),
+        capability("core.patch.apply", "write")
+      ],
+      profilePolicy: profileWorkflowPolicyWithProduceRunState()
+    }));
+
+    const contract = result.messages.find((message) => message.role === "system" && message.content.includes("File mutation output contract:"));
+    assert.ok(contract);
+    assert.equal(contract.content.includes("Current ready stage requires mutation progress: core.file.edit or core.patch.apply."), true);
+    assert.equal(contract.content.includes("Do not continue with read/search/list-only inspection unless a mutation tool is blocked."), true);
+    assert.equal(contract.content.includes("Inspect the relevant files first"), false);
   });
 
   it("can assemble with tool projection none without exposing model tools", async () => {
@@ -481,6 +1413,112 @@ describe("prompt assembly", () => {
     assert.equal(result.toolPlan.visibleToolCount, 0);
     assert.equal(result.toolPlan.excludedToolCount, 3);
     assert.deepEqual(result.toolPlan.visibleTools, []);
+  });
+
+  it("projects cross-platform semantic tool aliases instead of platform command habits", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const result = await assembler.assemble(input({
+      prompt: "search and edit README",
+      toolPolicy: "read-write",
+      availableTools: [
+        capability("core.file.read", "read", [], ["Read"]),
+        capability("core.search.text", "read", [], ["Grep"]),
+        capability("core.workspace.glob", "read", [], ["Glob"]),
+        capability("core.file.edit", "write", [], ["Edit"]),
+        capability("core.file.write", "write", [], ["Write"]),
+        capability("core.file.copy", "write", [], ["Copy"]),
+        capability("core.file.move", "write", [], ["Move"]),
+        capability("core.file.delete", "write", [], ["Delete"]),
+        capability("core.directory.create", "write", [], ["Mkdir"]),
+        capability("core.file.touch", "write", [], ["Touch"]),
+        capability("core.file.stat", "read", [], ["Stat"]),
+        capability("core.json.read", "read", [], ["JsonRead"]),
+        capability("core.json.patch", "write", [], ["JsonPatch"]),
+        capability("core.checksum.hash", "read", [], ["Hash"]),
+        capability("core.path.resolve", "read", [], ["PathResolve"]),
+        capability("core.env.inspect", "read", [], ["Env"]),
+        capability("core.command.lookup", "read", [], ["Which"]),
+        capability("core.archive.create", "write", [], ["ArchiveCreate"]),
+        capability("core.archive.extract", "write", [], ["ArchiveExtract"]),
+        capability("core.asset.view-local", "read", [], ["ViewImage"]),
+        capability("core.code.diagnostics", "read", [], ["Diagnostics"]),
+        capability("core.notebook.read", "read", [], ["NotebookRead"]),
+        capability("core.notebook.edit", "write", [], ["NotebookEdit"]),
+        capability("core.patch.apply", "write", [], ["ApplyPatch"]),
+        capability("core.revert.undo", "write", [], ["Revert"]),
+        capability("core.test.run", "process", ["process:test"], ["Test"]),
+        capability("core.task.create", "none", [], ["TaskCreate"]),
+        capability("core.task.update", "none", [], ["TaskUpdate"]),
+        capability("core.skill.activate", "none", [], ["Skill"]),
+        capability("core.shell.run", "process", ["process:run"], ["Bash", "PowerShell"])
+      ]
+    }));
+
+    const policy = result.messages.find((message) => message.role === "system" && message.content.includes("Tool visibility policy:"))?.content ?? "";
+    assert.equal(policy.includes("Read -> core_file_read"), true);
+    assert.equal(policy.includes("Grep -> core_search_text"), true);
+    assert.equal(policy.includes("Glob -> core_workspace_glob"), true);
+    assert.equal(policy.includes("Edit -> core_file_edit"), true);
+    assert.equal(policy.includes("Write -> core_file_write"), true);
+    assert.equal(policy.includes("Copy -> core_file_copy"), true);
+    assert.equal(policy.includes("Move -> core_file_move"), true);
+    assert.equal(policy.includes("Delete -> core_file_delete"), true);
+    assert.equal(policy.includes("Mkdir -> core_directory_create"), true);
+    assert.equal(policy.includes("Touch -> core_file_touch"), true);
+    assert.equal(policy.includes("Stat -> core_file_stat"), true);
+    assert.equal(policy.includes("JsonRead -> core_json_read"), true);
+    assert.equal(policy.includes("JsonPatch -> core_json_patch"), true);
+    assert.equal(policy.includes("Hash -> core_checksum_hash"), true);
+    assert.equal(policy.includes("PathResolve -> core_path_resolve"), true);
+    assert.equal(policy.includes("Env -> core_env_inspect"), true);
+    assert.equal(policy.includes("Which -> core_command_lookup"), true);
+    assert.equal(policy.includes("ArchiveCreate -> core_archive_create"), true);
+    assert.equal(policy.includes("ArchiveExtract -> core_archive_extract"), true);
+    assert.equal(policy.includes("ViewImage -> core_asset_view-local"), true);
+    assert.equal(policy.includes("Diagnostics -> core_code_diagnostics"), true);
+    assert.equal(policy.includes("NotebookRead -> core_notebook_read"), true);
+    assert.equal(policy.includes("NotebookEdit -> core_notebook_edit"), true);
+    assert.equal(policy.includes("ApplyPatch -> core_patch_apply"), true);
+    assert.equal(policy.includes("Revert -> core_revert_undo"), true);
+    assert.equal(policy.includes("Test -> core_test_run"), true);
+    assert.equal(policy.includes("TaskCreate -> core_task_create"), true);
+    assert.equal(policy.includes("TaskUpdate -> core_task_update"), true);
+    assert.equal(policy.includes("Skill -> core_skill_activate"), true);
+    assert.equal(policy.includes("Bash -> core_shell_run"), false);
+    assert.deepEqual(result.sections.find((section) => section.providerId === "core.tool-policy")?.provenance?.semanticAliases, [
+      "Read",
+      "Grep",
+      "Glob",
+      "Edit",
+      "Write",
+      "Copy",
+      "Move",
+      "Delete",
+      "Mkdir",
+      "Touch",
+      "Stat",
+      "JsonRead",
+      "JsonPatch",
+      "Hash",
+      "PathResolve",
+      "Env",
+      "Which",
+      "ArchiveCreate",
+      "ArchiveExtract",
+      "ViewImage",
+      "Diagnostics",
+      "NotebookRead",
+      "NotebookEdit",
+      "ApplyPatch",
+      "Revert",
+      "Test",
+      "TaskCreate",
+      "TaskUpdate",
+      "Skill"
+    ]);
+    assert.equal(policy.includes("Use semantic workspace tools before platform commands"), true);
+    assert.equal(policy.includes("Use ApplyPatch for unified diffs, Revert for checkpoint rollback, and Test for governed verification before falling back to shell commands"), true);
+    assert.equal(policy.includes("Use Edit, JsonPatch, ArchiveCreate, ArchiveExtract, Write, Copy, Move, Delete, Mkdir, or Touch for mutations instead of sed/jq/tar/zip/unzip/cp/mv/rm/mkdir/touch/echo redirection"), true);
   });
 
   it("weaves self-repair sections without mutating the exact user prompt", async () => {
@@ -660,10 +1698,14 @@ function input(options: {
   readonly reasoningEffortMapping?: AgentReasoningEffortMapping;
   readonly availableTools?: readonly CapabilityManifest[];
   readonly toolPolicy?: PromptAssemblyInput["toolPolicy"];
+  readonly toolOptIns?: PromptAssemblyInput["toolOptIns"];
   readonly projectRules?: readonly AgentLoopProjectRuleEvidence[];
   readonly contextPipelineManifest?: ContextPipelineManifest;
   readonly taskDecision?: TaskDecisionRequest;
+  readonly schedulingNextAction?: PromptSchedulingNextAction;
   readonly profilePolicy?: PromptAssemblyInput["profilePolicy"];
+  readonly toolDecisionBoard?: PromptAssemblyInput["toolDecisionBoard"];
+  readonly history?: readonly ModelChatMessage[];
 }): PromptAssemblyInput {
   const sessionId = asId<"session">(options.sessionId ?? "session-prompt-assembly");
   const turnId = asId<"turn">(options.turnId ?? "turn-prompt-assembly");
@@ -688,11 +1730,13 @@ function input(options: {
       spanId: asId<"span">("span-prompt-assembly"),
       correlationId: asId<"correlation">("corr-prompt-assembly")
     },
-    history: [{ role: "user", content: options.prompt }],
+    history: options.history ?? [{ role: "user", content: options.prompt }],
     ...(options.projectRules ? { projectRules: options.projectRules } : {}),
     ...(options.contextPipelineManifest ? { contextPipelineManifest: options.contextPipelineManifest } : {}),
     ...(options.taskDecision ? { taskDecision: options.taskDecision } : {}),
+    ...(options.schedulingNextAction ? { schedulingNextAction: options.schedulingNextAction } : {}),
     ...(options.profilePolicy ? { profilePolicy: options.profilePolicy } : {}),
+    ...(options.toolDecisionBoard ? { toolDecisionBoard: options.toolDecisionBoard } : {}),
     ...(options.evidenceFirst ? { evidenceFirst: options.evidenceFirst } : {}),
     ...(options.selfRepair ? { selfRepair: options.selfRepair } : {}),
     ...(options.phasePlan ? {
@@ -726,9 +1770,171 @@ function input(options: {
       }
     } : {}),
     availableTools: options.availableTools ?? [],
-    toolPolicy: options.toolPolicy ?? "all",
+    toolPolicy: options.toolPolicy ?? "safe-all",
+    ...(options.toolOptIns ? { toolOptIns: options.toolOptIns } : {}),
     budget: { hardLimitTokens: options.hardLimitTokens ?? 1024, reservedOutputTokens: 0 },
     compatibility: { schemaVersion: "1.0.0" }
+  };
+}
+
+function schedulingNextAction(options: {
+  readonly actionClass: PromptSchedulingNextAction["actionClass"];
+  readonly stageId?: string;
+  readonly requiredNextAction: string;
+  readonly allowedCapabilityIds: readonly string[];
+  readonly acceptedEvidenceRefs: readonly string[];
+  readonly correctionText?: string;
+}): PromptSchedulingNextAction {
+  return {
+    schemaVersion: "1.0.0",
+    ...options,
+    redaction: { class: "internal", fields: ["acceptedEvidenceRefs", "correctionText"] }
+  };
+}
+
+function toolDecisionBoard(): NonNullable<PromptAssemblyInput["toolDecisionBoard"]> {
+  return {
+    boardId: "tool-decision-board:test",
+    sessionId: asId<"session">("session-prompt-assembly"),
+    turnId: asId<"turn">("turn-prompt-assembly"),
+    iteration: 2,
+    visibleToolIds: ["core.file.read"],
+    projectionSummaries: [{
+      capabilityId: "core.file.read",
+      status: "visible",
+      visible: true,
+      reason: "required stage capability is model-visible",
+      reasonCode: "stage-required-visible",
+      policySource: "software-engineer-profile",
+      profileId: "engineering/coding.v1",
+      stageId: "change",
+      requiredByStage: true,
+      issueClass: "none",
+      aliases: ["Read"],
+      sideEffect: "read"
+    }, {
+      capabilityId: "core.file.edit",
+      status: "hidden",
+      visible: false,
+      reason: "capability is outside the current stage or projection boundary",
+      reasonCode: "stage-boundary",
+      policySource: "software-engineer-profile",
+      profileId: "engineering/coding.v1",
+      stageId: "change",
+      requiredByStage: false,
+      issueClass: "deliberate-boundary",
+      aliases: ["Edit"],
+      sideEffect: "write"
+    }, {
+      capabilityId: "core.test.run",
+      status: "unavailable",
+      visible: false,
+      reason: "workflow capability is not registered or has no executable provider",
+      reasonCode: "workflow-capability-unregistered",
+      policySource: "software-engineer-profile",
+      profileId: "engineering/coding.v1",
+      stageId: "change",
+      requiredByStage: true,
+      issueClass: "cli-capability-gap",
+      unavailableBecause: "capability-not-registered",
+      aliases: [],
+      sideEffect: "none"
+    }],
+    hiddenToolSummaries: [],
+    records: [{
+      recordId: "tool-decision:1",
+      kind: "feedback",
+      status: "rejected",
+      toolCallId: "call-1",
+      toolName: "core.file.read",
+      capabilityId: "core.file.read",
+      normalizedInputHash: "hash-input",
+      reasonCode: "preflight.rejected",
+      correctiveAction: "Correct the tool input or choose a different projected tool.",
+      recommendedNextAction: "corrected input or different projected tool",
+      iteration: 1,
+      timestamp: new Date(0).toISOString(),
+      metadata: { repeatedRejectedIntentCount: 2 }
+    }],
+    previousRejectedIntents: [{
+      recordId: "tool-decision:1",
+      kind: "feedback",
+      status: "rejected",
+      toolCallId: "call-1",
+      toolName: "core.file.read",
+      capabilityId: "core.file.read",
+      normalizedInputHash: "hash-input",
+      reasonCode: "preflight.rejected",
+      correctiveAction: "Correct the tool input or choose a different projected tool.",
+      recommendedNextAction: "corrected input or different projected tool",
+      iteration: 1,
+      timestamp: new Date(0).toISOString(),
+      metadata: { repeatedRejectedIntentCount: 2 }
+    }],
+    repeatedRejectedIntentCount: 2,
+    decisionLoopFailureCandidate: false,
+    recommendedNextActions: ["corrected input or different projected tool"],
+    sharedSchedulingEvidence: {
+      lineageIds: [],
+      failureAnalysisRecords: [],
+      acceptedEvidenceRefs: [],
+      redaction: { class: "internal" }
+    },
+    counters: { visibleToolCount: 1, hiddenToolCount: 0, recordCount: 1, rejectedIntentKeyCount: 1 },
+    redaction: { class: "internal", fields: ["records.metadata"] }
+  };
+}
+
+function noisyToolDecisionBoard(): NonNullable<PromptAssemblyInput["toolDecisionBoard"]> {
+  const board = toolDecisionBoard();
+  const noisyRecord: ToolDecisionRecord = {
+    recordId: "tool-decision:noisy",
+    kind: "feedback",
+    status: "rejected",
+    toolCallId: "call-noisy",
+    toolName: "core.shell.run",
+    capabilityId: "core.shell.run",
+    normalizedInputHash: "hash-noisy",
+    reasonCode: "cache hit rate collapsed to 12%",
+    correctiveAction: "technical director residual risk should not be visible",
+    recommendedNextAction: "stale rejected action should not be visible",
+    iteration: 1,
+    timestamp: new Date(0).toISOString(),
+    metadata: {
+      rawToolOutput: "RAW_SECRET_TOOL_OUTPUT_SHOULD_NOT_LEAK"
+    }
+  };
+  return {
+    ...board,
+    records: [...board.records, noisyRecord],
+    previousRejectedIntents: [noisyRecord],
+    recommendedNextActions: [noisyRecord.recommendedNextAction ?? ""],
+    sharedSchedulingEvidence: {
+      lineageIds: [],
+      failureAnalysisRecords: [{
+        recordId: "failure-analysis:noisy",
+        attemptId: "attempt-noisy",
+        terminalKind: "failed",
+        failureClass: "cache hit rate collapsed to 12%",
+        attribution: "cache",
+        proofStatus: "unproven",
+        evidenceQueries: ["technical director residual risk should not be visible"],
+        acceptedEvidenceRefs: ["RAW_SECRET_TOOL_OUTPUT_SHOULD_NOT_LEAK"],
+        nextAllowedAction: "search-evidence",
+        rerunAllowed: false,
+        modelOwnedAttributionAllowed: false,
+        residualRisk: "technical director residual risk should not be visible",
+        timestamp: new Date(0).toISOString(),
+        redaction: { class: "internal", fields: ["acceptedEvidenceRefs"] }
+      }],
+      acceptedEvidenceRefs: ["RAW_SECRET_TOOL_OUTPUT_SHOULD_NOT_LEAK"],
+      nextAllowedAction: "stale rejected action should not be visible",
+      redaction: { class: "internal" }
+    },
+    counters: {
+      ...board.counters,
+      cacheDiagnostic: "cache hit rate collapsed to 12%"
+    }
   };
 }
 
@@ -780,6 +1986,20 @@ function profileWorkflowPolicy(): NonNullable<PromptAssemblyInput["profilePolicy
       "core.swe.bench.run",
       "core.file.read"
     ],
+    requiredFamilyIds: ["package.manager", "benchmark.run", "file.read"],
+    capabilityAffordanceCompiler: {
+      schemaVersion: "1.0.0",
+      compilerId: "cli.profile.capability-affordance.compiler.v1",
+      status: "ready",
+      profileId: "evaluation/swe-bench-lite.v1",
+      workflowGraphId: "workflow/evaluation.swe-bench-lite.v1",
+      requiredFamilyIds: ["package.manager", "benchmark.run", "file.read"],
+      resolvedCapabilityIds: ["core.env.prepare", "core.swe.bench.run", "core.file.read"],
+      missingCapabilityIds: [],
+      projectionStatus: "ready",
+      source: "core-coding-tools.catalog",
+      redaction: { class: "internal" }
+    },
     workflowPriority: "primary",
     orchestrationMode: "staged-capability-workflow",
     toolProjection: "all",
@@ -1085,7 +2305,7 @@ function projectRule(path: string, content: string): AgentLoopProjectRuleEvidenc
   };
 }
 
-function capability(id: string, sideEffect: CapabilityManifest["sideEffect"] = "read"): CapabilityManifest {
+function capability(id: string, sideEffect: CapabilityManifest["sideEffect"] = "read", permissions: readonly string[] = [], modelAliases: readonly string[] = []): CapabilityManifest {
   return {
     id: asId<"capability">(id),
     name: id,
@@ -1093,11 +2313,16 @@ function capability(id: string, sideEffect: CapabilityManifest["sideEffect"] = "
     version: "1.0.0",
     trust: "trusted",
     sideEffect,
-    permissions: [],
+    permissions,
     inputSchema: {},
     outputSchema: {},
-    enabled: true
+    enabled: true,
+    ...(modelAliases.length > 0 ? { projection: { modelAliases } } : {})
   };
+}
+
+function stringArray(value: unknown): readonly string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
 
 function selfRepairOutcome(): SelfRepairOutcomeSummary {

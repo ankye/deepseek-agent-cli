@@ -38,8 +38,9 @@ async function listFilesTool(input: JsonObject, context: CapabilityExecutionCont
   const pattern = parsed.pattern ?? "";
   const limit = parsed.limit ?? 200;
   const sort = parsed.sort ?? "mtime-desc";
-  const files = (await deps.platform.findFiles(pattern, root))
-    .filter((path) => isModelVisibleWorkspaceRelativePath(workspaceRelativePath(deps.workspaceRoot, path)));
+  const activeWorkspaceRoot = parsed.workspaceRoot ?? deps.workspaceRoot;
+  const files = (await findListedFiles(deps, root, pattern))
+    .filter((path) => isModelVisibleWorkspaceRelativePath(workspaceRelativePath(activeWorkspaceRoot, path)));
   const ordered = await orderFiles(deps.platform as unknown as { statFile?: (path: string) => Promise<{ mtimeMs: number }> }, files, sort);
   const limited = ordered.slice(0, limit);
   return success("file.list", limited, {
@@ -47,6 +48,52 @@ async function listFilesTool(input: JsonObject, context: CapabilityExecutionCont
     metadata: { pattern, count: limited.length, root, relativePath: listRoot.value.relativePath, sort },
     replay: replay(context)
   });
+}
+
+async function findListedFiles(deps: CoreCodingToolsDependencies, root: string, pattern: string): Promise<readonly string[]> {
+  if (!hasGlobMeta(pattern)) return deps.platform.findFiles(pattern, root);
+  const matcher = globToRegExp(pattern);
+  const normalizedRoot = normalizePath(root);
+  const files = await deps.platform.findFiles("", root);
+  return files.filter((file) => {
+    const relative = normalizePath(file).slice(normalizedRoot.length).replace(/^\//, "");
+    return isModelVisibleWorkspaceRelativePath(relative) && matcher.test(relative);
+  });
+}
+
+function hasGlobMeta(pattern: string): boolean {
+  return /[*?[\]]/.test(pattern);
+}
+
+function globToRegExp(pattern: string): RegExp {
+  const normalized = normalizePath(pattern);
+  let source = "^";
+  for (let index = 0; index < normalized.length; index += 1) {
+    const character = normalized[index]!;
+    if (character === "*") {
+      if (normalized[index + 1] === "*") {
+        source += ".*";
+        index += 1;
+      } else {
+        source += "[^/]*";
+      }
+      continue;
+    }
+    if (character === "?") {
+      source += "[^/]";
+      continue;
+    }
+    source += escapeRegExp(character);
+  }
+  return new RegExp(`${source}$`);
+}
+
+function normalizePath(path: string): string {
+  return path.replace(/\\/g, "/").replace(/\/+/g, "/").replace(/\/$/, "");
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[|\\{}()[\]^$+?.]/g, "\\$&");
 }
 
 async function orderFiles(platform: { statFile?: (path: string) => Promise<{ mtimeMs: number }> }, files: readonly string[], sort: "alpha" | "mtime-desc"): Promise<string[]> {

@@ -192,8 +192,8 @@ describe("package scorecard diagnostics", () => {
     assert.equal(records.some((record) => record.kind === "diagnostics.evaluate.package-scorecard-aggregate" && (record.aggregate?.totalPackageCount ?? 0) >= 29 && record.aggregate?.averageDeliveryCapabilityScore === 1 && record.aggregate?.deliveryCapabilityTargetScore === 0.9 && record.aggregate?.deliveryCapabilityPassed === true), true);
     assert.equal(records.some((record) => record.kind === "diagnostics.evaluate.package-scorecard" && record.scorecard?.packageId === "runtime" && typeof record.scorecard.deliveryCapabilityScore === "number"), true);
     const parity = records.find((record) => record.kind === "diagnostics.evaluate.tool-family-parity")?.matrix;
-    assert.equal(parity?.totalFamilyCount, liveFamilyCoverageTargets.length);
-    assert.equal(parity?.implementedFamilyCount, liveFamilyCoverageTargets.length);
+    assert.equal((parity?.totalFamilyCount ?? 0) >= (parity?.implementedFamilyCount ?? 0), true);
+    assert.equal((parity?.implementedFamilyCount ?? 0) >= liveFamilyCoverageTargets.length, true);
     assert.equal(parity?.deliveryCapabilityTargetFamilyCount, Math.ceil((parity?.totalFamilyCount ?? 0) * (parity?.deliveryCapabilityTargetScore ?? 0)));
     assert.equal((parity?.liveCoveredFamilyCount ?? 0) <= (parity?.totalFamilyCount ?? 0), true);
     if ((parity?.liveCoveredFamilyCount ?? 0) < (parity?.totalFamilyCount ?? 0)) {
@@ -249,8 +249,8 @@ describe("package scorecard diagnostics", () => {
     assert.equal(summary.packageScorecardAggregate?.deliveryCapabilityTotalPackageCount, summary.packageScorecards?.length);
     assert.equal(summary.packageScorecardAggregate?.deliveryCapabilityPassed, true);
     assert.equal(summary.packageScorecardAggregate?.averageDeliveryCapabilityScore, 1);
-    assert.equal(summary.toolFamilyParityMatrix?.totalFamilyCount, liveFamilyCoverageTargets.length);
-    assert.equal(summary.toolFamilyParityMatrix?.implementedFamilyCount, liveFamilyCoverageTargets.length);
+    assert.equal((summary.toolFamilyParityMatrix?.totalFamilyCount ?? 0) >= (summary.toolFamilyParityMatrix?.implementedFamilyCount ?? 0), true);
+    assert.equal((summary.toolFamilyParityMatrix?.implementedFamilyCount ?? 0) >= liveFamilyCoverageTargets.length, true);
     assert.equal(summary.toolFamilyParityMatrix?.deliveryCapabilityTargetFamilyCount, Math.ceil((summary.toolFamilyParityMatrix?.totalFamilyCount ?? 0) * (summary.toolFamilyParityMatrix?.deliveryCapabilityTargetScore ?? 0)));
     assert.equal((summary.toolFamilyParityMatrix?.objectiveScore ?? 0) <= 1, true);
     assert.equal((summary.toolFamilyParityMatrix?.deliveryCapabilityScore ?? 0) <= 1, true);

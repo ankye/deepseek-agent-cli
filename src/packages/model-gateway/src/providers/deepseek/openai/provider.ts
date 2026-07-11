@@ -13,12 +13,14 @@ import type {
   ModelProviderRequest,
   ModelProviderTransport,
   ModelRequest,
-  ModelStreamEvent
+  ModelStreamEvent,
+  ModelUsageCacheMetadata
 } from "@deepseek/platform-contracts";
 import { buildDeepSeekAnthropicMessagesProviderRequest } from "../anthropic/index.js";
 import {
   attachPipelineCacheEvidence,
   countWhitespaceTokens,
+  isJsonObject,
   providerError,
   requestPipelineFingerprint,
   verifyByStreaming
@@ -41,6 +43,8 @@ export interface DeepSeekOpenAIProviderOptions {
   readonly credentials?: ModelCredentialProvider;
   readonly timeoutMs?: number;
 }
+
+const TRANSIENT_TRANSPORT_MAX_ATTEMPTS = 2;
 
 export class DeepSeekOpenAIProvider implements ModelGateway {
   private readonly config: ModelProviderConfig;
@@ -65,21 +69,32 @@ export class DeepSeekOpenAIProvider implements ModelGateway {
     }
 
     const providerRequest = this.buildProviderRequest(request, credential?.value);
-    const accumulator = createToolCallAccumulator();
-    try {
-      for await (const chunk of this.options.transport.stream(providerRequest, request.signal ? { signal: request.signal } : undefined)) {
-        for (const event of normalizeDeepSeekChunk(chunk, provider, accumulator)) {
-          yield attachPipelineCacheEvidence(event, pipelineFingerprint);
+    const explicitPrefixCacheHint = explicitPrefixCacheHintEvidence(request, this.config);
+    for (let attempt = 1; attempt <= TRANSIENT_TRANSPORT_MAX_ATTEMPTS; attempt += 1) {
+      const accumulator = createToolCallAccumulator();
+      let emittedProviderEvent = false;
+      try {
+        for await (const chunk of this.options.transport.stream(providerRequest, request.signal ? { signal: request.signal } : undefined)) {
+          for (const event of normalizeDeepSeekChunk(chunk, provider, accumulator)) {
+            emittedProviderEvent = true;
+            yield attachPipelineCacheEvidence(event, pipelineFingerprint, explicitPrefixCacheHint);
+          }
         }
+        for (const event of accumulator.flush(provider)) {
+          emittedProviderEvent = true;
+          yield attachPipelineCacheEvidence(event, pipelineFingerprint, explicitPrefixCacheHint);
+        }
+        yield { kind: "done", provider };
+        return;
+      } catch (error) {
+        if (!emittedProviderEvent && !request.signal?.aborted && attempt < TRANSIENT_TRANSPORT_MAX_ATTEMPTS) continue;
+        yield {
+          kind: "error",
+          error: providerError("PROVIDER_TRANSPORT_FAILED", error instanceof Error ? error.message : "DeepSeek provider transport failed.", true),
+          provider
+        };
+        return;
       }
-      for (const event of accumulator.flush(provider)) yield attachPipelineCacheEvidence(event, pipelineFingerprint);
-      yield { kind: "done", provider };
-    } catch (error) {
-      yield {
-        kind: "error",
-        error: providerError("PROVIDER_TRANSPORT_FAILED", error instanceof Error ? error.message : "DeepSeek provider transport failed.", true),
-        provider
-      };
     }
   }
 
@@ -124,4 +139,26 @@ export class DeepSeekOpenAIProvider implements ModelGateway {
       model: profile.model
     };
   }
+}
+
+function explicitPrefixCacheHintEvidence(
+  request: ModelRequest,
+  config: ModelProviderConfig
+): ModelUsageCacheMetadata["explicitPrefixCacheHint"] | undefined {
+  const pipeline = isJsonObject(request.metadata?.contextPipeline) ? request.metadata.contextPipeline : undefined;
+  if (typeof pipeline?.pipelineFingerprint !== "string" || pipeline.pipelineFingerprint.length === 0) return undefined;
+  if (!isJsonObject(pipeline.cacheHintSummary)) return undefined;
+  const capability = request.profile.cacheHints ?? config.cacheHints;
+  if (!capability?.explicitPrefixCacheHints) {
+    return {
+      status: "unsupported",
+      reasonCode: "PROVIDER_AUTOMATIC_PREFIX_CACHE_ONLY",
+      redaction: { class: "internal" }
+    };
+  }
+  return {
+    status: "missing",
+    reasonCode: "PROVIDER_EXPLICIT_PREFIX_CACHE_HINT_MISSING",
+    redaction: { class: "internal" }
+  };
 }

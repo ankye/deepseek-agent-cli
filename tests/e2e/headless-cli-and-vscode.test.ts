@@ -122,6 +122,7 @@ describe("host adapter smoke", () => {
         "context.memory.collected",
         "context.projection.completed",
         "visible.reasoning.recorded",
+        "tool.decision-board.snapshot",
         "hooks.invoked",
         "prompt.assembled",
         "visible.reasoning.recorded",

@@ -4,7 +4,6 @@
 Define tool family capability catalog requirements for concrete executable tools, family scoring, no-placeholder entries, and delivery visibility.
 
 定义 tool family capability catalog 对具体可执行工具、family scoring、no-placeholder entries 与交付可见性的要求。
-
 ## Requirements
 ### Requirement: Canonical Tool Family Catalog / 规范工具家族目录
 The system SHALL define a versioned tool family catalog with exactly 16 first-version domains and 64 first-version scoring families.
@@ -46,6 +45,13 @@ Every first-version family SHALL be reported as `implemented`, `planned`, `absen
 - **THEN** diagnostics report the family as `absent` and scorecard collection gives it zero credit
 - **中文** 当 DeepSeek 对某个 catalog family 没有 capability、connector 或规划实现时，diagnostics 必须报告该 family 为 `absent`，scorecard collection 必须给零分。
 
+#### Scenario: Required engineering family blocks before model dispatch / 必需工程 Family 在模型调用前阻塞
+- **WHEN** a selected engineering profile requires a catalog family such as `core.file.edit`, `patch.apply`, `shell.run`, `test.run`, or `git.diff`
+- **AND** that family has no executable implementation or no model-visible projection for the current host
+- **THEN** capability compilation fails with `blocked-by-cli-capability-gap` before provider dispatch
+- **AND** the diagnostic includes profile id, stage id, required family id, implementation state, and projection state
+- **中文** 当选中的 engineering profile 需要 `core.file.edit`、`patch.apply`、`shell.run`、`test.run` 或 `git.diff` 等 catalog family，且该 family 在当前 host 没有 executable implementation 或 model-visible projection 时，capability compilation 必须在 provider dispatch 前以 `blocked-by-cli-capability-gap` 失败；diagnostic 必须包含 profile id、stage id、required family id、implementation state 与 projection state。
+
 ### Requirement: Tool Entries Are Concrete Implementations / Tool Entry 必须是真实实现
 Catalog family tool entries SHALL represent concrete executable capabilities with capability ids, model-visible projection, and runnable executors; planned, absent, unavailable, or unassessed work SHALL NOT be represented as placeholder tools.
 
@@ -65,4 +71,33 @@ catalog 必须区分 `shell.run` 内部的 shell-level pipes 与 `pipeline.seque
 - **WHEN** a command uses `|` inside a shell process
 - **THEN** it may count toward `shell.run` evidence but SHALL NOT satisfy any `pipeline.*` family criterion
 - **中文** 当命令在 shell process 内使用 `|` 时，它可以计入 `shell.run` evidence，但不得满足任何 `pipeline.*` family criterion。
+
+### Requirement: Codex-Class Tool Tier Scorecard / Codex-Class 工具层级评分卡
+
+The tool family catalog SHALL support a Codex-class gap scorecard that groups families into production tool tiers without removing the underlying family-level denominator.
+
+tool family catalog 必须支持 Codex-class gap scorecard，将 families 分组为生产工具层级，同时不得移除底层 family-level 分母。
+
+#### Scenario: Tier score keeps absent families visible / 层级评分保持缺失 Family 可见
+- **WHEN** a Codex-class gap report is rendered
+- **THEN** it includes Tier 0 core read, Tier 1 engineering closure, Tier 2 production workflow, and Tier 3 ecosystem connector sections
+- **AND** every absent, planned, unavailable, or unassessed family remains visible with zero or explicit non-credit state
+- **中文** 当渲染 Codex-class gap report 时，必须包含 Tier 0 core read、Tier 1 engineering closure、Tier 2 production workflow 与 Tier 3 ecosystem connector sections；每个 absent、planned、unavailable 或 unassessed family 必须保持可见，并带零分或明确 non-credit 状态。
+
+#### Scenario: Tier 1 closure requires concrete tools / Tier 1 闭环要求真实工具
+- **WHEN** an engineering task requires source mutation and verification
+- **THEN** Tier 1 is not considered ready unless executable model-visible families exist for file mutation, patch application or equivalent edit, command or test execution, and diff/status inspection
+- **中文** 当工程任务需要源码修改与验证时，只有存在 file mutation、patch application 或等价 edit、command 或 test execution、diff/status inspection 的 executable model-visible families，Tier 1 才能视为 ready。
+
+### Requirement: Tool Projection Explains Visibility / 工具投影解释可见性
+
+The tool family capability catalog SHALL support projection evidence that explains why a capability is visible, hidden, denied, unavailable, stage-gated, or provider-incompatible for the current profile and stage.
+
+工具族能力目录必须支持 projection evidence，用于解释当前 profile 与 stage 下某个 capability 为什么可见、隐藏、拒绝、不可用、被阶段 gate，或与 provider 不兼容。
+
+#### Scenario: Hidden tools are diagnosable / 隐藏工具可诊断
+
+- **WHEN** a tool is not projected to the model
+- **THEN** projection evidence SHALL include its capability id or family id, hidden reason, policy/profile/stage source, and whether the issue is a CLI capability gap, deliberate boundary, platform unavailability, or provider compatibility limit
+- **中文** 当某个工具未投影给模型时，projection evidence 必须包含其 capability id 或 family id、hidden reason、policy/profile/stage source，以及该问题是 CLI 能力缺口、刻意边界、平台不可用，还是 provider compatibility limit。
 

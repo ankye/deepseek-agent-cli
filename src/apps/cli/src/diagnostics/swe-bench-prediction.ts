@@ -95,7 +95,7 @@ interface SweBenchHarnessResult {
 
 export interface SweBenchPredictionSummary extends JsonObject {
   readonly schemaVersion: "1.0.0";
-  readonly kind: "diagnostics.swe-bench.prediction.summary";
+  readonly kind: "diagnostics.swe-bench.prediction.summary" | "diagnostics.swe-bench.run.summary";
   readonly status: "pass" | "warn" | "fail";
   readonly action: string;
   readonly dryRun: boolean;
@@ -108,6 +108,7 @@ export interface SweBenchPredictionSummary extends JsonObject {
   readonly predictions: readonly SweBenchPredictionRecord[];
   readonly commandPlan: readonly JsonObject[];
   readonly executedCommands: readonly JsonObject[];
+  readonly run?: JsonObject;
   readonly childTrace?: SweBenchChildTraceSummary;
   readonly evaluation?: SweBenchEvaluationSummary;
   readonly diagnostics: readonly SweBenchPredictionDiagnostic[];
@@ -140,6 +141,7 @@ export interface CollectSweBenchPredictionOptions {
   readonly model?: string;
   readonly timeoutMs?: number;
   readonly repairContext?: SweBenchRepairContext;
+  readonly supervisorWorkflowStatePath?: string;
   readonly extraArgs: readonly string[];
   readonly platform?: PlatformRuntime;
 }
@@ -181,7 +183,7 @@ export async function collectSweBenchPrediction(options: CollectSweBenchPredicti
   });
   if (!instance) return summary(options, diagnostics, [], [], [], undefined, undefined);
 
-  const modelName = options.model ?? (options.modelProvider === "glm" ? "glm-5.1" : "deepseek-cli");
+  const modelName = options.model ?? "default";
   const repoDir = options.repoDir as string;
   const commandPlan = [childCommandPlan(instance, options, modelName), gitDiffCommandPlan(repoDir)];
   const executedCommands: JsonObject[] = [];
@@ -211,6 +213,18 @@ export async function collectSweBenchPrediction(options: CollectSweBenchPredicti
       await writeChildTrace(platform, options.traceOutputPath as string, result.stdout);
     }
     childTrace = summarizeSweBenchChildTrace(childStdout, options.traceOutputPath);
+    if (!childTrace.terminalKind) {
+      diagnostics.push(diagnostic("SWE_BENCH_CHILD_TRACE_TERMINAL_MISSING", "warn", "SWE-bench child CLI trace did not include a terminal agent loop event.", {
+        terminalKind: "",
+        terminalStatus: "",
+        terminalReason: "",
+        iterationCount: childTrace.iterationCount,
+        modelRequestCount: childTrace.modelRequestCount,
+        toolIntentCount: childTrace.toolIntentCount,
+        usageEventCount: childTrace.usageEventCount,
+        tracePath: options.traceOutputPath ?? ""
+      }));
+    }
     if (childTrace.terminalKind === "agent.loop.failed" || childTrace.terminalKind === "agent.loop.cancelled") {
       diagnostics.push(diagnostic("SWE_BENCH_CHILD_TRACE_TERMINAL_FAILED", "warn", "SWE-bench child CLI trace did not end with a clean completed event.", {
         terminalKind: childTrace.terminalKind,
@@ -280,12 +294,24 @@ export async function collectSweBenchPrediction(options: CollectSweBenchPredicti
         sourceMutationCount: childTrace.sourceMutationCount
       }));
     }
+    if (childTrace.diagnosticCodes.includes("SWE_BENCH_INVALID_TEST_TOOL_COMMAND_GATE")) {
+      diagnostics.push(diagnostic("SWE_BENCH_INVALID_TEST_TOOL_COMMAND_GATE", "warn", "SWE-bench child used a test tool for a non-test command, so the command was not counted as verification evidence.", {
+        terminalKind: childTrace.terminalKind,
+        terminalReason: childTrace.terminalReason,
+        shellCommandCount: childTrace.shellCommandCount,
+        testCommandCount: childTrace.testCommandCount,
+        invalidTestToolCommandCount: childTrace.invalidTestToolCommandCount,
+        sourceMutationCount: childTrace.sourceMutationCount
+      }));
+    }
     diagnostics.push(...childTraceGateDiagnostics(childTrace));
   }
 
   const patch = options.dryRun ? "" : await collectGitDiff(platform, repoDir, diagnostics, executedCommands);
+  if (!options.dryRun) diagnostics.push(...patchQualityDiagnostics(patch));
   const prediction = predictionRecord(instance.instanceId, modelName, patch);
-  if (!options.dryRun) {
+  const patchQualityFailed = diagnostics.some((entry) => entry.code === "SWE_BENCH_PATCH_QUALITY_FAILED" && entry.severity === "error");
+  if (!options.dryRun && !patchQualityFailed) {
     await writePredictionRecord(platform, options.outputPath as string, prediction, options.appendOutput === true);
   }
   if (!options.dryRun && patch.trim().length === 0) {
@@ -293,6 +319,31 @@ export async function collectSweBenchPrediction(options: CollectSweBenchPredicti
   }
 
   return summary(options, diagnostics, [prediction], commandPlan, executedCommands, instance, undefined, childTrace);
+}
+
+function patchQualityDiagnostics(patch: string): readonly SweBenchPredictionDiagnostic[] {
+  const debugLines = addedPatchLines(patch)
+    .filter((line) => looksLikeDebugResidue(line))
+    .slice(0, 20);
+  if (debugLines.length === 0) return [];
+  return [diagnostic("SWE_BENCH_PATCH_QUALITY_FAILED", "error", "SWE-bench candidate patch contains obvious debug residue and is not harness-ready.", {
+    debugLineCount: debugLines.length,
+    debugLines
+  })];
+}
+
+function addedPatchLines(patch: string): readonly string[] {
+  return patch.split(/\r?\n/)
+    .filter((line) => line.startsWith("+") && !line.startsWith("+++") && line.length > 1)
+    .map((line) => line.slice(1));
+}
+
+function looksLikeDebugResidue(line: string): boolean {
+  const trimmed = line.trim();
+  return /^print\s*\(.*\bDEBUG\b/i.test(trimmed) ||
+    /^console\.log\s*\(.*\bDEBUG\b/i.test(trimmed) ||
+    /^debugger\s*;?$/.test(trimmed) ||
+    /\b(?:logger|logging)\.(?:debug|info|warning|warn|error)\s*\(.*\bDEBUG\b/i.test(trimmed);
 }
 
 function childTraceGateDiagnostics(childTrace: SweBenchChildTraceSummary): readonly SweBenchPredictionDiagnostic[] {
@@ -404,7 +455,7 @@ function summary(
     invocation: {
       provider: options.modelProvider ?? "deepseek",
       providerSource: options.modelProvider ? "explicit" : "default",
-      model: options.model ?? (options.modelProvider === "glm" ? "glm-5.1" : "deepseek-cli"),
+      model: options.model ?? "default",
       live: options.live,
       dryRun: options.dryRun,
       action: options.action,
@@ -1412,13 +1463,18 @@ async function childCommand(
   options: CollectSweBenchPredictionOptions,
   modelName: string
 ): Promise<{ readonly command: string; readonly args: readonly string[]; readonly env?: JsonObject }> {
+  const repairContextPath = options.repairContext
+    ? await writeRepairContextFile(platform, options.repoDir as string, options.repairContext)
+    : undefined;
   const args = [
     join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs"),
     "--tsconfig",
     join(process.cwd(), "tsconfig.json"),
     join(process.cwd(), "src/apps/cli/src/index.ts"),
     "run",
-    sweBenchPrompt(instance, options.repairContext),
+    sweBenchPrompt(instance),
+    "--workspace-root",
+    options.repoDir as string,
     "--output",
     "jsonl",
     "--live",
@@ -1426,6 +1482,14 @@ async function childCommand(
     "all",
     "--timeout-ms",
     String(options.timeoutMs ?? 15 * 60 * 1000),
+    ...(options.supervisorWorkflowStatePath ? [
+      "--supervisor-workflow-state",
+      options.supervisorWorkflowStatePath
+    ] : []),
+    ...(repairContextPath ? [
+      "--additional-user-context-file",
+      repairContextPath
+    ] : []),
     ...evaluationModelSelectionArgs({
       ...(options.modelProvider ? { modelProvider: options.modelProvider } : {}),
       model: options.model ?? modelName
@@ -1436,6 +1500,17 @@ async function childCommand(
     args,
     env: await evaluationLiveCredentialEnv(platform, options.modelProvider)
   };
+}
+
+async function writeRepairContextFile(
+  platform: PlatformRuntime,
+  repoDir: string,
+  repairContext: SweBenchRepairContext
+): Promise<string> {
+  const path = platform.resolvePath(repoDir, ".deepseek", "swe-bench-repair-context.md");
+  await platform.ensureDirectory(dirname(path));
+  await platform.writeFile(path, repairFeedbackContent(repairContext));
+  return path;
 }
 
 async function collectGitDiff(
@@ -1542,7 +1617,7 @@ function childCommandPlan(instance: SweBenchInstance, options: CollectSweBenchPr
     instanceId: instance.instanceId,
     provider: options.modelProvider ?? "deepseek",
     model: modelName,
-    toolProjection: "all",
+    toolProjection: "safe-all",
     dryRun: options.dryRun,
     redaction: { class: "internal", fields: ["prompt", "args", "repoDir"] }
   };
@@ -1576,14 +1651,28 @@ function predictionRecord(instanceId: string, modelName: string, patch: string):
   };
 }
 
-function sweBenchPrompt(instance: SweBenchInstance, repairContext: SweBenchRepairContext | undefined = undefined): string {
+function sweBenchPrompt(instance: SweBenchInstance): string {
   return [
     `Resolve SWE-bench instance ${instance.instanceId}.`,
     instance.repo ? `Repository: ${instance.repo}` : undefined,
     instance.baseCommit ? `Base commit: ${instance.baseCommit}` : undefined,
     "",
     "Managed SWE-bench execution profile:",
+    "Managed child tool matrix:",
+    "- environment: supervisor-prepared checkout; do not call core.env.prepare",
+    "- source-inspection: core.file.read, core.file.list, core.search.text, core.workspace.glob",
+    "- mutation: core.file.write, core.file.edit, core.patch.apply",
+    "- command-execution: core.shell.run",
+    "- verification: core.test.run",
+    "- patch-review: core.git.diff",
+    "- harness-scoring: supervisor-owned official harness after child returns",
+    "- packaging: supervisor-owned prediction JSON and trace summary",
+    "Runner stages: prepare -> understand -> change -> verify -> score -> package -> return",
     "- Work only inside the current repository checkout.",
+    "- Do not search parent directories or system roots to discover the repository.",
+    "- Do not clone or create another copy of the repository.",
+    "- use pwd and ls once to verify the current checkout root, then stay inside it.",
+    "- If a path is missing, re-check the current checkout root before broadening the search.",
     "- Phase budget: inspect source and local tests first; after at most 12 tool calls or one dependency setup attempt, make a minimal source edit or record why no edit is possible.",
     "- Phase budget: after the first source edit, switch to verification instead of continuing broad exploration.",
     "- Before trusting existing tests, derive the smallest reproduction from the Problem statement, reproduction notes, expected behavior, or failing test description.",
@@ -1595,22 +1684,6 @@ function sweBenchPrompt(instance: SweBenchInstance, repairContext: SweBenchRepai
     "- After a passing focused standard test, stop local testing and leave broader scoring to the supervisor harness unless official repair feedback requires another focused check.",
     "- If no standard test command has been attempted, do not answer SWE patch ready; run the shortest feasible standard test command first or report why it cannot be started.",
     "- Capture the test result and leave the source diff in the checkout for the supervisor harness.",
-    ...(repairContext ? [
-      "",
-      "Previous supervised attempt feedback:",
-      `- Attempt ${repairContext.attemptNumber - 1} official harness did not resolve the instance.`,
-      `- Previous evaluation run: ${repairContext.previousRunId}.`,
-      ...(typeof repairContext.previousPatchBytes === "number" ? [
-        `- Previous patch status: ${repairContext.previousPatchBytes > 0 ? "non-empty" : "empty"} patchBytes=${repairContext.previousPatchBytes}.`
-      ] : []),
-      "- Failing tests:",
-      ...repairContext.failingTests.slice(0, 12).map((test) => `  - ${test}`),
-      ...(repairContext.failureExcerpts && repairContext.failureExcerpts.length > 0 ? [
-        "- Official harness failure excerpts:",
-        ...repairContext.failureExcerpts.slice(0, 6).flatMap(formatRepairFailureExcerpt)
-      ] : []),
-      "- Repair the current checkout based on local source and these test failures; do not look up upstream fix commits."
-    ] : []),
     "",
     "Problem statement:",
     instance.problemStatement,
@@ -1623,6 +1696,25 @@ function sweBenchPrompt(instance: SweBenchInstance, repairContext: SweBenchRepai
     "- Leave the repository with the fix applied.",
     "- Final answer exactly: SWE patch ready"
   ].filter((line): line is string => line !== undefined).join("\n");
+}
+
+function repairFeedbackContent(repairContext: SweBenchRepairContext): string {
+  return [
+    "Previous supervised attempt feedback:",
+    `- Attempt ${repairContext.attemptNumber - 1} official harness did not resolve the instance.`,
+    `- Previous evaluation run: ${repairContext.previousRunId}.`,
+    ...(typeof repairContext.previousPatchBytes === "number" ? [
+      `- Previous patch status: ${repairContext.previousPatchBytes > 0 ? "non-empty" : "empty"} patchBytes=${repairContext.previousPatchBytes}.`
+    ] : []),
+    "- Failing tests:",
+    ...repairContext.failingTests.slice(0, 12).map((test) => `  - ${test}`),
+    ...(repairContext.failureExcerpts && repairContext.failureExcerpts.length > 0 ? [
+      "- Official harness failure excerpts:",
+      ...repairContext.failureExcerpts.slice(0, 6).flatMap(formatRepairFailureExcerpt)
+    ] : []),
+    "- Repair the current checkout based on local source and these test failures; do not look up upstream fix commits.",
+    ""
+  ].join("\n");
 }
 
 function formatRepairFailureExcerpt(excerpt: SweBenchHarnessFailureExcerpt): readonly string[] {

@@ -32,6 +32,7 @@ export interface CliOptions {
   readonly output: AgentLoopOutputMode;
   readonly outputContract?: AgentLoopOutputContract;
   readonly live: boolean;
+  readonly workspaceRoot?: string;
   readonly modelProvider?: "deepseek" | "glm";
   readonly model?: string;
   readonly tuiProfile?: CliTuiProfile;
@@ -50,7 +51,7 @@ export interface CliOptions {
   readonly revertAction?: CliRevertAction;
   readonly revertTarget?: WorkspaceRevertRequestTarget;
   readonly revertReason?: string;
-  readonly sessionAction?: "resume" | "fork";
+  readonly sessionAction?: "resume" | "fork" | "board";
   readonly sessionId?: SessionId;
   readonly turnId?: TurnId;
   readonly parentSessionId?: SessionId;
@@ -65,7 +66,11 @@ export interface CliOptions {
   readonly indexProviderScope?: "workspace" | "user";
   readonly modeAction?: CliModeAction;
   readonly modeRequestedTransition?: string;
-  readonly toolProjection?: "none" | "read-only" | "read-write" | "all";
+  readonly toolProjection?: "none" | "read-only" | "read-write" | "safe-all" | "all";
+  readonly toolOptIns?: readonly string[];
+  readonly approvalMode?: "ask" | "trusted";
+  readonly supervisorWorkflowStatePath?: string;
+  readonly additionalUserContextFile?: string;
   readonly memoryAction?: "status" | "list" | "candidates" | "remember" | "approve" | "reject" | "edit" | "delete" | "enable" | "disable" | "export" | "explain";
   readonly memoryInput?: JsonObject;
   readonly contextInput?: JsonObject;
@@ -88,10 +93,13 @@ export interface CliRuntimeFactoryOptions {
   readonly live: boolean;
   readonly workspaceRoot: string;
   readonly toolProjection?: CliOptions["toolProjection"];
+  readonly toolOptIns?: CliOptions["toolOptIns"];
+  readonly approvalMode?: CliOptions["approvalMode"];
   readonly modelProvider?: CliOptions["modelProvider"];
   readonly model?: CliOptions["model"];
 }
 
 export interface CliRunOptions {
+  readonly workspaceRoot?: string;
   readonly createRuntime?: (options: CliRuntimeFactoryOptions) => Promise<{ readonly deps: RuntimeDependencies; readonly kernel: RuntimeKernel }>;
 }

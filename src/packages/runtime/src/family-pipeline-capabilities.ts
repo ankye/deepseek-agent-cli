@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type {
   CapabilityExecutionContext,
   CapabilityId,
+  CapabilityManifest,
   ExecutionEnvelope,
   JsonObject,
   RedactedError,
@@ -12,8 +13,17 @@ import type {
   ToolFamilyPipelineStepRecord
 } from "@deepseek/platform-contracts";
 import { asId } from "@deepseek/platform-contracts";
+import {
+  analyzeResourceScope,
+  createSandboxAuditEvidence,
+  createSandboxRequirement,
+  createSecretRedactionDecision
+} from "@deepseek/policy-sandbox";
 import type { RuntimeFamilyCapabilityDependencies } from "./family-capabilities.js";
 import { runtimeFamilyCapabilityIds } from "./family-capabilities.js";
+import { resourceLocksFor } from "./envelope.js";
+import { normalizeResourceLockStrings, resourceLockStringsConflict } from "./resource-locks.js";
+import type { ResourceLockNormalizationOptions } from "./resource-locks.js";
 
 const MAX_PIPELINE_STEPS = 16;
 const DEFAULT_ARTIFACT_LIMIT_BYTES = 16_000;
@@ -27,6 +37,21 @@ interface PipelineStepInput extends JsonObject {
   readonly inputFromArtifacts?: JsonObject;
   readonly resourceLocks?: readonly string[];
   readonly lockScope?: readonly string[];
+}
+
+interface PipelineStepFields {
+  readonly stepId?: string;
+  readonly capabilityId?: string;
+  readonly input?: JsonObject;
+  readonly inputArtifactIds?: readonly string[];
+  readonly inputFromArtifacts?: JsonObject;
+  readonly resourceLocks?: readonly string[];
+  readonly lockScope?: readonly string[];
+}
+
+interface ResolvedPipelineStep extends PipelineStepFields {
+  readonly manifest?: CapabilityManifest;
+  readonly inferredResourceLocks: readonly string[];
 }
 
 interface PipelineExecutionState {
@@ -59,8 +84,15 @@ export async function executePipeline(
     return success(executeStreamOnly(input, context, pipelineId, familyId, artifactLimitBytes));
   }
   if (steps.length === 0) return failure("PIPELINE_STEPS_REQUIRED", "Pipeline must contain at least one step.");
+  const resolvedSteps = await resolvePipelineSteps(deps, steps, workspaceRoot);
+  const platformDescriptor = await deps.platform.descriptor();
   if (kind === "parallel") {
-    const conflict = firstLockConflict(steps);
+    const artifactDependency = firstParallelArtifactDependency(resolvedSteps);
+    if (artifactDependency) return failure("PIPELINE_PARALLEL_ARTIFACT_DEPENDENCY", `Parallel pipeline step depends on sibling artifact input: ${artifactDependency}. Use pipeline.sequence or pipeline.artifact-routing for ordered artifact flow.`);
+    const conflict = firstLockConflict(resolvedSteps, {
+      workspaceRoot,
+      caseSensitive: platformDescriptor.filesystem.caseSensitive
+    });
     if (conflict) return failure("PIPELINE_LOCK_CONFLICT", `Parallel pipeline has overlapping resource lock: ${conflict}.`);
   }
 
@@ -76,8 +108,8 @@ export async function executePipeline(
   };
 
   const records = kind === "parallel"
-    ? await Promise.all(steps.map((step, index) => executePipelineStep(state, step, index)))
-    : await executeStepsInOrder(state, steps);
+    ? await Promise.all(resolvedSteps.map((step, index) => executePipelineStep(state, step, index)))
+    : await executeStepsInOrder(state, resolvedSteps);
   const status = records.every((record) => record.status === "executed") ? "completed" : records.some((record) => record.status === "cancelled") ? "cancelled" : "failed";
   const record: ToolFamilyPipelineRecord = {
     pipelineId,
@@ -104,10 +136,10 @@ export async function executePipeline(
   return status === "completed" ? success(value) : { ok: false, value, error: diag("PIPELINE_STEP_FAILED", "One or more pipeline steps failed.") };
 }
 
-async function executeStepsInOrder(state: PipelineExecutionState, steps: readonly PipelineStepInput[]): Promise<readonly ToolFamilyPipelineStepRecord[]> {
+async function executeStepsInOrder(state: PipelineExecutionState, steps: readonly ResolvedPipelineStep[]): Promise<readonly ToolFamilyPipelineStepRecord[]> {
   const records: ToolFamilyPipelineStepRecord[] = [];
   for (let index = 0; index < steps.length; index += 1) {
-    const record = await executePipelineStep(state, steps[index] ?? {}, index);
+    const record = await executePipelineStep(state, steps[index] ?? { inferredResourceLocks: [] }, index);
     records.push(record);
     if (record.status !== "executed") break;
   }
@@ -116,7 +148,7 @@ async function executeStepsInOrder(state: PipelineExecutionState, steps: readonl
 
 async function executePipelineStep(
   state: PipelineExecutionState,
-  step: PipelineStepInput,
+  step: ResolvedPipelineStep,
   index: number
 ): Promise<ToolFamilyPipelineStepRecord> {
   const stepId = stringValue(step.stepId) ?? `step-${index + 1}`;
@@ -127,11 +159,11 @@ async function executePipelineStep(
   if (state.context.signal.aborted) {
     return stepRecord(state, stepId, asId<"capability">(capabilityId), index, "cancelled", artifactIds(step.inputArtifactIds), [], state.context.cancellationReason ?? "cancelled");
   }
-  const manifest = await state.deps.capabilities.get(asId<"capability">(capabilityId));
+  const manifest = step.manifest ?? await state.deps.capabilities.get(asId<"capability">(capabilityId));
   if (!manifest) {
     return stepRecord(state, stepId, asId<"capability">(capabilityId), index, "failed", artifactIds(step.inputArtifactIds), [], "capability not found");
   }
-  const stepInput = materializeStepInput(step, state);
+  const stepInput = withWorkspaceRootDefault(materializeStepInput(step, state), state.workspaceRoot);
   const visible = await state.deps.capabilities.listModelVisible();
   const descriptor = await state.deps.platform.descriptor();
   const preflight = await state.deps.toolIntentPreflight.check({
@@ -143,20 +175,56 @@ async function executePipelineStep(
   if (preflight.status === "rejected" || !preflight.capabilityId) {
     return stepRecord(state, stepId, manifest.id, index, "failed", artifactIds(step.inputArtifactIds), [], preflight.diagnostics[0]?.message ?? "preflight rejected", "rejected");
   }
+  const effectiveStepInput = withWorkspaceRootDefault(preflight.repaired?.input ?? stepInput, state.workspaceRoot);
+  const stepResourceScope = analyzeResourceScope(effectiveStepInput, manifest.sideEffect);
+  const stepSecretExposure = createSecretRedactionDecision(effectiveStepInput, { class: "internal" });
+  const stepSandboxRequirements = createSandboxRequirement({
+    sideEffect: manifest.sideEffect,
+    resourceScope: stepResourceScope,
+    timeoutMs: manifest.timeoutMs ?? 30_000,
+    permissions: manifest.permissions
+  });
+  const stepAudit = createSandboxAuditEvidence({
+    decision: "pending",
+    reasonCode: "pipeline.step.policy",
+    subject: "runtime.pipeline",
+    resource: String(preflight.capabilityId),
+    sandboxProfile: stepSandboxRequirements.profile,
+    trace: state.context.trace,
+    metadata: {
+      pipelineId: state.pipelineId,
+      stepId,
+      parentInvocationId: state.context.envelope.invocationId,
+      capabilityId: preflight.capabilityId,
+      sideEffect: manifest.sideEffect
+    }
+  });
   const policy = await state.deps.policy.decide({
     subject: "runtime.pipeline",
     action: `execute:${String(preflight.capabilityId)}`,
     resource: String(preflight.capabilityId),
     metadata: {
+      sideEffect: manifest.sideEffect,
+      permissions: manifest.permissions,
+      timeoutMs: manifest.timeoutMs ?? 30_000,
+      resourceLocks: resourceLocksFor(manifest.sideEffect, effectiveStepInput, { resolveWorkspacePath: state.deps.platform.resolveWorkspacePath.bind(state.deps.platform) }),
+      secretExposure: stepSecretExposure,
+      resourceScope: stepResourceScope,
+      sandboxRequirements: stepSandboxRequirements,
+      audit: stepAudit,
       pipelineId: state.pipelineId,
       stepId,
       parentInvocationId: state.context.envelope.invocationId
-    }
+    },
+    secret: stepSecretExposure,
+    resourceScope: stepResourceScope,
+    sandbox: stepSandboxRequirements,
+    auditEvidence: stepAudit
   });
   if (policy.action !== "allow") {
     return stepRecord(state, stepId, manifest.id, index, "failed", artifactIds(step.inputArtifactIds), [], `policy ${policy.action}: ${policy.reason}`, policy.action);
   }
-  const result = await state.deps.capabilities.execute(preflight.capabilityId, preflight.repaired?.input ?? stepInput, childExecutionContext(state.context, manifest.id, stepId));
+  const result = await state.deps.capabilities.execute(preflight.capabilityId, effectiveStepInput, childExecutionContext(state.context, manifest.id, stepId));
   const artifact = artifactFromValue(state, stepId, manifest.toolFamily?.familyId ?? state.pipelineFamilyId, result.ok ? result.value ?? {} : { error: result.error ?? diag("CAPABILITY_FAILED", "Capability failed.") });
   state.artifactsById.set(artifact.artifactId, artifact);
   state.artifactValuesById.set(artifact.artifactId, result.ok ? result.value ?? {} : { error: result.error ?? diag("CAPABILITY_FAILED", "Capability failed.") });
@@ -237,7 +305,7 @@ function childExecutionContext(parent: CapabilityExecutionContext, capabilityId:
   };
 }
 
-function materializeStepInput(step: PipelineStepInput, state: PipelineExecutionState): JsonObject {
+function materializeStepInput(step: PipelineStepFields, state: PipelineExecutionState): JsonObject {
   const fromArtifacts = step.inputFromArtifacts && typeof step.inputFromArtifacts === "object" ? step.inputFromArtifacts : {};
   const artifactFields: Record<string, JsonObject> = {};
   for (const [field, artifactId] of Object.entries(fromArtifacts)) {
@@ -317,13 +385,45 @@ function artifactRef(input: {
   };
 }
 
-function firstLockConflict(steps: readonly PipelineStepInput[]): string | undefined {
-  const seen = new Set<string>();
+async function resolvePipelineSteps(
+  deps: RuntimeFamilyCapabilityDependencies,
+  steps: readonly PipelineStepInput[],
+  workspaceRoot: string
+): Promise<readonly ResolvedPipelineStep[]> {
+  return Promise.all(steps.map(async (step): Promise<ResolvedPipelineStep> => {
+    const capabilityId = stringValue(step.capabilityId);
+    const manifest = capabilityId ? await deps.capabilities.get(asId<"capability">(capabilityId)) : undefined;
+    const stepInput = withWorkspaceRootDefault(step.input && typeof step.input === "object" ? step.input : {}, workspaceRoot);
+    return {
+      ...step,
+      input: stepInput,
+      ...(manifest ? { manifest } : {}),
+      inferredResourceLocks: manifest ? resourceLocksFor(manifest.sideEffect, stepInput, { resolveWorkspacePath: deps.platform.resolveWorkspacePath.bind(deps.platform) }) : []
+    };
+  }));
+}
+
+function withWorkspaceRootDefault(input: JsonObject, workspaceRoot: string): JsonObject {
+  return typeof input.workspaceRoot === "string" ? input : { ...input, workspaceRoot };
+}
+
+function firstLockConflict(steps: readonly ResolvedPipelineStep[], lockOptions: ResourceLockNormalizationOptions): string | undefined {
+  const previousStepLocks: string[] = [];
   for (const step of steps) {
-    for (const lock of [...stringArray(step.resourceLocks), ...stringArray(step.lockScope)]) {
-      if (seen.has(lock)) return lock;
-      seen.add(lock);
+    const stepLocks = normalizeResourceLockStrings([...stringArray(step.resourceLocks), ...stringArray(step.lockScope), ...step.inferredResourceLocks], lockOptions);
+    for (const lock of stepLocks) {
+      if (previousStepLocks.some((previous) => resourceLockStringsConflict(previous, lock))) return lock;
     }
+    previousStepLocks.push(...stepLocks);
+  }
+  return undefined;
+}
+
+function firstParallelArtifactDependency(steps: readonly ResolvedPipelineStep[]): string | undefined {
+  for (const step of steps) {
+    const fromArtifacts = step.inputFromArtifacts && typeof step.inputFromArtifacts === "object" ? step.inputFromArtifacts : {};
+    const dependency = Object.entries(fromArtifacts).find((entry): entry is [string, string] => typeof entry[1] === "string" && entry[1].length > 0);
+    if (dependency) return `${stringValue(step.stepId) ?? "unnamed-step"}.${dependency[0]} -> ${dependency[1]}`;
   }
   return undefined;
 }

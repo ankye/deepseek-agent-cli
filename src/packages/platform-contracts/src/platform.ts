@@ -143,6 +143,10 @@ export interface ProcessRunObserver {
   readonly onProcessExit?: () => void;
 }
 
+export interface ProcessRunControl {
+  readonly signal?: AbortSignal;
+}
+
 export interface ProcessRunOptions extends JsonObject {
   readonly cwd?: string;
   readonly timeoutMs?: number;
@@ -159,6 +163,13 @@ export interface SearchResult {
   readonly engine: "rg" | "grep" | "select-string" | "js";
   readonly fallbackReason?: string;
   readonly metadata?: PlatformProviderResultMetadata;
+}
+
+export interface PlatformPathStat extends JsonObject {
+  readonly path: string;
+  readonly kind: "file" | "directory" | "other";
+  readonly sizeBytes: number;
+  readonly mtimeMs: number;
 }
 
 export interface PlatformRuntime {
@@ -181,9 +192,14 @@ export interface PlatformRuntime {
   permissionDiagnostics(path: string): Promise<readonly PlatformPersistenceDiagnostic[]>;
   readFile(path: string): Promise<string>;
   writeFile(path: string, content: string): Promise<void>;
+  appendFile(path: string, content: string): Promise<void>;
+  statPath(path: string): Promise<PlatformPathStat>;
+  copyPath(sourcePath: string, targetPath: string, options?: { readonly overwrite?: boolean; readonly recursive?: boolean }): Promise<void>;
+  movePath(sourcePath: string, targetPath: string, options?: { readonly overwrite?: boolean }): Promise<void>;
+  deletePath(path: string, options?: { readonly recursive?: boolean }): Promise<void>;
   findFiles(pattern: string, root: string): Promise<readonly string[]>;
   searchText(pattern: string, root: string): Promise<readonly SearchResult[]>;
-  runProcess(command: string, args: readonly string[], options?: ProcessRunOptions, observer?: ProcessRunObserver): Promise<ProcessResult>;
+  runProcess(command: string, args: readonly string[], options?: ProcessRunOptions, observer?: ProcessRunObserver, control?: ProcessRunControl): Promise<ProcessResult>;
   availability(): Promise<JsonObject>;
 }
 

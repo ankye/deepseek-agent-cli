@@ -143,11 +143,39 @@ function matchMultiline(content: string, regex: RegExp): Array<{ line: number; t
 function matchesGlob(filePath: string, glob: string): boolean {
   if (!glob) return true;
   const normalized = filePath.replace(/\\/g, "/");
-  const regex = new RegExp(`^${glob
-    .replace(/[.+^${}()|[\]]/g, "\\$&")
-    .replace(/\*\*\//g, "(?:.*/)?")
-    .replace(/\*\*/g, ".*")
-    .replace(/\*/g, "[^/]*")
-    .replace(/\?/g, "[^/]")}$`);
+  const regex = new RegExp(`^${globToRegexSource(glob)}$`);
   return regex.test(normalized) || regex.test(normalized.split("/").pop() ?? "");
+}
+
+function globToRegexSource(glob: string): string {
+  let source = "";
+  for (let index = 0; index < glob.length; index += 1) {
+    const char = glob[index];
+    const next = glob[index + 1];
+    if (char === "*" && next === "*" && glob[index + 2] === "/") {
+      source += "(?:.*/)?";
+      index += 2;
+      continue;
+    }
+    if (char === "*" && next === "*") {
+      source += ".*";
+      index += 1;
+      continue;
+    }
+    if (char === "*") {
+      source += "[^/]*";
+      continue;
+    }
+    if (char === "?") {
+      source += "[^/]";
+      continue;
+    }
+    source += escapeRegexChar(char);
+  }
+  return source;
+}
+
+function escapeRegexChar(char: string | undefined): string {
+  if (!char) return "";
+  return /[\\^$.*+?()[\]{}|]/.test(char) ? `\\${char}` : char;
 }

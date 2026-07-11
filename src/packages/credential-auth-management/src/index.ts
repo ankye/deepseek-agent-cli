@@ -21,6 +21,23 @@ import { join } from "node:path";
 
 export type DeepSeekCredentialEnv = Readonly<Record<"DEEPSEEK_API_KEY" | "DEEPSEEK_TOKEN", string | undefined>>;
 export type GlmAnthropicCredentialEnv = Readonly<Record<"GLM_ANTHROPIC_API_KEY" | "ZHIPU_API_KEY", string | undefined>>;
+export type LiveCredentialSourceClass =
+  | "process-env"
+  | "workspace-env-file"
+  | "launch-workspace-env-file"
+  | "missing";
+
+export interface LiveCredentialResolutionSummary {
+  readonly provider: "deepseek" | "glm";
+  readonly available: boolean;
+  readonly sourceClass: LiveCredentialSourceClass;
+  readonly redaction: { readonly class: "secret"; readonly fields: readonly string[] };
+}
+
+export interface LiveCredentialResolution<TEnv extends Record<string, string | undefined>> {
+  readonly env: TEnv;
+  readonly summary: LiveCredentialResolutionSummary;
+}
 export type DiagnosticsEnvironmentPresenceEnv = Readonly<Record<
   "DOCKER_HOST" |
   "HOME" |
@@ -195,20 +212,62 @@ export async function createDeepSeekCredentialAuthServiceFromEnv(env: Readonly<R
 }
 
 export async function deepSeekLiveCredentialProcessEnv(platform: Pick<PlatformRuntime, "readFile">, cwd = process.cwd(), env: Readonly<Record<string, string | undefined>> = process.env): Promise<DeepSeekCredentialEnv> {
+  return (await deepSeekLiveCredentialResolution(platform, cwd, env)).env;
+}
+
+export async function deepSeekLiveCredentialResolution(platform: Pick<PlatformRuntime, "readFile">, cwd = process.cwd(), env: Readonly<Record<string, string | undefined>> = process.env): Promise<LiveCredentialResolution<DeepSeekCredentialEnv>> {
   const envFile = await readDeepSeekCredentialEnvFile(platform, join(cwd, ".env"));
   const launchEnvFile = await readLaunchCredentialEnvFile(platform, cwd, env, readDeepSeekCredentialEnvFile, { DEEPSEEK_API_KEY: undefined, DEEPSEEK_TOKEN: undefined });
-  return {
+  const sourceClass = credentialSourceClass(
+    hasValue(env.DEEPSEEK_API_KEY) || hasValue(env.DEEPSEEK_TOKEN),
+    hasValue(envFile.DEEPSEEK_API_KEY) || hasValue(envFile.DEEPSEEK_TOKEN),
+    hasValue(launchEnvFile.DEEPSEEK_API_KEY) || hasValue(launchEnvFile.DEEPSEEK_TOKEN)
+  );
+  const resolved = {
     DEEPSEEK_API_KEY: firstNonEmpty(env.DEEPSEEK_API_KEY, envFile.DEEPSEEK_API_KEY, launchEnvFile.DEEPSEEK_API_KEY),
     DEEPSEEK_TOKEN: firstNonEmpty(env.DEEPSEEK_TOKEN, envFile.DEEPSEEK_TOKEN, launchEnvFile.DEEPSEEK_TOKEN)
+  };
+  return {
+    env: resolved,
+    summary: credentialResolutionSummary("deepseek", sourceClass, hasValue(resolved.DEEPSEEK_API_KEY) || hasValue(resolved.DEEPSEEK_TOKEN))
   };
 }
 
 export async function glmAnthropicLiveCredentialProcessEnv(platform: Pick<PlatformRuntime, "readFile">, cwd = process.cwd(), env: Readonly<Record<string, string | undefined>> = process.env): Promise<GlmAnthropicCredentialEnv> {
+  return (await glmAnthropicLiveCredentialResolution(platform, cwd, env)).env;
+}
+
+export async function glmAnthropicLiveCredentialResolution(platform: Pick<PlatformRuntime, "readFile">, cwd = process.cwd(), env: Readonly<Record<string, string | undefined>> = process.env): Promise<LiveCredentialResolution<GlmAnthropicCredentialEnv>> {
   const envFile = await readGlmAnthropicCredentialEnvFile(platform, join(cwd, ".env"));
   const launchEnvFile = await readLaunchCredentialEnvFile(platform, cwd, env, readGlmAnthropicCredentialEnvFile, { GLM_ANTHROPIC_API_KEY: undefined, ZHIPU_API_KEY: undefined });
-  return {
+  const sourceClass = credentialSourceClass(
+    hasValue(env.GLM_ANTHROPIC_API_KEY) || hasValue(env.ZHIPU_API_KEY),
+    hasValue(envFile.GLM_ANTHROPIC_API_KEY) || hasValue(envFile.ZHIPU_API_KEY),
+    hasValue(launchEnvFile.GLM_ANTHROPIC_API_KEY) || hasValue(launchEnvFile.ZHIPU_API_KEY)
+  );
+  const resolved = {
     GLM_ANTHROPIC_API_KEY: firstNonEmpty(env.GLM_ANTHROPIC_API_KEY, envFile.GLM_ANTHROPIC_API_KEY, launchEnvFile.GLM_ANTHROPIC_API_KEY),
     ZHIPU_API_KEY: firstNonEmpty(env.ZHIPU_API_KEY, envFile.ZHIPU_API_KEY, launchEnvFile.ZHIPU_API_KEY)
+  };
+  return {
+    env: resolved,
+    summary: credentialResolutionSummary("glm", sourceClass, hasValue(resolved.GLM_ANTHROPIC_API_KEY) || hasValue(resolved.ZHIPU_API_KEY))
+  };
+}
+
+function credentialSourceClass(processEnv: boolean, workspaceEnvFile: boolean, launchWorkspaceEnvFile: boolean): LiveCredentialSourceClass {
+  if (processEnv) return "process-env";
+  if (workspaceEnvFile) return "workspace-env-file";
+  if (launchWorkspaceEnvFile) return "launch-workspace-env-file";
+  return "missing";
+}
+
+function credentialResolutionSummary(provider: "deepseek" | "glm", sourceClass: LiveCredentialSourceClass, available: boolean): LiveCredentialResolutionSummary {
+  return {
+    provider,
+    available,
+    sourceClass,
+    redaction: { class: "secret", fields: ["env"] }
   };
 }
 

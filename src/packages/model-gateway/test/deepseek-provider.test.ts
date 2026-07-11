@@ -24,7 +24,7 @@ import {
 } from "../src/index.js";
 import { asId } from "@deepseek/platform-contracts";
 import { InMemoryCapabilityRegistry } from "@deepseek/capability-registry";
-import type { CredentialRef, ModelRequest, ModelStreamEvent } from "@deepseek/platform-contracts";
+import type { CredentialRef, ModelProviderRequest, ModelProviderResponseChunk, ModelProviderTransport, ModelRequest, ModelStreamEvent } from "@deepseek/platform-contracts";
 
 async function collect(iterable: AsyncIterable<ModelStreamEvent>): Promise<readonly ModelStreamEvent[]> {
   const events: ModelStreamEvent[] = [];
@@ -46,6 +46,22 @@ function countAnthropicCacheControls(value: unknown): number {
   const object = value as { readonly cache_control?: unknown; readonly content?: unknown };
   return (typeof object.cache_control === "object" && object.cache_control !== null ? 1 : 0)
     + countAnthropicCacheControls(object.content);
+}
+
+class FailOnceModelProviderTransport implements ModelProviderTransport {
+  readonly requests: ModelProviderRequest[] = [];
+  private failed = false;
+
+  constructor(private readonly chunks: readonly ModelProviderResponseChunk[]) {}
+
+  async *stream(request: ModelProviderRequest): AsyncIterable<ModelProviderResponseChunk> {
+    this.requests.push(request);
+    if (!this.failed) {
+      this.failed = true;
+      throw new Error("transient network failure");
+    }
+    for (const chunk of this.chunks) yield chunk;
+  }
 }
 
 describe("DeepSeek OpenAI provider", () => {
@@ -380,6 +396,35 @@ describe("DeepSeek OpenAI provider", () => {
     assert.equal(usage?.kind === "usage" ? usage.metadata?.cache?.hitRate : undefined, 0.7);
   });
 
+  it("derives DeepSeek cache misses from prompt tokens when only cached token details are returned", async () => {
+    const transport = new FixtureModelProviderTransport([
+      {
+        data: {
+          choices: [{ delta: { content: "ok" }, finish_reason: "stop" }],
+          usage: {
+            prompt_tokens: 100,
+            completion_tokens: 2,
+            prompt_tokens_details: {
+              cached_tokens: 90
+            }
+          }
+        }
+      }
+    ]);
+    const provider = new DeepSeekOpenAIProvider({ transport, credentials: new StaticCredentialProvider("sk-test") });
+    const events = await collect(provider.stream({
+      profile: defaultDeepSeekProfile,
+      prompt: "hello",
+      metadata: { contextPipeline: { pipelineFingerprint: "pipeline:test" } }
+    }));
+
+    const usage = events.find((event) => event.kind === "usage");
+    assert.equal(usage?.kind === "usage" ? usage.metadata?.cache?.status : undefined, "available");
+    assert.equal(usage?.kind === "usage" ? usage.metadata?.cache?.hitTokens : undefined, 90);
+    assert.equal(usage?.kind === "usage" ? usage.metadata?.cache?.missTokens : undefined, 10);
+    assert.equal(usage?.kind === "usage" ? usage.metadata?.cache?.hitRate : undefined, 0.9);
+  });
+
   it("marks provider cache metrics unavailable when a fingerprint has no cache counts", async () => {
     const transport = new FixtureModelProviderTransport([
       {
@@ -405,7 +450,7 @@ describe("DeepSeek OpenAI provider", () => {
     assert.equal(usage?.kind === "usage" ? usage.metadata?.cache?.hitTokens : undefined, undefined);
   });
 
-  it("projects provider cache hints only when capability metadata supports them", async () => {
+  it("does not send synthetic DeepSeek cache_control fields for automatic provider prefix caching", async () => {
     const metadata = {
       contextPipeline: {
         pipelineFingerprint: "pipeline:test",
@@ -418,7 +463,16 @@ describe("DeepSeek OpenAI provider", () => {
       }
     };
     const unsupportedTransport = new FixtureModelProviderTransport([{ data: { choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] } }]);
-    const unsupported = new DeepSeekOpenAIProvider({ transport: unsupportedTransport, credentials: new StaticCredentialProvider("sk-test") });
+    const unsupported = new DeepSeekOpenAIProvider({
+      transport: unsupportedTransport,
+      credentials: new StaticCredentialProvider("sk-test"),
+      config: {
+        ...deepSeekOpenAIProviderConfig,
+        cacheHints: {
+          explicitPrefixCacheHints: false
+        }
+      }
+    });
     await collect(unsupported.stream({ profile: defaultDeepSeekProfile, prompt: "hello", metadata }));
 
     assert.equal(unsupportedTransport.requests[0]?.body.cache_control, undefined);
@@ -438,15 +492,49 @@ describe("DeepSeek OpenAI provider", () => {
     });
     await collect(supported.stream({ profile: defaultDeepSeekProfile, prompt: "hello", metadata }));
 
-    assert.deepEqual(supportedTransport.requests[0]?.body.cache_control, {
-      type: "deepseek-prefix-cache",
-      pipeline_fingerprint: "pipeline:test",
-      stable_blocks: 2,
-      ephemeral_blocks: 1,
-      no_store_blocks: 0,
-      ttl_blocks: 0,
-      max_hint_blocks: 8
+    assert.equal(supportedTransport.requests[0]?.body.cache_control, undefined);
+  });
+
+  it("observes DeepSeek automatic prefix cache usage without claiming an explicit cache hint was sent", async () => {
+    const metadata = {
+      contextPipeline: {
+        pipelineFingerprint: "pipeline:test",
+        cacheHintSummary: {
+          stable: 2,
+          ephemeral: 1,
+          noStore: 0,
+          ttlBound: 0
+        }
+      }
+    };
+    const transport = new FixtureModelProviderTransport([
+      {
+        data: {
+          id: "request-1",
+          choices: [{ delta: { content: "ok" }, finish_reason: "stop" }],
+          usage: {
+            prompt_tokens: 10,
+            completion_tokens: 2,
+            prompt_tokens_details: { cached_tokens: 8 }
+          }
+        }
+      }
+    ]);
+    const provider = new DeepSeekOpenAIProvider({
+      transport,
+      credentials: new StaticCredentialProvider("sk-test")
     });
+    const events = await collect(provider.stream({
+      profile: defaultDeepSeekProfile,
+      prompt: "hello",
+      metadata
+    }));
+    const usage = events.find((event) => event.kind === "usage");
+
+    assert.equal(transport.requests[0]?.body.cache_control, undefined);
+    assert.equal(usage?.kind === "usage" ? usage.metadata?.cache?.explicitPrefixCacheHint?.status : undefined, "unsupported");
+    assert.equal(usage?.kind === "usage" ? usage.metadata?.cache?.explicitPrefixCacheHint?.reasonCode : undefined, "PROVIDER_AUTOMATIC_PREFIX_CACHE_ONLY");
+    assert.equal(usage?.kind === "usage" ? usage.metadata?.cache?.breakpointShape : undefined, undefined);
   });
 
   it("normalizes provider error chunks and transport failures", async () => {
@@ -471,6 +559,23 @@ describe("DeepSeek OpenAI provider", () => {
     const events = await collect(provider.stream({ profile: defaultDeepSeekProfile, prompt: "hello" }));
     assert.equal(events[0]?.kind, "error");
     assert.equal(events[0]?.kind === "error" ? events[0].error.code : "", "PROVIDER_TRANSPORT_FAILED");
+  });
+
+  it("retries a transient DeepSeek transport failure inside one provider stream", async () => {
+    const transport = new FailOnceModelProviderTransport([
+      { data: { choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] } }
+    ]);
+    const provider = new DeepSeekOpenAIProvider({
+      transport,
+      credentials: new StaticCredentialProvider("sk-test")
+    });
+
+    const events = await collect(provider.stream({ profile: defaultDeepSeekProfile, prompt: "hello" }));
+
+    assert.equal(transport.requests.length, 2);
+    assert.equal(events.some((event) => event.kind === "error"), false);
+    assert.equal(events.some((event) => event.kind === "delta" && event.text === "ok"), true);
+    assert.equal(events.at(-1)?.kind, "done");
   });
 
   it("parses OpenAI-style SSE chunks through fetch transport", async () => {
@@ -735,6 +840,25 @@ describe("GLM Anthropic-compatible provider", () => {
     assert.equal(result?.provider.provider, "glm");
     assert.equal(result?.provider.protocol, "anthropic-messages");
     assert.equal(result?.provider.model, "glm-5.1");
+  });
+
+  it("retries a transient GLM transport failure inside one provider stream", async () => {
+    const transport = new FailOnceModelProviderTransport([
+      { data: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } } },
+      { data: { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } } },
+      { data: { type: "message_stop" } }
+    ]);
+    const provider = new GlmAnthropicProvider({
+      transport,
+      credentials: new StaticCredentialProvider("glm-test", glmAnthropicProviderConfig.credentialRef)
+    });
+
+    const events = await collect(provider.stream({ profile: defaultGlmAnthropicProfile, prompt: "hello" }));
+
+    assert.equal(transport.requests.length, 2);
+    assert.equal(events.some((event) => event.kind === "error"), false);
+    assert.equal(events.some((event) => event.kind === "delta" && event.text === "ok"), true);
+    assert.equal(events.at(-1)?.kind, "done");
   });
 
   it("projects GLM Anthropic system cache hints only when capability metadata supports them", async () => {
@@ -1078,13 +1202,13 @@ describe("GLM Anthropic-compatible provider", () => {
 
     const messages = request.body.messages as readonly { readonly content?: unknown }[];
     assert.equal(hasAnthropicCacheControl(request.body.system), false);
-    assert.equal(hasAnthropicCacheControl(request.body.tools), false);
+    assert.equal(hasAnthropicCacheControl(request.body.tools), true);
     assert.equal(countAnthropicCacheControls(messages), 1);
     assert.equal(hasAnthropicCacheControl(messages[0]?.content), true);
     assert.equal(hasAnthropicCacheControl(messages.at(-1)?.content), false);
   });
 
-  it("uses the stable task prompt as the only GLM Anthropic cache breakpoint", () => {
+  it("uses the stable task prompt and tool schema as GLM Anthropic cache breakpoints", () => {
     const metadata = {
       contextPipeline: {
         pipelineFingerprint: "pipeline:test",
@@ -1124,9 +1248,64 @@ describe("GLM Anthropic-compatible provider", () => {
 
     const messages = request.body.messages as readonly { readonly content?: unknown }[];
     assert.equal(hasAnthropicCacheControl(request.body.system), false);
-    assert.equal(hasAnthropicCacheControl(request.body.tools), false);
+    assert.equal(hasAnthropicCacheControl(request.body.tools), true);
     assert.equal(countAnthropicCacheControls(messages), 1);
     assert.equal(hasAnthropicCacheControl(messages[0]?.content), true);
+  });
+
+  it("keeps GLM Anthropic tool schemas cacheable when a stable task prompt defines the provider prefix", () => {
+    const metadata = {
+      contextPipeline: {
+        pipelineFingerprint: "pipeline:test",
+        cacheHintSummary: {
+          stable: 3,
+          ephemeral: 1,
+          noStore: 0,
+          ttlBound: 0
+        },
+        providerPrefixFingerprint: "provider-prefix:stable",
+        providerToolSchemaCount: 2,
+        toolPlanFingerprint: "tool-plan:stage-a"
+      }
+    };
+    const provider = new GlmAnthropicProvider({
+      transport: new FixtureModelProviderTransport([]),
+      credentials: new StaticCredentialProvider("glm-test", glmAnthropicProviderConfig.credentialRef)
+    });
+    const request = provider.buildProviderRequest({
+      profile: defaultGlmAnthropicProfile,
+      prompt: "SWE task",
+      messages: [
+        { role: "system", content: "stable system prefix", cacheHint: { policy: "stable" } },
+        { role: "user", content: "SWE task", cacheHint: { policy: "stable" } },
+        { role: "assistant", content: "", toolCalls: [{ id: "tool-1", name: "core_search_text", input: { query: "alpha" } }] },
+        { role: "tool", toolCallId: "tool-1", toolName: "core.search.text", content: "first dynamic result" }
+      ],
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "core_file_read",
+            description: "Read files.",
+            parameters: { type: "object", properties: { path: { type: "string" } } }
+          }
+        },
+        {
+          type: "function",
+          function: {
+            name: "core_search_text",
+            description: "Search files.",
+            parameters: { type: "object", properties: { query: { type: "string" } } }
+          }
+        }
+      ],
+      metadata
+    }, "glm-test");
+
+    const messages = request.body.messages as readonly { readonly content?: unknown }[];
+    assert.equal(countAnthropicCacheControls(messages), 1);
+    assert.equal(hasAnthropicCacheControl(messages[0]?.content), true);
+    assert.equal(hasAnthropicCacheControl(request.body.tools), true);
   });
 
   it("keeps the GLM Anthropic stable task prompt breakpoint when volatile system state is present", () => {
@@ -1172,7 +1351,7 @@ describe("GLM Anthropic-compatible provider", () => {
 
     const messages = request.body.messages as readonly { readonly content?: unknown }[];
     assert.equal(hasAnthropicCacheControl(request.body.system), false);
-    assert.equal(hasAnthropicCacheControl(request.body.tools), false);
+    assert.equal(hasAnthropicCacheControl(request.body.tools), true);
     assert.equal(countAnthropicCacheControls(messages), 1);
     assert.equal(hasAnthropicCacheControl(messages[0]?.content), true);
     assert.equal(hasAnthropicCacheControl(messages.at(-1)?.content), false);
@@ -1224,8 +1403,8 @@ describe("GLM Anthropic-compatible provider", () => {
     assert.deepEqual(usage?.kind === "usage" ? usage.metadata?.cache?.breakpointShape : undefined, {
       systemCacheControlCount: 0,
       messageCacheControlCount: 1,
-      toolCacheControlCount: 0,
-      totalCacheControlCount: 1,
+      toolCacheControlCount: 1,
+      totalCacheControlCount: 2,
       messageCacheControlPositions: ["first-message"],
       redaction: { class: "internal" }
     });
@@ -1251,7 +1430,7 @@ describe("GLM Anthropic-compatible provider", () => {
       profile: defaultGlmAnthropicProfile,
       prompt: "SWE task",
       messages: [
-        { role: "system", content: "stable system prefix", cacheHint: { policy: "stable" } },
+        { role: "system", content: "runtime instructions" },
         { role: "user", content: "SWE task" }
       ],
       tools: [
@@ -1430,6 +1609,96 @@ describe("GLM Anthropic-compatible provider", () => {
       }
     ]);
     assert.equal(usage?.kind === "usage" ? usage.metadata?.cache?.explicitPrefixCacheHint?.status : undefined, "sent");
+  });
+
+  it("sends the GLM Anthropic prompt-caching beta header when explicit cache breakpoints are present", () => {
+    const metadata = {
+      contextPipeline: {
+        pipelineFingerprint: "pipeline:test",
+        cacheHintSummary: {
+          stable: 2,
+          ephemeral: 1,
+          noStore: 0,
+          ttlBound: 0
+        }
+      }
+    };
+    const provider = new GlmAnthropicProvider({
+      transport: new FixtureModelProviderTransport([]),
+      credentials: new StaticCredentialProvider("glm-test", glmAnthropicProviderConfig.credentialRef)
+    });
+    const request = provider.buildProviderRequest({
+      profile: defaultGlmAnthropicProfile,
+      prompt: "SWE task",
+      messages: [
+        { role: "system", content: "stable system prefix", cacheHint: { policy: "stable" } },
+        { role: "user", content: "SWE task", cacheHint: { policy: "stable" } }
+      ],
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "core_file_read",
+            description: "Read files.",
+            parameters: { type: "object", properties: { path: { type: "string" } } }
+          }
+        }
+      ],
+      metadata
+    }, "glm-test");
+
+    assert.equal(request.headers["anthropic-beta"], "prompt-caching-2024-07-31");
+  });
+
+  it("keeps dynamic GLM Anthropic system guidance after the stable task cache breakpoint", () => {
+    const metadata = {
+      contextPipeline: {
+        pipelineFingerprint: "pipeline:test",
+        cacheHintSummary: {
+          stable: 2,
+          ephemeral: 1,
+          noStore: 0,
+          ttlBound: 0
+        }
+      }
+    };
+    const provider = new GlmAnthropicProvider({
+      transport: new FixtureModelProviderTransport([]),
+      credentials: new StaticCredentialProvider("glm-test", glmAnthropicProviderConfig.credentialRef)
+    });
+    const stableTask = "Resolve SWE task.\nProblem statement:\n" + "stable task details ".repeat(200);
+    const request = provider.buildProviderRequest({
+      profile: defaultGlmAnthropicProfile,
+      prompt: stableTask,
+      messages: [
+        { role: "system", content: "stable runtime contract", cacheHint: { policy: "stable" } },
+        { role: "system", content: "dynamic workflow state", cacheHint: { policy: "ephemeral" } },
+        { role: "user", content: stableTask, cacheHint: { policy: "stable" } },
+        { role: "assistant", content: "analysis tail" }
+      ],
+      metadata
+    }, "glm-test");
+
+    assert.deepEqual(request.body.system, [
+      {
+        type: "text",
+        text: "stable runtime contract"
+      }
+    ]);
+    assert.equal(Array.isArray(request.body.messages), true);
+    const messages = request.body.messages as readonly { readonly role?: unknown; readonly content?: unknown }[];
+    const firstContent = Array.isArray(messages[0]?.content)
+      ? messages[0]?.content[0]
+      : undefined;
+    const firstText = typeof firstContent === "object" && firstContent !== null && "text" in firstContent
+      ? String(firstContent.text)
+      : "";
+    assert.equal(messages[0]?.role, "user");
+    assert.equal(hasAnthropicCacheControl(messages[0]), true);
+    assert.equal(firstText, stableTask);
+    assert.equal(messages[1]?.role, "user");
+    assert.equal(String(messages[1]?.content).includes("dynamic workflow state"), true);
+    assert.equal(hasAnthropicCacheControl(messages[1]), false);
   });
 
   it("normalizes Anthropic text, tool-use, usage, finish, and done events", () => {

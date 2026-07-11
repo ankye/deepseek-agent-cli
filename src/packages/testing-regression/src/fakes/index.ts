@@ -128,7 +128,6 @@ export function createDeterministicRuntimeDependencies(options: DeterministicRun
     concurrency: new DeterministicScheduler(),
     agents: new InMemoryAgentManager(),
     models: new DeterministicMockModelGateway(),
-    toolIntentPreflight: new DeterministicToolIntentPreflight(),
     capabilities: new InMemoryCapabilityRegistry(),
     commands: new InMemoryCommandSystem(),
     skills: new InMemorySkillSystem(),
@@ -147,6 +146,9 @@ export function createDeterministicRuntimeDependencies(options: DeterministicRun
     sandbox: new DevelopmentSandboxRuntime(),
     sessions: new InMemorySessionStore(),
     platform,
+    toolIntentPreflight: new DeterministicToolIntentPreflight(undefined, {
+      resolveWorkspacePath: platform.resolveWorkspacePath.bind(platform)
+    }),
     evolution: new InMemoryEvolutionEngine(),
     codeIntelligence,
     remote: new NoopRemoteRuntimeConnectivity(),
@@ -170,6 +172,7 @@ export interface LiveCliDependencyOptions {
   readonly transport?: ModelProviderTransport;
   readonly timeoutMs?: number;
   readonly sessionsDirectory?: string;
+  readonly losslessContextDirectory?: string;
   readonly allowWorkspaceWrites?: boolean;
   readonly allowWorkspaceProcesses?: boolean;
 }
@@ -183,7 +186,7 @@ export function createLiveCliDependencies(options: LiveCliDependencyOptions = {}
     timeoutMs: options.timeoutMs ?? 90_000
   };
   const sessionsDir = options.sessionsDirectory ?? userSessionsDirectory();
-  const losslessContextDir = platform.resolvePath(platform.userConfigPath("deepseek"), "..", "lossless-context");
+  const losslessContextDir = options.losslessContextDirectory ?? platform.resolvePath(platform.userConfigPath("deepseek"), "..", "lossless-context");
   const sessions = (() => {
     try {
       return new PersistentFilesystemSessionStore(sessionsDir);
@@ -197,7 +200,10 @@ export function createLiveCliDependencies(options: LiveCliDependencyOptions = {}
     platform,
     losslessContext: new PersistentJsonlLosslessContextManager(platform, losslessContextDir),
     models: new DeepSeekOpenAIProvider(modelOptions),
-    policy: options.allowWorkspaceWrites || options.allowWorkspaceProcesses ? new WorkspaceWritePolicyEngine({ allowWorkspaceProcesses: options.allowWorkspaceProcesses === true }) : base.policy,
+    policy: options.allowWorkspaceWrites || options.allowWorkspaceProcesses ? new WorkspaceWritePolicyEngine({
+      allowWorkspaceTestProcesses: options.allowWorkspaceWrites === true,
+      allowWorkspaceProcesses: options.allowWorkspaceProcesses === true
+    }) : base.policy,
     sessions,
     backgroundTasks: new NodeBackgroundTaskManager()
   };
@@ -206,7 +212,10 @@ export function createLiveCliDependencies(options: LiveCliDependencyOptions = {}
 class WorkspaceWritePolicyEngine implements PolicyEngine {
   private readonly fallback = new DefaultPolicyEngine();
 
-  constructor(private readonly options: { readonly allowWorkspaceProcesses: boolean }) {}
+  constructor(private readonly options: {
+    readonly allowWorkspaceTestProcesses: boolean;
+    readonly allowWorkspaceProcesses: boolean;
+  }) {}
 
   async decide(request: PolicyRequest): Promise<PolicyDecision> {
     if (request.metadata.sideEffect === "write" && request.resourceScope?.kind === "filesystem") {
@@ -222,12 +231,14 @@ class WorkspaceWritePolicyEngine implements PolicyEngine {
         ...(request.auditEvidence ? { auditEvidence: request.auditEvidence } : {})
       };
     }
-    if (this.options.allowWorkspaceProcesses && request.metadata.sideEffect === "process" && request.resourceScope?.kind === "process") {
+    if (request.metadata.sideEffect === "process" && request.resourceScope?.kind === "process" && this.canRunWorkspaceProcess(request)) {
       const sandbox = selectSandboxDecision(request);
       if (sandbox.action !== "allow") return this.fallback.decide(request);
       return {
         action: "allow",
-        reason: "Live CLI policy allows workspace-scoped process execution.",
+        reason: requestPermissions(request).includes("process:test")
+          ? "Live CLI policy allows workspace-scoped test execution."
+          : "Live CLI policy allows workspace-scoped process execution.",
         audit: request.auditEvidence ?? { policy: "live-cli-workspace-process" },
         sandboxProfile: sandbox.profile,
         sandbox: { ...sandbox, reasonCodes: [...sandbox.reasonCodes, "policy.live-cli.workspace-process.allow"] },
@@ -237,4 +248,14 @@ class WorkspaceWritePolicyEngine implements PolicyEngine {
     }
     return this.fallback.decide(request);
   }
+
+  private canRunWorkspaceProcess(request: PolicyRequest): boolean {
+    if (this.options.allowWorkspaceProcesses) return true;
+    return this.options.allowWorkspaceTestProcesses && requestPermissions(request).includes("process:test");
+  }
+}
+
+function requestPermissions(request: PolicyRequest): readonly string[] {
+  const permissions = request.metadata.permissions;
+  return Array.isArray(permissions) ? permissions.filter((item): item is string => typeof item === "string") : [];
 }

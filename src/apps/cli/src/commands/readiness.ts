@@ -27,6 +27,8 @@ import { NodePlatformRuntime } from "@deepseek/platform-abstraction";
 import type { CliOptions } from "../types.js";
 import { collectReleaseReadinessEvidence } from "../diagnostics/release-evidence.js";
 import { resolveCliModelProfile } from "../host/model-selection.js";
+import { resolveCliWorkspaceRoot } from "../host/workspace-root.js";
+import type { CliRunOptions } from "../types.js";
 
 export function renderReadinessText(result: ReadinessCommandResult): readonly string[] {
   const lines = [`${result.command}: ${result.status}`];
@@ -39,9 +41,9 @@ export function renderReadinessText(result: ReadinessCommandResult): readonly st
   return lines;
 }
 
-export async function runReadinessCommand(options: CliOptions, write: (line: string) => Promise<void>): Promise<void> {
+export async function runReadinessCommand(options: CliOptions, write: (line: string) => Promise<void>, runOptions: CliRunOptions = {}): Promise<void> {
   if (!options.readinessCommand) return;
-  const environment = await createCliReadinessEnvironment(options);
+  const environment = await createCliReadinessEnvironment(options, runOptions);
   const result = await invokeLocalReadinessCommand(options.readinessCommand, options.readinessInput ?? {}, environment);
   if (!result.ok || !result.value) {
     await write(options.output === "text" ? `[readiness failed] ${result.error?.message ?? options.readinessCommand}` : JSON.stringify(result));
@@ -54,9 +56,9 @@ export async function runReadinessCommand(options: CliOptions, write: (line: str
   for (const line of renderReadinessText(result.value)) await write(line);
 }
 
-export async function createCliReadinessEnvironment(options: CliOptions): Promise<LocalReadinessEnvironment> {
+export async function createCliReadinessEnvironment(options: CliOptions, runOptions: CliRunOptions = {}): Promise<LocalReadinessEnvironment> {
   const platform = new NodePlatformRuntime();
-  const workspaceRoot = process.cwd();
+  const workspaceRoot = await resolveCliWorkspaceRoot(runOptions);
   const config = new PersistentConfigService({
     platform,
     workspaceRoot,

@@ -30,6 +30,8 @@ export interface GlmAnthropicProviderOptions {
   readonly timeoutMs?: number;
 }
 
+const TRANSIENT_TRANSPORT_MAX_ATTEMPTS = 2;
+
 export class GlmAnthropicProvider implements ModelGateway {
   private readonly config: ModelProviderConfig;
 
@@ -55,22 +57,29 @@ export class GlmAnthropicProvider implements ModelGateway {
     const providerRequest = this.buildProviderRequest(request, credential?.value);
     const explicitPrefixCacheHint = explicitPrefixCacheHintEvidence(request, providerRequest, this.config);
     const breakpointShape = anthropicCacheBreakpointShape(providerRequest.body);
-    const normalize = createGlmAnthropicChunkNormalizer();
-    let emittedDone = false;
-    try {
-      for await (const chunk of this.options.transport.stream(providerRequest, request.signal ? { signal: request.signal } : undefined)) {
-        for (const event of normalize(chunk, provider)) {
-          if (event.kind === "done") emittedDone = true;
-          yield attachPipelineCacheEvidence(event, pipelineFingerprint, explicitPrefixCacheHint, breakpointShape);
+    for (let attempt = 1; attempt <= TRANSIENT_TRANSPORT_MAX_ATTEMPTS; attempt += 1) {
+      const normalize = createGlmAnthropicChunkNormalizer();
+      let emittedDone = false;
+      let emittedProviderEvent = false;
+      try {
+        for await (const chunk of this.options.transport.stream(providerRequest, request.signal ? { signal: request.signal } : undefined)) {
+          for (const event of normalize(chunk, provider)) {
+            emittedProviderEvent = true;
+            if (event.kind === "done") emittedDone = true;
+            yield attachPipelineCacheEvidence(event, pipelineFingerprint, explicitPrefixCacheHint, breakpointShape);
+          }
         }
+        if (!emittedDone) yield { kind: "done", provider };
+        return;
+      } catch (error) {
+        if (!emittedProviderEvent && !request.signal?.aborted && attempt < TRANSIENT_TRANSPORT_MAX_ATTEMPTS) continue;
+        yield {
+          kind: "error",
+          error: providerError("PROVIDER_TRANSPORT_FAILED", error instanceof Error ? error.message : "GLM Anthropic-compatible provider transport failed.", true),
+          provider
+        };
+        return;
       }
-      if (!emittedDone) yield { kind: "done", provider };
-    } catch (error) {
-      yield {
-        kind: "error",
-        error: providerError("PROVIDER_TRANSPORT_FAILED", error instanceof Error ? error.message : "GLM Anthropic-compatible provider transport failed.", true),
-        provider
-      };
     }
   }
 

@@ -19,7 +19,7 @@ import type { TaskDeliveryFlowSummary } from "@deepseek/platform-contracts";
 import { invokeLocalReadinessCommand } from "@deepseek/command-system";
 import { InMemoryObservabilitySink } from "@deepseek/observability";
 import { NodePlatformRuntime } from "@deepseek/platform-abstraction";
-import type { CliOptions } from "../types.js";
+import type { CliOptions, CliRunOptions } from "../types.js";
 import { createCliReadinessEnvironment, renderReadinessText } from "../commands/readiness.js";
 import { activationEvidenceText, missingActivationEvidence } from "../commands/index-provider.js";
 import { collectReleaseReadinessEvidence, diagnosticPitIds, diagnosticsSchemaVersion } from "./release-evidence.js";
@@ -46,6 +46,8 @@ import { collectDiagnosticsFlowInspect, diagnosticsFlowInspectJsonLines } from "
 import { collectSweBenchCliDiagnostics } from "./swe-bench-cli-diagnostics.js";
 import { renderSweBenchPredictionText, sweBenchPredictionJsonLines } from "./swe-bench-prediction.js";
 import type { SweBenchPredictionSummary } from "./swe-bench-prediction.js";
+import type { CapabilityMatrixSummary } from "./capability-matrix-types.js";
+import { capabilityMatrixDiagnostics, capabilityMatrixJsonLines, renderCapabilityMatrixText } from "./capability-matrix-diagnostics.js";
 
 export interface CliDiagnosticNotice {
   readonly code: string;
@@ -54,7 +56,7 @@ export interface CliDiagnosticNotice {
 
 export interface CliDiagnosticsResult extends JsonObject {
   readonly schemaVersion: string;
-  readonly kind: "diagnostics.bundle" | "diagnostics.release" | "diagnostics.doctor" | "diagnostics.verify" | "diagnostics.refresh" | "diagnostics.evaluate" | "diagnostics.env.prepare" | "diagnostics.flow.inspect" | "diagnostics.swe-bench";
+  readonly kind: "diagnostics.bundle" | "diagnostics.release" | "diagnostics.doctor" | "diagnostics.verify" | "diagnostics.refresh" | "diagnostics.evaluate" | "diagnostics.env.prepare" | "diagnostics.flow.inspect" | "diagnostics.swe-bench" | "diagnostics.capability-matrix";
   readonly status: "pass" | "warn" | "fail";
   readonly command: DiagnosticsCommandName;
   readonly bundle?: DiagnosticBundle;
@@ -66,6 +68,7 @@ export interface CliDiagnosticsResult extends JsonObject {
   readonly environment?: DiagnosticsEnvironmentPrepareSummary;
   readonly flow?: TaskDeliveryFlowSummary;
   readonly sweBench?: SweBenchPredictionSummary;
+  readonly capabilityMatrix?: CapabilityMatrixSummary;
   readonly evaluation?: CliEvaluationComparisonSummary;
   readonly indexProviders?: IndexProviderDiagnosticsSummary;
   readonly modeMatrix?: CliModeMatrixSummary;
@@ -74,7 +77,7 @@ export interface CliDiagnosticsResult extends JsonObject {
   readonly redaction: { readonly class: "internal"; readonly fields?: readonly string[] };
 }
 
-export async function runDiagnosticsCommand(options: CliOptions, write: (line: string) => Promise<void>): Promise<void> {
+export async function runDiagnosticsCommand(options: CliOptions, write: (line: string) => Promise<void>, runOptions: CliRunOptions = {}): Promise<void> {
   const command = options.diagnosticsCommand ?? "bundle";
   let progressWrites = Promise.resolve();
   const progressSink: EvaluationProgressSink | undefined = command === "evaluate" && options.output === "text"
@@ -84,20 +87,21 @@ export async function runDiagnosticsCommand(options: CliOptions, write: (line: s
         }
       }
     : undefined;
-  const result = await collectCliDiagnostics(command, options, progressSink);
+  const result = await collectCliDiagnostics(command, options, progressSink, runOptions);
   await progressWrites;
   for (const line of renderDiagnosticsResult(result, options.output)) await write(line);
 }
 
-export async function collectCliDiagnostics(command: DiagnosticsCommandName, options: CliOptions, progressSink?: EvaluationProgressSink): Promise<CliDiagnosticsResult> {
+export async function collectCliDiagnostics(command: DiagnosticsCommandName, options: CliOptions, progressSink?: EvaluationProgressSink, runOptions: CliRunOptions = {}): Promise<CliDiagnosticsResult> {
   if (command === "release") return releaseDiagnostics(options);
   if (command === "verify") return verifyDiagnostics(options);
   if (command === "refresh") return refreshDiagnostics(options);
   if (command === "env") return environmentDiagnostics(options);
   if (command === "flow") return flowDiagnostics(options);
-  if (command === "swe-bench") return collectSweBenchCliDiagnostics(options);
+  if (command === "swe-bench") return collectSweBenchCliDiagnostics(options, runOptions);
+  if (command === "capability-matrix") return capabilityMatrixDiagnostics(options);
   if (command === "evaluate") return evaluateDiagnostics(options, progressSink);
-  if (command === "doctor") return doctorDiagnostics(options);
+  if (command === "doctor") return doctorDiagnostics(options, runOptions);
   return bundleDiagnostics(options);
 }
 
@@ -222,6 +226,9 @@ export function renderDiagnosticsResult(result: CliDiagnosticsResult, output: Ag
   }
   if (result.sweBench) {
     lines.push(...renderSweBenchPredictionText(result.sweBench));
+  }
+  if (result.capabilityMatrix) {
+    lines.push(...renderCapabilityMatrixText(result.capabilityMatrix));
   }
   if (result.evaluation) {
     lines.push(`- mode: ${result.evaluation.mode}`);
@@ -454,9 +461,9 @@ async function writeEvaluationDeliveryCapabilityEvidence(
   await platform.writeFile(outputPath, `${JSON.stringify(evidence, null, 2)}\n`);
 }
 
-async function doctorDiagnostics(options: CliOptions): Promise<CliDiagnosticsResult> {
+async function doctorDiagnostics(options: CliOptions, runOptions: CliRunOptions): Promise<CliDiagnosticsResult> {
   const live = options.live === true;
-  const environment = await createCliReadinessEnvironment({ ...options, readinessCommand: "doctor", readinessInput: { live } });
+  const environment = await createCliReadinessEnvironment({ ...options, readinessCommand: "doctor", readinessInput: { live } }, runOptions);
   const readiness = await invokeLocalReadinessCommand("doctor", { live }, environment);
   const releaseRaw = await collectReleaseReadinessEvidence({
     productReadyClaims: productReadyClaimsFromInput(options.diagnosticsInput)
@@ -726,6 +733,9 @@ function diagnosticsJsonLines(result: CliDiagnosticsResult): readonly JsonObject
   if (result.flow) {
     entries.push(...diagnosticsFlowInspectJsonLines(result.schemaVersion, result.flow));
   }
+  if (result.capabilityMatrix) {
+    entries.push(...capabilityMatrixJsonLines(result.schemaVersion, result.capabilityMatrix));
+  }
   if (result.sweBench) {
     entries.push(...sweBenchPredictionJsonLines(result.sweBench));
   }
@@ -767,10 +777,7 @@ function diagnosticsJsonLines(result: CliDiagnosticsResult): readonly JsonObject
   return entries;
 }
 
-function filteredGovernance(
-  release: DiagnosticsReleaseReadinessEvidence,
-  filter: GovernanceDiagnosticsFilter | undefined
-): Pick<DiagnosticsReleaseReadinessEvidence, "governanceDiagnostics"> {
+function filteredGovernance(release: DiagnosticsReleaseReadinessEvidence, filter: GovernanceDiagnosticsFilter | undefined): Pick<DiagnosticsReleaseReadinessEvidence, "governanceDiagnostics"> {
   const governanceDiagnostics = filterGovernanceDiagnostics(release.governanceDiagnostics, filter);
   return governanceDiagnostics ? { governanceDiagnostics } : {};
 }

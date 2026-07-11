@@ -21,12 +21,24 @@ class FakeSweBenchRunPlatform extends FakePlatformRuntime {
   readonly datasetInstances = new Map<number, Partial<SweBenchDatasetFixture>>();
   private readonly fileMtimeMs = new Map<string, number>();
   private fileClock = 0;
-  agentStdout = JSON.stringify({ kind: "agent.loop.completed", data: { status: "completed" } }) + "\n";
+  agentStdout = solvedChildTrace();
   agentStdouts: string[] = [];
+  datasetResolverExitCode = 0;
   resolveOnSecondHarness = false;
   resolvedTaskNumbers = new Set<number>();
   harnessTestOutputByInstanceId = new Map<string, string>();
   checkoutEditableInstallExitCode = 0;
+  checkoutCloneExitCode = 0;
+  checkoutCloneOutput = "cloned\n";
+  gitDiffOutput = [
+    "diff --git a/src/example.py b/src/example.py",
+    "--- a/src/example.py",
+    "+++ b/src/example.py",
+    "@@ -1 +1 @@",
+    "-old",
+    "+new",
+    ""
+  ].join("\n");
   skipHarnessReportWrite = false;
   repoAlreadyExists = false;
   checkoutRequiresPreClean = false;
@@ -34,6 +46,7 @@ class FakeSweBenchRunPlatform extends FakePlatformRuntime {
   harnessRunCount = 0;
   agentRunCount = 0;
   datasetRequests: number[] = [];
+  dockerInfoExitCode = 0;
   private preCheckoutCleanSeen = false;
 
   override async writeFile(path: string, content: string): Promise<void> {
@@ -60,6 +73,7 @@ class FakeSweBenchRunPlatform extends FakePlatformRuntime {
     });
     if (args[0] === "-c" && String(command).includes(".deepseek/swebench-venv/bin/python")) {
       const taskNumber = Number(args[2] ?? 2);
+      if (this.datasetResolverExitCode !== 0) return result("dataset timeout\n", this.datasetResolverExitCode);
       const fixture = this.datasetInstances.get(taskNumber);
       this.datasetRequests.push(taskNumber);
       return result(JSON.stringify({
@@ -77,7 +91,7 @@ class FakeSweBenchRunPlatform extends FakePlatformRuntime {
     if (command === "git" && args[0] === "-C" && this.gitIndexLockExists && (args[2] === "reset" || args[2] === "checkout" || args[2] === "clean")) {
       return result("fatal: Unable to create '.git/index.lock': File exists.\n", 128);
     }
-    if (command === "git" && args[0] === "clone") return result("cloned\n");
+    if (command === "git" && args[0] === "clone") return result(this.checkoutCloneOutput, this.checkoutCloneExitCode);
     if (command === "git" && args[0] === "-C" && args[2] === "clean") {
       if (!this.executedCommands.some((entry) => entry.command === "git" && entry.args[2] === "checkout")) {
         this.preCheckoutCleanSeen = true;
@@ -91,7 +105,12 @@ class FakeSweBenchRunPlatform extends FakePlatformRuntime {
     if (String(command).endsWith("/.venv/bin/python") && args[0] === "-m" && args[1] === "pip" && args[2] === "install" && args[3] === "-e") {
       return result(this.checkoutEditableInstallExitCode === 0 ? "installed\n" : "editable install failed\n", this.checkoutEditableInstallExitCode);
     }
-    if (command === "docker" && args[0] === "context" && args[1] === "inspect") return result("\"unix:///workspace/.colima/default/docker.sock\"\n");
+    if (command === "docker" && args[0] === "info") {
+      return result(this.dockerInfoExitCode === 0 ? "\"24.0.0\"\n" : "Cannot connect to the Docker daemon\n", this.dockerInfoExitCode);
+    }
+    if (command === "docker" && args[0] === "context" && args[1] === "inspect") {
+      return result("\"unix:///workspace/.colima/default/docker.sock\"\n");
+    }
     if (args.includes("swebench.harness.run_evaluation")) {
       this.harnessRunCount += 1;
       const cwd = typeof options.cwd === "string" ? options.cwd : "/workspace/.deepseek/swe-lite-runs/unit-run/harness";
@@ -120,15 +139,7 @@ class FakeSweBenchRunPlatform extends FakePlatformRuntime {
       return result("Evaluation complete\n");
     }
     if (command === "git" && args[0] === "diff") {
-      return result([
-        "diff --git a/src/example.py b/src/example.py",
-        "--- a/src/example.py",
-        "+++ b/src/example.py",
-        "@@ -1 +1 @@",
-        "-old",
-        "+new",
-        ""
-      ].join("\n"));
+      return result(this.gitDiffOutput);
     }
     if (command === process.execPath) {
       this.agentRunCount += 1;
@@ -143,6 +154,28 @@ interface SweBenchDatasetFixture {
   readonly repo: string;
   readonly baseCommit: string;
   readonly problemStatement: string;
+}
+
+function solvedChildTrace(): string {
+  return [
+    JSON.stringify({ kind: "model.requested", data: { iteration: 1 } }),
+    JSON.stringify({ kind: "model.tool.intent", data: { toolCallId: "edit-1", name: "core.file.edit", input: { path: "src/example.py" } } }),
+    JSON.stringify({ kind: "model.tool.result", data: { toolCallId: "edit-1", toolName: "core.file.edit", terminalKind: "capability.completed" } }),
+    JSON.stringify({ kind: "model.tool.intent", data: { toolCallId: "test-1", name: "core.test.run", input: { command: "python", args: ["-m", "pytest", "tests/test_demo.py"] } } }),
+    JSON.stringify({ kind: "model.tool.result", data: { toolCallId: "test-1", toolName: "core.test.run", terminalKind: "capability.completed", output: "1 passed" } }),
+    JSON.stringify({ kind: "agent.loop.completed", data: { status: "completed", reason: "workflow-stages-completed" } })
+  ].join("\n") + "\n";
+}
+
+function solvedChildTraceWithTerminal(terminalEvents: readonly JsonObject[]): string {
+  return [
+    JSON.stringify({ kind: "model.requested", data: { iteration: 1 } }),
+    JSON.stringify({ kind: "model.tool.intent", data: { toolCallId: "edit-1", name: "core.file.edit", input: { path: "src/example.py" } } }),
+    JSON.stringify({ kind: "model.tool.result", data: { toolCallId: "edit-1", toolName: "core.file.edit", terminalKind: "capability.completed" } }),
+    JSON.stringify({ kind: "model.tool.intent", data: { toolCallId: "test-1", name: "core.test.run", input: { command: "python", args: ["-m", "pytest", "tests/test_demo.py"] } } }),
+    JSON.stringify({ kind: "model.tool.result", data: { toolCallId: "test-1", toolName: "core.test.run", terminalKind: "capability.completed", output: "1 passed" } }),
+    ...terminalEvents.map((event) => JSON.stringify(event))
+  ].join("\n") + "\n";
 }
 
 describe("CLI SWE-bench run capability", () => {
@@ -191,7 +224,604 @@ describe("CLI SWE-bench run capability", () => {
     assert.equal(platform.executedCommands.some((entry) => entry.command === "git" && entry.args.includes("checkout")), true);
   });
 
-  it("normalizes explicit low SWE-bench run timeouts before launching the child CLI", async () => {
+  it("uses active runtime model metadata when a model tool call omits model selection", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      runId: "unit-run-active-model"
+    }, capabilityContext({ activeModel: "glm-5.2", activeModelProvider: "glm" }));
+
+    assert.equal(execution.ok, true);
+    const child = platform.executedCommands.find(isAgentRunCommand);
+    assert.equal(argAfter(child?.args ?? [], "--provider"), "glm");
+    assert.equal(argAfter(child?.args ?? [], "--model"), "glm-5.2");
+  });
+
+  it("does not rewrite invalid provider input to a concrete child provider", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace");
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      provider: "provider-deepseek",
+      model: "deepseek-v4-flash",
+      runId: "unit-run-invalid-provider"
+    }, capabilityContext());
+
+    assert.equal(execution.ok, false);
+    const metadata = (execution.value as { evidence?: { metadata?: JsonObject } }).evidence?.metadata;
+    assert.equal(metadata?.provider, "unknown");
+    assert.equal(platform.executedCommands.find(isAgentRunCommand), undefined);
+  });
+
+  it("passes the selected DeepSeek provider to the managed child agent", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: {
+        DEEPSEEK_API_KEY: "fixture-secret-value",
+        GLM_ANTHROPIC_API_KEY: "fixture-secret-value"
+      }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "deepseek",
+      model: "deepseek-v4-flash",
+      runId: "unit-run-deepseek-child-provider"
+    }, capabilityContext());
+
+    assert.equal(execution.ok, true);
+    const child = platform.executedCommands.find(isAgentRunCommand);
+    assert.equal(argAfter(child?.args ?? [], "--provider"), "deepseek");
+    assert.equal(argAfter(child?.args ?? [], "--model"), "deepseek-v4-flash");
+  });
+
+  it("inherits the active runtime provider and model when a model tool call omits provider selection", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: {
+        DEEPSEEK_API_KEY: "fixture-secret-value",
+        GLM_ANTHROPIC_API_KEY: "fixture-secret-value"
+      }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      model: "deepseek-v4-flash",
+      runId: "unit-run-deepseek-provider-id"
+    }, capabilityContext({ activeModel: "deepseek-v4-flash", activeModelProvider: "deepseek", activeModelProviderId: "provider-deepseek" }));
+
+    assert.equal(execution.ok, true);
+    const child = platform.executedCommands.find(isAgentRunCommand);
+    assert.equal(argAfter(child?.args ?? [], "--provider"), "deepseek");
+    assert.equal(argAfter(child?.args ?? [], "--model"), "deepseek-v4-flash");
+  });
+
+  it("pins the managed child CLI workspace root to the run-scoped checkout", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.2",
+      runId: "unit-run-child-workspace-root"
+    }, capabilityContext());
+
+    assert.equal(execution.ok, true);
+    const child = platform.executedCommands.find(isAgentRunCommand);
+
+    assert.equal(child?.cwd, "/workspace/.deepseek/swe-lite-runs/unit-run-child-workspace-root/repo");
+    assert.equal(argAfter(child?.args ?? [], "--workspace-root"), "/workspace/.deepseek/swe-lite-runs/unit-run-child-workspace-root/repo");
+  });
+
+  it("warns managed child prompts against parent-directory and system-wide repository discovery", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.2",
+      runId: "unit-run-child-discovery-guard"
+    }, capabilityContext());
+
+    assert.equal(execution.ok, true);
+    const child = platform.executedCommands.find(isAgentRunCommand);
+    const prompt = child?.args[(child.args.indexOf("run") + 1)] ?? "";
+
+    assert.equal(prompt.includes("Do not search parent directories or system roots"), true);
+    assert.equal(prompt.includes("Do not clone or create another copy of the repository"), true);
+    assert.equal(prompt.includes("use pwd and ls once to verify the current checkout root"), true);
+  });
+
+  it("records the managed child runner tool matrix before child model dispatch", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.1",
+      runId: "unit-run-tool-matrix"
+    }, capabilityContext());
+
+    assert.equal(execution.ok, true);
+    const metadata = (execution.value as { evidence?: { metadata?: JsonObject } }).evidence?.metadata;
+    const toolMatrix = metadata?.toolMatrix as JsonObject | undefined;
+
+    assert.equal(toolMatrix?.status, "complete");
+    assert.deepEqual(toolMatrix?.requiredCapabilityIds, [
+      "core.file.read",
+      "core.file.list",
+      "core.search.text",
+      "core.workspace.glob",
+      "core.file.write",
+      "core.file.edit",
+      "core.patch.apply",
+      "core.shell.run",
+      "core.test.run",
+      "core.git.diff",
+      "core.swe.harness.run",
+      "core.swe.prediction.write"
+    ]);
+    assert.equal((toolMatrix?.counts as JsonObject | undefined)?.required, 12);
+    assert.equal((toolMatrix?.counts as JsonObject | undefined)?.unavailable, 0);
+    assert.equal((toolMatrix?.families as JsonObject[] | undefined)?.some((family) => family.id === "mutation" && family.status === "complete"), true);
+
+    const stageEvaluations = metadata?.stageEvaluations as JsonObject[] | undefined;
+    assert.deepEqual(stageEvaluations?.map((stage) => stage.stageId), ["prepare", "understand", "change", "verify", "score", "package", "return"]);
+    const technicalDirectorAcceptance = metadata?.technicalDirectorAcceptance as JsonObject | undefined;
+    assert.deepEqual((technicalDirectorAcceptance?.stageStatuses as JsonObject[] | undefined)?.map((stage) => stage.stageId), ["prepare", "understand", "change", "verify", "score", "package", "return"]);
+
+    const traceContent = await platform.readFile("/workspace/.deepseek/swe-lite-runs/unit-run-tool-matrix/trace.jsonl");
+    const traceEvents = traceContent.trim().split(/\r?\n/).map((line) => JSON.parse(line) as JsonObject);
+    const matrixEvent = traceEvents.find((event) => event.kind === "runner.tool_matrix.evaluated");
+    assert.equal((matrixEvent?.data as JsonObject | undefined)?.profileId, "evaluation/swe-bench-lite.child.v1");
+    assert.equal(((matrixEvent?.data as JsonObject | undefined)?.counts as JsonObject | undefined)?.required, 12);
+  });
+
+  it("does not accept understand stage completion from duplicate read evidence alone", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    platform.resolvedTaskNumbers.add(2);
+    platform.agentStdout = [
+      JSON.stringify({ kind: "model.requested", data: { iteration: 1 } }),
+      JSON.stringify({ kind: "model.tool.intent", data: { toolCallId: "read-1", name: "core.file.read", input: { path: "README.md" } } }),
+      JSON.stringify({ kind: "model.tool.result", data: { toolCallId: "read-1", toolName: "core.file.read", terminalKind: "capability.completed" } }),
+      JSON.stringify({ kind: "model.tool.intent", data: { toolCallId: "read-2", name: "core.file.read", input: { path: "README.md" } } }),
+      JSON.stringify({ kind: "model.tool.result", data: { toolCallId: "read-2", toolName: "core.file.read", terminalKind: "capability.completed" } }),
+      JSON.stringify({ kind: "agent.loop.completed", data: { status: "completed", reason: "workflow-stages-completed" } })
+    ].join("\n") + "\n";
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.1",
+      runId: "unit-run-duplicate-understand"
+    }, capabilityContext());
+
+    assert.equal(execution.ok, true);
+    const metadata = (execution.value as { evidence?: { metadata?: JsonObject } }).evidence?.metadata;
+    const stageEvaluations = metadata?.stageEvaluations as JsonObject[] | undefined;
+    const understand = stageEvaluations?.find((entry) => entry.stageId === "understand");
+    assert.equal(understand?.status, "blocked");
+    assert.equal(understand?.reason, "RUNNER_UNDERSTAND_DUPLICATE_INSPECTION_ONLY");
+    const director = metadata?.technicalDirectorAcceptance as JsonObject | undefined;
+    assert.equal(director?.accepted, false);
+    assert.equal(director?.status, "blocked");
+    assert.equal(director?.reason, "RUNNER_UNDERSTAND_DUPLICATE_INSPECTION_ONLY");
+  });
+
+  it("skips harness when a material patch lacks child mutation and test evidence", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    platform.resolvedTaskNumbers.add(2);
+    platform.agentStdout = [
+      JSON.stringify({ kind: "model.requested", data: { iteration: 1 } }),
+      JSON.stringify({ kind: "model.tool.intent", data: { toolCallId: "read-1", name: "core.file.read", input: { path: "src/example.py" } } }),
+      JSON.stringify({ kind: "model.tool.result", data: { toolCallId: "read-1", toolName: "core.file.read", terminalKind: "capability.completed" } }),
+      JSON.stringify({ kind: "agent.loop.budget.consumed", data: { budget: { kind: "source-inspection", stopReason: "swe-bench-child-stage-understand-budget" } } })
+    ].join("\n") + "\n";
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.1",
+      runId: "unit-run-patch-without-child-proof"
+    }, capabilityContext());
+
+    assert.equal(execution.ok, true);
+    assert.equal(platform.harnessRunCount, 0);
+    const metadata = (execution.value as { evidence?: { metadata?: JsonObject } }).evidence?.metadata;
+    const stageEvaluations = metadata?.stageEvaluations as JsonObject[] | undefined;
+    const change = stageEvaluations?.find((entry) => entry.stageId === "change");
+    assert.equal(metadata?.predictionStatus, "pass");
+    assert.equal(metadata?.evaluationStatus, undefined);
+    assert.equal(change?.reason, "RUNNER_CHANGE_MUTATION_EVIDENCE_MISSING");
+    assert.equal((metadata?.diagnostics as JsonObject[] | undefined)?.some((entry) => entry.code === "SWE_BENCH_CHILD_NOT_HARNESS_READY"), true);
+  });
+
+  it("does not accept change stage completion without mutation-grade evidence and material diff", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    platform.resolvedTaskNumbers.add(2);
+    platform.gitDiffOutput = "";
+    platform.agentStdout = [
+      JSON.stringify({ kind: "model.requested", data: { iteration: 1 } }),
+      JSON.stringify({ kind: "model.tool.intent", data: { toolCallId: "edit-1", name: "core.file.edit", input: { path: "src/example.py" } } }),
+      JSON.stringify({ kind: "model.tool.result", data: { toolCallId: "edit-1", toolName: "core.file.edit", terminalKind: "capability.completed" } }),
+      JSON.stringify({ kind: "model.tool.intent", data: { toolCallId: "test-1", name: "core.test.run", input: { command: "pytest", args: ["tests/test_demo.py"] } } }),
+      JSON.stringify({ kind: "model.tool.result", data: { toolCallId: "test-1", toolName: "core.test.run", terminalKind: "capability.completed", output: "1 passed" } }),
+      JSON.stringify({ kind: "agent.loop.completed", data: { status: "completed", reason: "workflow-stages-completed" } })
+    ].join("\n") + "\n";
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.1",
+      runId: "unit-run-empty-change"
+    }, capabilityContext());
+
+    assert.equal(execution.ok, true);
+    const metadata = (execution.value as { evidence?: { metadata?: JsonObject } }).evidence?.metadata;
+    const stageEvaluations = metadata?.stageEvaluations as JsonObject[] | undefined;
+    const change = stageEvaluations?.find((entry) => entry.stageId === "change");
+    assert.equal(metadata?.patchBytes, 0);
+    assert.equal(change?.status, "blocked");
+    assert.equal(change?.reason, "RUNNER_CHANGE_EMPTY_MATERIAL_DIFF");
+    const director = metadata?.technicalDirectorAcceptance as JsonObject | undefined;
+    assert.equal(director?.accepted, false);
+    assert.equal(director?.status, "blocked");
+    assert.equal(director?.reason, "RUNNER_CHANGE_EMPTY_MATERIAL_DIFF");
+  });
+
+  it("does not accept verify stage completion when broad tests run before a focused low-cost check", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    platform.resolvedTaskNumbers.add(2);
+    platform.agentStdout = [
+      JSON.stringify({ kind: "model.requested", data: { iteration: 1 } }),
+      JSON.stringify({ kind: "model.tool.intent", data: { toolCallId: "edit-1", name: "core.file.edit", input: { path: "src/example.py" } } }),
+      JSON.stringify({ kind: "model.tool.result", data: { toolCallId: "edit-1", toolName: "core.file.edit", terminalKind: "capability.completed" } }),
+      JSON.stringify({ kind: "model.tool.intent", data: { toolCallId: "test-1", name: "core.test.run", input: { command: "python", args: ["-m", "pytest"] } } }),
+      JSON.stringify({ kind: "model.tool.result", data: { toolCallId: "test-1", toolName: "core.test.run", terminalKind: "capability.completed", output: "12 passed" } }),
+      JSON.stringify({ kind: "agent.loop.completed", data: { status: "completed", reason: "workflow-stages-completed" } })
+    ].join("\n") + "\n";
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.1",
+      runId: "unit-run-broad-before-focused"
+    }, capabilityContext());
+
+    assert.equal(execution.ok, true);
+    const metadata = (execution.value as { evidence?: { metadata?: JsonObject } }).evidence?.metadata;
+    const stageEvaluations = metadata?.stageEvaluations as JsonObject[] | undefined;
+    const verify = stageEvaluations?.find((entry) => entry.stageId === "verify");
+    assert.equal(verify?.status, "blocked");
+    assert.equal(verify?.reason, "RUNNER_VERIFY_BROAD_BEFORE_FOCUSED");
+    const director = metadata?.technicalDirectorAcceptance as JsonObject | undefined;
+    assert.equal(director?.accepted, false);
+    assert.equal(director?.status, "blocked");
+    assert.equal(director?.reason, "RUNNER_VERIFY_BROAD_BEFORE_FOCUSED");
+  });
+
+  it("distinguishes score stage blockers for official unresolved, harness, environment, and packaging failures", async () => {
+    const scenarios = [
+      {
+        runId: "unit-run-score-official-unresolved",
+        configure(platform: FakeSweBenchRunPlatform): void {
+          platform.agentStdout = solvedChildTrace();
+        },
+        reason: "RUNNER_SCORE_OFFICIAL_UNRESOLVED"
+      },
+      {
+        runId: "unit-run-score-harness-error",
+        configure(platform: FakeSweBenchRunPlatform): void {
+          platform.agentStdout = solvedChildTrace();
+          platform.skipHarnessReportWrite = true;
+        },
+        reason: "RUNNER_SCORE_HARNESS_ERROR"
+      },
+      {
+        runId: "unit-run-score-environment-blocker",
+        configure(platform: FakeSweBenchRunPlatform): void {
+          platform.agentStdout = [
+            JSON.stringify({ kind: "model.requested", data: { iteration: 1 } }),
+            JSON.stringify({ kind: "model.tool.intent", data: { toolCallId: "edit-1", name: "core.file.edit", input: { path: "src/example.py" } } }),
+            JSON.stringify({ kind: "model.tool.result", data: { toolCallId: "edit-1", toolName: "core.file.edit", terminalKind: "capability.completed" } }),
+            JSON.stringify({ kind: "model.tool.intent", data: { toolCallId: "test-1", name: "core.test.run", input: { command: "python", args: ["-m", "pytest", "tests/test_demo.py"] } } }),
+            JSON.stringify({ kind: "model.tool.result", data: { toolCallId: "test-1", toolName: "core.test.run", terminalKind: "capability.completed", output: "No module named pytest" } }),
+            JSON.stringify({
+              kind: "agent.loop.budget.consumed",
+              data: {
+                budget: { kind: "verification", stopReason: "swe-bench-environment-blocker" },
+                gate: "SWE_BENCH_ENVIRONMENT_BLOCKER_GATE",
+                modelRequestCount: 1,
+                toolCallCount: 2,
+                sourceMutationCount: 1,
+                shellCommandCount: 1,
+                testCommandCount: 1,
+                successfulTestCommandCount: 0
+              }
+            })
+          ].join("\n") + "\n";
+        },
+        reason: "RUNNER_SCORE_ENVIRONMENT_BLOCKER"
+      },
+      {
+        runId: "unit-run-score-packaging-failure",
+        configure(platform: FakeSweBenchRunPlatform): void {
+          platform.agentStdout = solvedChildTrace();
+          platform.gitDiffOutput = "";
+        },
+        reason: "RUNNER_SCORE_PREDICTION_PACKAGING_FAILED"
+      }
+    ];
+
+    for (const scenario of scenarios) {
+      const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+      scenario.configure(platform);
+      const deps = createDeterministicRuntimeDependencies({ platform });
+      await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+        env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+      });
+
+      const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+        taskNumber: 2,
+        provider: "glm",
+        model: "glm-5.1",
+        runId: scenario.runId
+      }, capabilityContext());
+
+      assert.equal(execution.ok, true, scenario.runId);
+      const metadata = (execution.value as { evidence?: { metadata?: JsonObject } }).evidence?.metadata;
+      const stageEvaluations = metadata?.stageEvaluations as JsonObject[] | undefined;
+      const score = stageEvaluations?.find((entry) => entry.stageId === "score");
+      assert.equal(score?.reason, scenario.reason, scenario.runId);
+    }
+  });
+
+  it("accepts package stage only with prediction, child trace, progress ledger, and terminal status refs", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    platform.resolvedTaskNumbers.add(2);
+    platform.agentStdout = solvedChildTrace();
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.1",
+      runId: "unit-run-package-evidence"
+    }, capabilityContext());
+
+    assert.equal(execution.ok, true);
+    const metadata = (execution.value as { evidence?: { metadata?: JsonObject } }).evidence?.metadata;
+    const stageEvaluations = metadata?.stageEvaluations as JsonObject[] | undefined;
+    const packageStage = stageEvaluations?.find((entry) => entry.stageId === "package");
+    const outputRefs = packageStage?.outputRefs as JsonObject | undefined;
+
+    assert.equal(packageStage?.status, "passed");
+    assert.equal(packageStage?.reason, "RUNNER_PACKAGE_EVIDENCE_ACCEPTED");
+    assert.equal(outputRefs?.predictionPath, "/workspace/.deepseek/swe-lite-runs/unit-run-package-evidence/prediction.jsonl");
+    assert.equal(outputRefs?.childTracePath, "/workspace/.deepseek/swe-lite-runs/unit-run-package-evidence/trace.jsonl");
+    assert.equal(outputRefs?.progressLedgerPath, "/workspace/.deepseek/swe-lite-runs/unit-run-package-evidence/run-progress.jsonl");
+    assert.equal(outputRefs?.terminalStatus, "completed");
+  });
+
+  it("records runner stage state as replayable contract data with accepted refs", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    platform.resolvedTaskNumbers.add(2);
+    platform.agentStdout = solvedChildTrace();
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.1",
+      runId: "unit-run-stage-state"
+    }, capabilityContext());
+
+    assert.equal(execution.ok, true);
+    const metadata = (execution.value as { evidence?: { metadata?: JsonObject } }).evidence?.metadata;
+    const runnerStageState = metadata?.runnerStageState as JsonObject | undefined;
+    const stageStates = runnerStageState?.stageStates as JsonObject[] | undefined;
+    const refs = runnerStageState?.refs as JsonObject[] | undefined;
+    const packageStage = stageStates?.find((entry) => entry.stageId === "package");
+    const packageOutputRefs = packageStage?.outputRefs as string[] | undefined;
+
+    assert.equal(runnerStageState?.schemaVersion, "1.0.0");
+    assert.equal(runnerStageState?.graphId, "workflow/evaluation.swe-bench-lite.child.v1");
+    assert.equal(runnerStageState?.profileId, "evaluation/swe-bench-lite.child.v1");
+    assert.equal(packageStage?.status, "succeeded");
+    assert.deepEqual(packageOutputRefs, [
+      "ref:runner:prediction",
+      "ref:runner:child-trace",
+      "ref:runner:progress-ledger",
+      "ref:runner:terminal-status"
+    ]);
+    assert.equal(refs?.find((ref) => ref.refId === "ref:runner:prediction")?.path, "/workspace/.deepseek/swe-lite-runs/unit-run-stage-state/prediction.jsonl");
+    assert.equal(refs?.find((ref) => ref.refId === "ref:runner:child-trace")?.path, "/workspace/.deepseek/swe-lite-runs/unit-run-stage-state/trace.jsonl");
+    assert.equal(refs?.find((ref) => ref.refId === "ref:runner:progress-ledger")?.path, "/workspace/.deepseek/swe-lite-runs/unit-run-stage-state/run-progress.jsonl");
+    assert.equal((refs?.find((ref) => ref.refId === "ref:runner:terminal-status")?.metadata as JsonObject | undefined)?.terminalStatus, "completed");
+  });
+
+  it("passes runner stage state to the child prompt dynamic state boundary", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    platform.resolvedTaskNumbers.add(2);
+    platform.agentStdout = solvedChildTrace();
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.1",
+      runId: "unit-run-child-dynamic-state"
+    }, capabilityContext());
+
+    assert.equal(execution.ok, true);
+    const child = platform.executedCommands.find(isAgentRunCommand);
+    const stateFlagIndex = child?.args.indexOf("--supervisor-workflow-state") ?? -1;
+    const statePath = stateFlagIndex >= 0 ? child?.args[stateFlagIndex + 1] : undefined;
+    assert.equal(statePath, "/workspace/.deepseek/swe-lite-runs/unit-run-child-dynamic-state/runner-stage-state.json");
+
+    const state = JSON.parse(await platform.readFile(statePath as string)) as JsonObject;
+    const stageStates = state.stageStates as JsonObject[] | undefined;
+    assert.equal(state.schemaVersion, "1.0.0");
+    assert.equal(state.taskRunId, "staged:runner:unit-run-child-dynamic-state:2");
+    assert.equal(stageStates?.find((stage) => stage.stageId === "prepare")?.status, "succeeded");
+    assert.equal(stageStates?.find((stage) => stage.stageId === "understand")?.status, "pending");
+    assert.deepEqual(stageStates?.find((stage) => stage.stageId === "understand")?.outputRefs, []);
+  });
+
+  it("fails before child model dispatch when managed child mutation tools are unavailable", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" },
+      unavailableChildCapabilityIds: ["core.file.edit", "core.patch.apply"]
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.1",
+      runId: "unit-run-missing-mutation-tools"
+    }, capabilityContext());
+
+    assert.equal(execution.ok, false);
+    assert.equal(platform.executedCommands.some(isAgentRunCommand), false);
+    const metadata = (execution.value as { evidence?: { metadata?: JsonObject } }).evidence?.metadata;
+    const toolMatrix = metadata?.toolMatrix as JsonObject | undefined;
+    const diagnostics = Array.isArray(metadata?.diagnostics) ? metadata.diagnostics as JsonObject[] : [];
+
+    assert.equal(toolMatrix?.status, "incomplete");
+    assert.deepEqual(toolMatrix?.unavailableCapabilityIds, ["core.file.edit", "core.patch.apply"]);
+    assert.equal(metadata?.primaryFailureCategory, "missing-tools");
+    assert.equal(metadata?.modelAttributionAllowed, false);
+    assert.equal(metadata?.primaryReasonCode, "RUNNER_MUTATION_TOOL_UNAVAILABLE");
+    assert.equal(diagnostics.some((entry) => entry.code === "RUNNER_MUTATION_TOOL_UNAVAILABLE"), true);
+  });
+
+  it("keeps supervisor-owned environment preparation out of the managed child tool matrix", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" },
+      unavailableChildCapabilityIds: ["core.env.prepare"]
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.1",
+      runId: "unit-run-missing-environment-tools"
+    }, capabilityContext());
+
+    assert.equal(execution.ok, true);
+    assert.equal(platform.executedCommands.some(isAgentRunCommand), true);
+    const metadata = (execution.value as { evidence?: { metadata?: JsonObject } }).evidence?.metadata;
+    const toolMatrix = metadata?.toolMatrix as JsonObject | undefined;
+
+    assert.equal(toolMatrix?.status, "complete");
+    assert.equal((toolMatrix?.requiredCapabilityIds as string[] | undefined)?.includes("core.env.prepare"), false);
+    assert.equal((toolMatrix?.unavailableCapabilityIds as string[] | undefined)?.includes("core.env.prepare"), false);
+  });
+
+  it("fails before child model dispatch when managed child verification tools are unavailable", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" },
+      unavailableChildCapabilityIds: ["core.test.run"]
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.1",
+      runId: "unit-run-missing-verification-tools"
+    }, capabilityContext());
+
+    assert.equal(execution.ok, false);
+    assert.equal(platform.executedCommands.some(isAgentRunCommand), false);
+    const metadata = (execution.value as { evidence?: { metadata?: JsonObject } }).evidence?.metadata;
+
+    assert.equal(metadata?.primaryFailureCategory, "missing-tools");
+    assert.equal(metadata?.modelAttributionAllowed, false);
+    assert.equal(metadata?.primaryReasonCode, "RUNNER_VERIFICATION_TOOL_UNAVAILABLE");
+  });
+
+  it("keeps managed child tools out of the user-level SWE-bench dispatcher projection", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const visibleToolIds = new Set((await deps.capabilities.listModelVisible()).map((tool) => String(tool.id)));
+
+    assert.equal(visibleToolIds.has("core.swe.bench.run"), true);
+    for (const childCapabilityId of [
+      "core.env.prepare",
+      "core.file.read",
+      "core.file.list",
+      "core.search.text",
+      "core.workspace.glob",
+      "core.file.write",
+      "core.file.edit",
+      "core.patch.apply",
+      "core.shell.run",
+      "core.test.run",
+      "core.git.diff",
+      "core.swe.harness.run",
+      "core.swe.prediction.write"
+    ]) {
+      assert.equal(visibleToolIds.has(childCapabilityId), false);
+    }
+  });
+
+  it("preserves explicit SWE-bench run timeouts before launching the child CLI", async () => {
     const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
     const deps = createDeterministicRuntimeDependencies({ platform });
     await registerCliSweBenchRunCapabilities(deps, "/workspace", {
@@ -208,7 +838,36 @@ describe("CLI SWE-bench run capability", () => {
 
     assert.equal(execution.ok, true);
     const child = platform.executedCommands.find(isAgentRunCommand);
-    assert.equal(argAfter(child?.args ?? [], "--timeout-ms"), "7200000");
+    assert.equal(argAfter(child?.args ?? [], "--timeout-ms"), "600000");
+  });
+
+  it("classifies Docker daemon readiness failures before child model dispatch", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    platform.dockerInfoExitCode = 1;
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.1",
+      runId: "unit-run-docker-daemon-readiness"
+    }, capabilityContext());
+
+    assert.equal(execution.ok, false);
+    assert.equal(platform.executedCommands.some(isAgentRunCommand), false);
+    const metadata = (execution.value as { evidence?: { metadata?: JsonObject } }).evidence?.metadata;
+    const diagnostics = metadata?.diagnostics as JsonObject[] | undefined;
+
+    assert.equal(diagnostics?.some((entry) => entry.code === "SWE_BENCH_ENV_DOCKER_DAEMON"), true);
+    assert.equal(metadata?.primaryFailureCategory, "runner-readiness");
+    assert.equal(metadata?.modelAttributionAllowed, false);
+
+    const persisted = JSON.parse(await platform.readFile("/workspace/.deepseek/swe-lite-runs/unit-run-docker-daemon-readiness/summary.json")) as JsonObject;
+    assert.equal(persisted.primaryFailureCategory, "runner-readiness");
+    assert.equal(persisted.modelAttributionAllowed, false);
   });
 
   it("uses fresh default run ids so repeated live probes do not mix trace evidence", async () => {
@@ -810,7 +1469,7 @@ describe("CLI SWE-bench run capability", () => {
     assert.equal(metadata?.primaryReasonCode, "REPAIR_FEEDBACK_LOW_FIDELITY");
     assert.equal(metadata?.failureCategory, "repair-feedback");
     assert.equal(metadata?.actionability, "repair-feedback-fix");
-    assert.deepEqual(metadata?.reasonCodes, ["REPAIR_FEEDBACK_LOW_FIDELITY", "OFFICIAL_UNRESOLVED_AFTER_REPAIR"]);
+    assert.deepEqual(metadata?.reasonCodes, ["REPAIR_FEEDBACK_LOW_FIDELITY", "VERIFICATION_ORACLE_GAP", "OFFICIAL_UNRESOLVED_AFTER_REPAIR"]);
     assert.equal(value.evidence?.status, "failed");
     assert.equal(preview.includes("status=warn"), true);
     assert.equal(preview.includes("evaluation=warn resolved=false rate=0.0%"), true);
@@ -1363,6 +2022,200 @@ describe("CLI SWE-bench run capability", () => {
     ]);
     assert.equal(value.evidence?.preview?.text?.includes("contextProjectionCache hitRate=0.0% requests=2"), true);
     assert.equal(value.evidence?.preview?.text?.includes("reviewCodes=SWE_BENCH_CACHE_METRIC_SCOPE_MISMATCH,SWE_BENCH_CONTEXT_PROJECTION_CACHE_NO_HIT"), true);
+  });
+
+  it("keeps batch failure attribution actionable without counting engineering cache gates as task failures", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    await platform.writeFile("/workspace/.deepseek/swe-lite-runs/unit-batch-architecture-gaps-task-2/summary.json", JSON.stringify({
+      schemaVersion: "1.0.0",
+      kind: "capability.swe-bench.run.summary",
+      taskNumber: 2,
+      runId: "unit-batch-architecture-gaps-task-2",
+      status: "warn",
+      dryRun: false,
+      execute: true,
+      provider: "glm",
+      model: "glm-5.1",
+      evaluationStatus: "warn",
+      evaluationResolved: false,
+      childTerminalReason: "swe-bench-environment-blocker",
+      childModelRequestCount: 31,
+      childSourceMutationCount: 1,
+      childTestCommandCount: 3,
+      childSuccessfulTestCommandCount: 0,
+      providerCacheHitRate: 0.81,
+      providerCacheRequestCount: 31,
+      diagnostics: [
+        {
+          code: "SWE_BENCH_TEST_ENV_DEPENDENCY_MISSING",
+          severity: "warn",
+          message: "pytest missing but repo-local runner exists",
+          metadata: {
+            testFailureDetails: [
+              {
+                kind: "python-missing-module",
+                moduleName: "pytest",
+                suggestedAction: "use-repo-local-python-test-runner",
+                suggestedCommand: "python tests/runtests.py",
+                alternateCommand: "python tests/runtests.py",
+                alternateRunnerPath: "tests/runtests.py"
+              }
+            ]
+          },
+          redaction: { class: "internal", fields: ["metadata"] }
+        },
+        {
+          code: "SWE_BENCH_PROVIDER_CACHE_PIPELINE_TELEMETRY_ABSENT",
+          severity: "warn",
+          message: "historical cache trace lacks current pipeline telemetry",
+          redaction: { class: "internal" }
+        },
+        {
+          code: "SWE_BENCH_PROVIDER_CACHE_BELOW_TARGET",
+          severity: "error",
+          message: "provider cache below target",
+          redaction: { class: "internal" }
+        },
+        {
+          code: "SWE_BENCH_EVALUATION_UNRESOLVED",
+          severity: "warn",
+          message: "official unresolved",
+          redaction: { class: "internal" }
+        }
+      ],
+      reviewCodes: [
+        "SWE_BENCH_TEST_ENV_DEPENDENCY_MISSING",
+        "SWE_BENCH_PROVIDER_CACHE_PIPELINE_TELEMETRY_ABSENT",
+        "SWE_BENCH_PROVIDER_CACHE_BELOW_TARGET",
+        "SWE_BENCH_EVALUATION_UNRESOLVED"
+      ],
+      redaction: { class: "internal" }
+    }));
+    await platform.writeFile("/workspace/.deepseek/swe-lite-runs/unit-batch-architecture-gaps-task-3/summary.json", JSON.stringify({
+      schemaVersion: "1.0.0",
+      kind: "capability.swe-bench.run.summary",
+      taskNumber: 3,
+      runId: "unit-batch-architecture-gaps-task-3",
+      status: "warn",
+      dryRun: false,
+      execute: true,
+      provider: "glm",
+      model: "glm-5.1",
+      evaluationStatus: "warn",
+      evaluationResolved: false,
+      childTerminalReason: "swe-bench-request-budget-exceeded",
+      childModelRequestCount: 12,
+      childSourceMutationCount: 1,
+      childTestCommandCount: 1,
+      childSuccessfulTestCommandCount: 1,
+      providerCacheHitRate: 0.82,
+      providerCacheRequestCount: 12,
+      diagnostics: [
+        {
+          code: "SWE_BENCH_READY_FOR_HARNESS_GATE_MISSING",
+          severity: "warn",
+          message: "ready gate missing after edit and successful tests",
+          redaction: { class: "internal" }
+        },
+        {
+          code: "SWE_BENCH_ENVIRONMENT_BLOCKER_GATE",
+          severity: "warn",
+          message: "stale post-verification environment gate",
+          redaction: { class: "internal" }
+        },
+        {
+          code: "SWE_BENCH_PROVIDER_CACHE_BELOW_TARGET",
+          severity: "error",
+          message: "provider cache below target",
+          redaction: { class: "internal" }
+        },
+        {
+          code: "SWE_BENCH_EVALUATION_UNRESOLVED",
+          severity: "warn",
+          message: "official unresolved",
+          redaction: { class: "internal" }
+        }
+      ],
+      reviewCodes: [
+        "SWE_BENCH_READY_FOR_HARNESS_GATE_MISSING",
+        "SWE_BENCH_ENVIRONMENT_BLOCKER_GATE",
+        "SWE_BENCH_PROVIDER_CACHE_BELOW_TARGET",
+        "SWE_BENCH_EVALUATION_UNRESOLVED"
+      ],
+      redaction: { class: "internal" }
+    }));
+    await platform.writeFile("/workspace/.deepseek/swe-lite-runs/unit-batch-architecture-gaps-task-4/summary.json", JSON.stringify({
+      schemaVersion: "1.0.0",
+      kind: "capability.swe-bench.run.summary",
+      taskNumber: 4,
+      runId: "unit-batch-architecture-gaps-task-4",
+      status: "pass",
+      dryRun: false,
+      execute: true,
+      provider: "glm",
+      model: "glm-5.1",
+      evaluationStatus: "pass",
+      evaluationResolved: true,
+      providerCacheHitRate: 0.75,
+      providerCacheRequestCount: 10,
+      diagnostics: [
+        {
+          code: "SWE_BENCH_ENVIRONMENT_BLOCKER_GATE",
+          severity: "warn",
+          message: "resolved child flow warning should not pollute batch review",
+          redaction: { class: "internal" }
+        },
+        {
+          code: "SWE_BENCH_PROVIDER_CACHE_BELOW_TARGET",
+          severity: "error",
+          message: "cache economics still matter for resolved child",
+          redaction: { class: "internal" }
+        }
+      ],
+      reviewCodes: [
+        "SWE_BENCH_ENVIRONMENT_BLOCKER_GATE",
+        "SWE_BENCH_PROVIDER_CACHE_BELOW_TARGET"
+      ],
+      redaction: { class: "internal" }
+    }));
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumbers: [2, 3, 4, 5],
+      provider: "glm",
+      model: "glm-5.1",
+      runId: "unit-batch-architecture-gaps",
+      resume: true,
+      resumeOnly: true
+    }, capabilityContext());
+
+    assert.equal(execution.ok, true);
+    const value = execution.value as { evidence?: { metadata?: JsonObject; preview?: { text?: string } } };
+    const batch = value.evidence?.metadata?.batch as JsonObject | undefined;
+    const states = batch?.taskStates as JsonObject[] | undefined;
+    const task2 = states?.find((state) => state.taskNumber === 2);
+    const task3 = states?.find((state) => state.taskNumber === 3);
+    const task4 = states?.find((state) => state.taskNumber === 4);
+    const task5 = states?.find((state) => state.taskNumber === 5);
+    const reviewCodes = batch?.reviewCodes as string[] | undefined;
+
+    assert.equal(batch?.failedTasks, 0);
+    assert.deepEqual(batch?.failedTaskNumbers, []);
+    assert.equal(task2?.primaryReasonCode, "VERIFICATION_REPO_LOCAL_RUNNER_AVAILABLE");
+    assert.equal((task2?.reasonCodes as string[] | undefined)?.includes("CACHE_PROVIDER_PIPELINE_TELEMETRY_ABSENT"), true);
+    assert.equal((task2?.reasonCodes as string[] | undefined)?.includes("CACHE_PROVIDER_PIPELINE_MISSING"), false);
+    assert.equal(task3?.primaryReasonCode, "FLOW_READY_FOR_HARNESS_GATE_MISSING");
+    assert.equal((task3?.reasonCodes as string[] | undefined)?.includes("ENV_POST_VERIFICATION_BLOCKER"), false);
+    assert.equal(task4?.status, "resolved");
+    assert.equal((task4?.reasonCodes as string[] | undefined)?.length ?? 0, 0);
+    assert.equal(task5?.primaryReasonCode, "BATCH_PENDING_GOVERNANCE_BACKPRESSURE");
+    assert.equal(reviewCodes?.includes("SWE_BENCH_ENVIRONMENT_BLOCKER_GATE"), false);
+    assert.equal(reviewCodes?.includes("SWE_BENCH_PROVIDER_CACHE_BELOW_TARGET"), true);
+    assert.equal(reviewCodes?.includes("SWE_BENCH_BATCH_BACKPRESSURE_ACTIVE"), true);
+    assert.equal(value.evidence?.preview?.text?.includes("taskReview=2:VERIFICATION_REPO_LOCAL_RUNNER_AVAILABLE;3:FLOW_READY_FOR_HARNESS_GATE_MISSING;5:BATCH_PENDING_GOVERNANCE_BACKPRESSURE"), true);
   });
 
   it("does not aggregate non-cache review codes from resolved child summaries into batch review", async () => {
@@ -1992,8 +2845,8 @@ describe("CLI SWE-bench run capability", () => {
       evaluationStatus: "warn",
       evaluationResolved: false,
       childTerminalReason: "swe-bench-environment-blocker",
-      childModelRequestCount: 18,
-      childIterationCount: 18,
+      childModelRequestCount: 24,
+      childIterationCount: 24,
       providerCacheHitRate: 0.78,
       providerCacheRequestCount: 12,
       commandCount: 24,
@@ -2031,7 +2884,7 @@ describe("CLI SWE-bench run capability", () => {
     assert.equal((state?.blockerIds as string[]).includes("agentic.blocker.102.swe-bench-request-budget-exceeded"), true);
   });
 
-  it("treats twelve child model requests as suspicious budget evidence on resume", async () => {
+  it("does not treat twelve child model requests as widened budget evidence on resume", async () => {
     const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
     await platform.writeFile("/workspace/.deepseek/swe-lite-runs/unit-batch-budget-threshold-task-3/summary.json", JSON.stringify({
       schemaVersion: "1.0.0",
@@ -2079,11 +2932,11 @@ describe("CLI SWE-bench run capability", () => {
     const batch = value.evidence?.metadata?.batch as JsonObject | undefined;
     const state = (batch?.taskStates as JsonObject[]).find((taskState) => taskState.taskNumber === 3);
 
-    assert.equal(state?.primaryReasonCode, "FLOW_REQUEST_BUDGET_EXCEEDED");
-    assert.equal(state?.failureCategory, "flow-control");
-    assert.equal(state?.actionability, "framework-fix");
-    assert.equal((state?.blockerIds as string[]).includes("agentic.blocker.102.swe-bench-request-budget-exceeded"), true);
-    assert.equal(value.evidence?.preview?.text?.includes("taskReview=3:FLOW_REQUEST_BUDGET_EXCEEDED"), true);
+    assert.equal(state?.primaryReasonCode, "MODEL_PATCH_INSUFFICIENT_AFTER_GOVERNED_REPAIR");
+    assert.equal(state?.failureCategory, "model-patch");
+    assert.equal(state?.actionability, "model-feedback");
+    assert.equal((state?.blockerIds as string[]).includes("agentic.blocker.102.swe-bench-request-budget-exceeded"), false);
+    assert.equal(value.evidence?.preview?.text?.includes("taskReview=3:MODEL_PATCH_INSUFFICIENT_AFTER_GOVERNED_REPAIR"), true);
   });
 
   it("uses source-inspection pressure before generic request-budget attribution on resume", async () => {
@@ -2361,7 +3214,7 @@ describe("CLI SWE-bench run capability", () => {
     assert.equal(state?.primaryReasonCode, "ENV_POST_VERIFICATION_BLOCKER");
     assert.equal(state?.failureCategory, "environment");
     assert.equal(state?.actionability, "environment-fix");
-    assert.equal((state?.reasonCodes as string[]).includes("FLOW_REQUEST_BUDGET_EXCEEDED"), true);
+    assert.equal((state?.reasonCodes as string[]).includes("FLOW_REQUEST_BUDGET_EXCEEDED"), false);
     assert.equal((state?.blockerIds as string[]).includes("agentic.blocker.049.post-test-setup-loop"), true);
     assert.equal((persisted.diagnostics as JsonObject[]).some((entry) => entry.code === "SWE_BENCH_ENVIRONMENT_BLOCKER_GATE"), true);
     assert.equal(value.evidence?.preview?.text?.includes("taskReview=3:ENV_POST_VERIFICATION_BLOCKER"), true);
@@ -3333,8 +4186,9 @@ describe("CLI SWE-bench run capability", () => {
     assert.equal(reasonCodes.includes("ENV_POST_VERIFICATION_BLOCKER"), false);
     assert.equal(blockerIds.includes("agentic.blocker.119.test-env-dependency-missing"), false);
     assert.equal(blockerIds.includes("agentic.blocker.049.post-test-setup-loop"), false);
-    assert.equal(metadata?.primaryReasonCode, "CACHE_PROVIDER_BELOW_TARGET");
-    assert.equal(persisted.primaryReasonCode, "CACHE_PROVIDER_BELOW_TARGET");
+    assert.equal(reasonCodes.includes("CACHE_PROVIDER_BELOW_TARGET"), true);
+    assert.equal(metadata?.primaryReasonCode, "FLOW_READY_FOR_HARNESS_GATE_MISSING");
+    assert.equal(persisted.primaryReasonCode, "FLOW_READY_FOR_HARNESS_GATE_MISSING");
   });
 
   it("replaces stale breakpoint-shape misses with telemetry-missing evidence during resumeOnly refresh", async () => {
@@ -3600,7 +4454,7 @@ describe("CLI SWE-bench run capability", () => {
     assert.equal(value.evidence?.preview?.text?.includes("evaluation=fail resolved=unknown rate=unknown"), true);
   });
 
-  it("keeps child request budget primary when an empty patch causes missing harness report diagnostics", async () => {
+  it("keeps child request budget primary when an empty patch skips harness diagnostics", async () => {
     const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
     platform.skipHarnessReportWrite = true;
     platform.agentStdout = [
@@ -3651,7 +4505,8 @@ describe("CLI SWE-bench run capability", () => {
     assert.equal(metadata?.primaryReasonCode, "FLOW_REQUEST_BUDGET_EXCEEDED");
     assert.equal(metadata?.failureCategory, "flow-control");
     assert.equal(metadata?.actionability, "framework-fix");
-    assert.equal(reasonCodes?.includes("HARNESS_INSTANCE_REPORT_MISSING"), true);
+    assert.equal(platform.harnessRunCount, 0);
+    assert.equal(reasonCodes?.includes("HARNESS_INSTANCE_REPORT_MISSING"), false);
     assert.equal(reasonCodes?.includes("FLOW_REQUEST_BUDGET_EXCEEDED"), true);
     assert.equal(value.evidence?.preview?.text?.includes("failure=FLOW_REQUEST_BUDGET_EXCEEDED action=framework-fix"), true);
   });
@@ -3905,6 +4760,8 @@ describe("CLI SWE-bench run capability", () => {
             stopReason: "swe-bench-request-budget-exceeded"
           },
           gate: "SWE_BENCH_REQUEST_BUDGET_GATE",
+          stageId: "verify",
+          progressMarker: "post-edit-verification",
           modelRequestCount: 12,
           toolCallCount: 13,
           sourceInspectionToolCount: 12,
@@ -3937,9 +4794,90 @@ describe("CLI SWE-bench run capability", () => {
     assert.equal(metadata?.childModelRequestCount, 12);
     assert.equal(metadata?.childToolIntentCount, 13);
     assert.equal(metadata?.childTestCommandCount, 0);
+    assert.equal(metadata?.childLastStageId, "verify");
+    assert.equal(metadata?.childLastProgressMarker, "post-edit-verification");
     assert.equal(metadata?.primaryReasonCode, "FLOW_REQUEST_BUDGET_EXCEEDED");
     assert.equal((metadata?.blockerIds as string[] | undefined)?.includes("agentic.blocker.102.swe-bench-request-budget-exceeded"), true);
     assert.equal(value.evidence?.preview?.text?.includes("childTrace terminal=swe-bench-request-budget-exceeded"), true);
+  });
+
+  it("classifies non-test core.test.run commands as framework verification misuse", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    platform.agentStdout = [
+      JSON.stringify({
+        kind: "model.tool.intent",
+        data: {
+          toolCallId: "call-invalid-test-tool",
+          name: "core.test.run",
+          input: {
+            command: "cat",
+            args: ["django/forms/widgets.py"]
+          },
+          iteration: 1
+        }
+      }),
+      JSON.stringify({
+        kind: "model.tool.result",
+        data: {
+          toolCallId: "call-invalid-test-tool",
+          toolName: "core.test.run",
+          terminalKind: "capability.completed",
+          feedback: { status: "success" },
+          evidence: {
+            status: "success",
+            metadata: { exitCode: 0 }
+          }
+        }
+      }),
+      JSON.stringify({
+        kind: "agent.loop.budget.consumed",
+        data: {
+          budget: {
+            kind: "model-iteration",
+            consumed: 12,
+            allowed: 12,
+            remaining: 0,
+            stopReason: "swe-bench-request-budget-exceeded"
+          },
+          gate: "SWE_BENCH_REQUEST_BUDGET_GATE",
+          modelRequestCount: 12,
+          toolCallCount: 12,
+          sourceInspectionToolCount: 8,
+          sourceMutationCount: 0,
+          shellCommandCount: 0,
+          testCommandCount: 0,
+          successfulTestCommandCount: 0
+        }
+      }),
+      ""
+    ].join("\n");
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.1",
+      runId: "unit-run-invalid-test-tool"
+    }, capabilityContext());
+
+    assert.equal(execution.ok, true);
+    const value = execution.value as { evidence?: { metadata?: JsonObject; preview?: { text?: string } } };
+    const metadata = value.evidence?.metadata;
+    const diagnostics = Array.isArray(metadata?.diagnostics) ? metadata.diagnostics as JsonObject[] : [];
+    const invalidTestDiagnostic = diagnostics.find((entry) => entry.code === "SWE_BENCH_INVALID_TEST_TOOL_COMMAND_GATE");
+
+    assert.equal(metadata?.childTestCommandCount, 0);
+    assert.equal(metadata?.childSuccessfulTestCommandCount, 0);
+    assert.equal(metadata?.primaryReasonCode, "GATE_INVALID_TEST_TOOL_COMMAND");
+    assert.equal(metadata?.failureCategory, "framework");
+    assert.equal(metadata?.actionability, "framework-fix");
+    assert.equal((metadata?.reasonCodes as string[] | undefined)?.includes("FLOW_REQUEST_BUDGET_EXCEEDED"), true);
+    assert.equal((metadata?.blockerIds as string[] | undefined)?.includes("agentic.blocker.123.invalid-test-tool-command"), true);
+    assert.equal(invalidTestDiagnostic?.metadata && (invalidTestDiagnostic.metadata as JsonObject).invalidTestToolCommandCount, 1);
+    assert.equal(value.evidence?.preview?.text?.includes("failure=GATE_INVALID_TEST_TOOL_COMMAND action=framework-fix"), true);
   });
 
   it("keeps request budget as primary when a prior post-edit gate was later satisfied by tests", async () => {
@@ -4650,6 +5588,8 @@ describe("CLI SWE-bench run capability", () => {
     assert.equal(metadata?.childTerminalReason, "swe-bench-environment-blocker");
     assert.equal(metadata?.childTestCommandCount, 3);
     assert.equal(metadata?.childSuccessfulTestCommandCount, 0);
+    assert.equal(metadata?.primaryFailureCategory, "verification");
+    assert.equal(metadata?.modelAttributionAllowed, false);
     assert.equal(diagnostics?.some((entry) => entry.code === "SWE_BENCH_PARTIAL_RUN_RECOVERED"), true);
     assert.equal((metadata?.reviewCodes as string[] | undefined)?.includes("SWE_BENCH_PROVIDER_CACHE_DYNAMIC_TAIL_MISS"), true);
     assert.equal((metadata?.reasonCodes as string[] | undefined)?.includes("VERIFICATION_LOCAL_TEST_UNSUCCESSFUL"), true);
@@ -4851,10 +5791,103 @@ describe("CLI SWE-bench run capability", () => {
     assert.equal(stages.includes("environment.prepare:completed"), true);
     assert.equal(stages.includes("dataset.resolve:completed"), true);
     assert.equal(stages.includes("checkout.prepare:completed"), true);
+    assert.equal(stages.includes("checkout.prepare.probe:started"), true);
+    assert.equal(stages.includes("checkout.prepare.probe:completed"), true);
+    assert.equal(stages.includes("checkout.prepare.clone:started"), true);
+    assert.equal(stages.includes("checkout.prepare.clone:completed"), true);
     assert.equal(stages.includes("checkout.env:completed"), true);
     assert.equal(stages.includes("attempt.predict.start:started"), true);
     assert.equal(stages.includes("attempt.evaluate.completed:completed"), true);
     assert.equal(stages.includes("summary.persisted:completed"), true);
+
+    const clone = platform.executedCommands.find((entry) => entry.command === "git" && entry.args[0] === "clone");
+    assert.equal(clone?.timeoutMs, 600_000);
+  });
+
+  it("inherits governed runner timeout and typed evidence when dataset resolution fails", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    platform.datasetResolverExitCode = 124;
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.1",
+      runId: "unit-run-dataset-resolve-timeout"
+    }, capabilityContext());
+
+    assert.equal(execution.ok, false);
+    const resolver = platform.executedCommands.find((entry) =>
+      entry.command === "/workspace/.deepseek/swebench-venv/bin/python" && entry.args[0] === "-c"
+    );
+    assert.equal(resolver?.timeoutMs, 7_200_000);
+
+    const metadata = (execution.value as { evidence?: { metadata?: JsonObject } }).evidence?.metadata;
+    const diagnostics = metadata?.diagnostics as JsonObject[] | undefined;
+    const diagnostic = diagnostics?.find((entry) => entry.code === "SWE_BENCH_INSTANCE_RESOLVE_FAILED");
+    assert.equal((diagnostic?.metadata as JsonObject | undefined)?.exitCode, 124);
+    assert.equal((diagnostic?.metadata as JsonObject | undefined)?.timeoutMs, 7_200_000);
+    assert.equal(metadata?.primaryFailureCategory, "runner-readiness");
+    assert.equal(metadata?.modelAttributionAllowed, false);
+
+    const progress = await platform.readFile("/workspace/.deepseek/swe-lite-runs/unit-run-dataset-resolve-timeout/run-progress.jsonl");
+    const failedResolve = progress
+      .split(/\r?\n/)
+      .filter((line) => line.trim().length > 0)
+      .map((line) => JSON.parse(line) as JsonObject)
+      .find((entry) => entry.stage === "dataset.resolve" && entry.status === "failed");
+    assert.equal((failedResolve?.metadata as JsonObject | undefined)?.exitCode, 124);
+    assert.equal((failedResolve?.metadata as JsonObject | undefined)?.timeoutMs, 7_200_000);
+  });
+
+  it("classifies checkout command failures with typed evidence before child model dispatch", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    platform.checkoutCloneExitCode = 128;
+    platform.checkoutCloneOutput = "fatal: unable to access 'https://github.com/demo/repo.git/': Could not resolve host: github.com\n";
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.1",
+      runId: "unit-run-checkout-clone-failure"
+    }, capabilityContext());
+
+    assert.equal(execution.ok, false);
+    assert.equal(platform.executedCommands.filter(isAgentRunCommand).length, 0);
+
+    const metadata = (execution.value as { evidence?: { metadata?: JsonObject } }).evidence?.metadata;
+    const diagnostics = metadata?.diagnostics as JsonObject[] | undefined;
+    const diagnostic = diagnostics?.find((entry) => entry.code === "SWE_BENCH_CHECKOUT_FAILED");
+    const diagnosticMetadata = diagnostic?.metadata as JsonObject | undefined;
+    assert.equal(diagnosticMetadata?.commandId, "swe-bench.checkout.clone");
+    assert.equal(diagnosticMetadata?.exitCode, 128);
+    assert.equal(diagnosticMetadata?.timeoutMs, 600_000);
+    assert.equal(diagnosticMetadata?.stdoutBytes, Buffer.byteLength(platform.checkoutCloneOutput, "utf8"));
+    assert.equal(metadata?.primaryFailureCategory, "runner-readiness");
+    assert.equal(metadata?.modelAttributionAllowed, false);
+
+    const stageEvaluations = metadata?.stageEvaluations as JsonObject[] | undefined;
+    const prepare = stageEvaluations?.find((entry) => entry.stageId === "prepare");
+    assert.equal(prepare?.status, "blocked");
+    assert.equal(prepare?.reason, "SWE_BENCH_CHECKOUT_FAILED");
+    const director = metadata?.technicalDirectorAcceptance as JsonObject | undefined;
+    assert.equal(director?.accepted, false);
+    assert.equal(director?.status, "blocked");
+
+    const progress = await platform.readFile("/workspace/.deepseek/swe-lite-runs/unit-run-checkout-clone-failure/run-progress.jsonl");
+    const failedCheckout = progress
+      .split(/\r?\n/)
+      .filter((line) => line.trim().length > 0)
+      .map((line) => JSON.parse(line) as JsonObject)
+      .find((entry) => entry.stage === "checkout.prepare" && entry.status === "failed");
+    assert.equal((failedCheckout?.metadata as JsonObject | undefined)?.instanceId, "demo__repo-2");
   });
 
   it("returns single-task evidence when host context omits an execution envelope", async () => {
@@ -4910,19 +5943,68 @@ describe("CLI SWE-bench run capability", () => {
     assert.equal(execution.ok, true);
     const value = execution.value as { evidence?: { status?: string; preview?: { text?: string }; metadata?: JsonObject } };
     const childRuns = platform.executedCommands.filter(isAgentRunCommand);
-    const secondPrompt = childRuns[1]?.args[childRuns[1].args.indexOf("run") + 1] ?? "";
+    const repairContextPath = argAfter(childRuns[1]?.args ?? [], "--additional-user-context-file");
+    const repairContext = repairContextPath ? await platform.readFile(repairContextPath) : "";
 
     assert.equal(platform.harnessRunCount, 2);
     assert.equal(childRuns.length, 2);
-    assert.equal(secondPrompt.includes("Previous supervised attempt feedback"), true);
-    assert.equal(secondPrompt.includes("tests/test_demo.py::test_expected_fix"), true);
-    assert.equal(secondPrompt.includes("Official harness failure excerpts"), true);
-    assert.equal(secondPrompt.includes("ValueError: could not convert string to float: 'no'"), true);
+    assert.equal(repairContext.includes("Previous supervised attempt feedback"), true);
+    assert.equal(repairContext.includes("tests/test_demo.py::test_expected_fix"), true);
+    assert.equal(repairContext.includes("Official harness failure excerpts"), true);
+    assert.equal(repairContext.includes("ValueError: could not convert string to float: 'no'"), true);
     assert.equal(value.evidence?.status, "completed");
     assert.equal(value.evidence?.metadata?.attemptCount, 2);
     assert.equal(value.evidence?.metadata?.repairAttempted, true);
     assert.equal(value.evidence?.metadata?.evaluationResolved, true);
     assert.equal(value.evidence?.preview?.text?.includes("attempts=2 repair=true"), true);
+  });
+
+  it("passes official harness failures as repair evidence in the second child workflow state", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    platform.resolveOnSecondHarness = true;
+    platform.agentStdout = solvedChildTrace();
+    platform.harnessTestOutputByInstanceId.set("demo__repo-2", [
+      "tests/test_demo.py::test_expected_fix FAILED",
+      "tests/test_demo.py:42: in test_expected_fix",
+      "    parse_value('no')",
+      "E   ValueError: could not convert string to float: 'no'",
+      "FAILED tests/test_demo.py::test_expected_fix - ValueError: could not convert string to float: 'no'",
+      ""
+    ].join("\n"));
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.1",
+      runId: "unit-run-repair-state"
+    }, capabilityContext());
+
+    assert.equal(execution.ok, true);
+    const childRuns = platform.executedCommands.filter(isAgentRunCommand);
+    const firstStatePath = argAfter(childRuns[0]?.args ?? [], "--supervisor-workflow-state");
+    const secondStatePath = argAfter(childRuns[1]?.args ?? [], "--supervisor-workflow-state");
+    const secondState = JSON.parse(await platform.readFile(secondStatePath as string)) as JsonObject;
+    const refs = secondState.refs as JsonObject[] | undefined;
+    const stageStates = secondState.stageStates as JsonObject[] | undefined;
+    const repairFeedbackRef = refs?.find((ref) => ref.refId === "ref:runner:official-repair-feedback");
+    const understandStage = stageStates?.find((stage) => stage.stageId === "understand");
+    const changeStage = stageStates?.find((stage) => stage.stageId === "change");
+
+    assert.equal(firstStatePath, "/workspace/.deepseek/swe-lite-runs/unit-run-repair-state/runner-stage-state.json");
+    assert.equal(secondStatePath, "/workspace/.deepseek/swe-lite-runs/unit-run-repair-state/runner-stage-state-attempt-2.json");
+    assert.equal(repairFeedbackRef?.type, "diagnostic");
+    assert.equal(repairFeedbackRef?.producerStageId, "understand");
+    assert.equal((repairFeedbackRef?.metadata as JsonObject | undefined)?.attemptNumber, 2);
+    assert.equal((repairFeedbackRef?.metadata as JsonObject | undefined)?.failingTestCount, 2);
+    assert.equal((repairFeedbackRef?.metadata as JsonObject | undefined)?.failureExcerptCount, 1);
+    assert.equal((understandStage?.outputRefs as string[] | undefined)?.includes("ref:runner:official-repair-feedback"), true);
+    assert.equal(understandStage?.status, "succeeded");
+    assert.equal((changeStage?.inputRefs as string[] | undefined)?.includes("ref:runner:official-repair-feedback"), true);
+    assert.equal(changeStage?.status, "pending");
   });
 
   it("diagnoses low-fidelity repair feedback when official failure excerpts are unavailable", async () => {
@@ -4945,14 +6027,20 @@ describe("CLI SWE-bench run capability", () => {
     const diagnostics = value.evidence?.metadata?.diagnostics as JsonObject[] | undefined;
 
     assert.equal(diagnostics?.some((entry) => entry.code === "REPAIR_FEEDBACK_LOW_FIDELITY"), true);
+    assert.equal(value.evidence?.metadata?.primaryFailureCategory, "runner-readiness");
+    assert.equal(value.evidence?.metadata?.modelAttributionAllowed, false);
   });
 
   it("preserves separate child traces for each supervised attempt", async () => {
     const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
     platform.resolveOnSecondHarness = true;
     platform.agentStdouts = [
-      JSON.stringify({ kind: "agent.loop.completed", data: { status: "completed", attempt: 1 } }) + "\n",
-      JSON.stringify({ kind: "agent.loop.completed", data: { status: "completed", attempt: 2 } }) + "\n"
+      solvedChildTraceWithTerminal([
+        { kind: "agent.loop.completed", data: { status: "completed", reason: "attempt-1" } }
+      ]),
+      solvedChildTraceWithTerminal([
+        { kind: "agent.loop.completed", data: { status: "completed", reason: "attempt-2" } }
+      ])
     ];
     const deps = createDeterministicRuntimeDependencies({ platform });
     await registerCliSweBenchRunCapabilities(deps, "/workspace", {
@@ -4969,7 +6057,37 @@ describe("CLI SWE-bench run capability", () => {
     assert.equal(execution.ok, true);
     assert.equal(await platform.readFile("/workspace/.deepseek/swe-lite-runs/unit-run-traces/trace-attempt-1.jsonl"), platform.agentStdouts[0]);
     assert.equal(await platform.readFile("/workspace/.deepseek/swe-lite-runs/unit-run-traces/trace-attempt-2.jsonl"), platform.agentStdouts[1]);
-    assert.equal(await platform.readFile("/workspace/.deepseek/swe-lite-runs/unit-run-traces/trace.jsonl"), platform.agentStdouts[1]);
+    const latestTrace = await platform.readFile("/workspace/.deepseek/swe-lite-runs/unit-run-traces/trace.jsonl");
+    const secondAttemptTrace = platform.agentStdouts[1] as string;
+    assert.equal(latestTrace.startsWith(secondAttemptTrace), true);
+    assert.equal(latestTrace.split(/\r?\n/).some((line) => line.includes('"kind":"runner.tool_matrix.evaluated"')), true);
+  });
+
+  it("preserves one parent result for a child trace with repeated terminal close events", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    platform.resolvedTaskNumbers.add(2);
+    platform.agentStdout = solvedChildTraceWithTerminal([
+      { kind: "agent.loop.completed", data: { status: "completed", reason: "first-close" } },
+      { kind: "agent.loop.completed", data: { status: "completed", reason: "second-close" } }
+    ]);
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.1",
+      runId: "unit-run-single-parent-result"
+    }, capabilityContext());
+
+    assert.equal(execution.ok, true);
+    assert.equal(platform.executedCommands.filter(isAgentRunCommand).length, 1);
+    assert.equal(platform.executedCommands.filter((entry) => entry.args.includes("swebench.harness.run_evaluation")).length, 1);
+    const metadata = (execution.value as { evidence?: { metadata?: JsonObject } }).evidence?.metadata;
+    assert.equal(metadata?.childTerminalKind, "agent.loop.completed");
+    assert.equal(metadata?.childTerminalReason, "second-close");
   });
 
   it("resets an existing run-scoped checkout before predicting", async () => {
@@ -5092,6 +6210,21 @@ describe("CLI SWE-bench run capability", () => {
     assert.equal(editableInstallIndex >= 0, true);
     assert.equal(venvCreateIndex < childIndex, true);
     assert.equal(editableInstallIndex < childIndex, true);
+
+    const progress = await platform.readFile("/workspace/.deepseek/swe-lite-runs/unit-run-checkout-env/run-progress.jsonl");
+    const stages = progress
+      .split(/\r?\n/)
+      .filter((line) => line.trim().length > 0)
+      .map((line) => {
+        const entry = JSON.parse(line) as JsonObject;
+        return `${String(entry.stage)}:${String(entry.status)}`;
+      });
+    assert.equal(stages.includes("checkout.env.venv:started"), true);
+    assert.equal(stages.includes("checkout.env.venv:completed"), true);
+    assert.equal(stages.includes("checkout.env.bootstrap:started"), true);
+    assert.equal(stages.includes("checkout.env.bootstrap:completed"), true);
+    assert.equal(stages.includes("checkout.env.editable:started"), true);
+    assert.equal(stages.includes("checkout.env.editable:completed"), true);
   });
 
   it("uses package metadata to select legacy checkout Python and test extras before launching the child agent", async () => {
@@ -5225,23 +6358,347 @@ describe("CLI SWE-bench run capability", () => {
       : [];
     const checkoutWarning = diagnostics.find((entry) => entry.code === "SWE_BENCH_CHECKOUT_ENV_WARN");
     const repoDir = "/workspace/.deepseek/swe-lite-runs/unit-run-checkout-env-warning/repo";
+    const childStateWrite = platform.writes.find((entry) => entry.path.endsWith("/runner-stage-state.json"));
+    const childState = childStateWrite ? JSON.parse(childStateWrite.content) as JsonObject : undefined;
+    const childStageStates = childState?.stageStates as JsonObject[] | undefined;
 
-    assert.equal(value.evidence?.status, "failed");
+    assert.equal(value.evidence?.status, "completed");
     assert.equal(value.evidence?.metadata?.status, "warn");
     assert.equal(value.evidence?.metadata?.evaluationResolved, true);
+    assert.equal(value.evidence?.metadata?.primaryFailureCategory, "none");
+    assert.equal(childStageStates?.find((stage) => stage.stageId === "prepare")?.status, "succeeded");
+    assert.equal(childStageStates?.find((stage) => stage.stageId === "understand")?.status, "pending");
+    assert.deepEqual(childStageStates?.find((stage) => stage.stageId === "understand")?.outputRefs, []);
     assert.equal(checkoutWarning?.severity, "warn");
     assert.deepEqual(checkoutWarning?.metadata, {
       command: `${repoDir}/.venv/bin/python`,
       args: ["-m", "pip", "install", "-e", "."],
       cwd: repoDir,
       exitCode: 1,
+      stdoutBytes: 24,
+      stderrBytes: 0,
       stdoutPreview: "editable install failed\n",
       stderrPreview: ""
     });
   });
+
+  it("keeps checkout editable install on a stage budget before launching the child agent", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.1",
+      runId: "unit-run-checkout-env-stage-budget",
+      timeoutMs: 1_800_000
+    }, capabilityContext());
+
+    assert.equal(execution.ok, true);
+    const repoDir = "/workspace/.deepseek/swe-lite-runs/unit-run-checkout-env-stage-budget/repo";
+    const editableInstall = platform.executedCommands.find((entry) =>
+      entry.command === `${repoDir}/.venv/bin/python` &&
+      entry.args.join(" ") === "-m pip install -e ."
+    );
+    const childIndex = platform.executedCommands.findIndex(isAgentRunCommand);
+    const editableIndex = platform.executedCommands.findIndex((entry) => entry === editableInstall);
+
+    assert.equal(Boolean(editableInstall), true);
+    assert.equal(editableInstall?.timeoutMs, 180_000);
+    assert.equal(editableIndex >= 0, true);
+    assert.equal(childIndex > editableIndex, true);
+  });
+
+  it("stops before harness or repair when the child loop fails without a patch", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    platform.gitDiffOutput = "";
+    platform.agentStdout = [
+      JSON.stringify({ kind: "model.requested", data: { iteration: 1 } }),
+      JSON.stringify({ kind: "model.tool.intent", data: { toolCallId: "read-1", name: "core.file.read", input: { path: "src/example.py" } } }),
+      JSON.stringify({ kind: "model.tool.result", data: { toolCallId: "read-1", toolName: "core.file.read", terminalKind: "capability.completed" } }),
+      JSON.stringify({ kind: "workflow.required-action.missed", data: { requestedCapabilityId: "core.file.read", repeatedProgressEvidence: true } }),
+      JSON.stringify({ kind: "agent.loop.failed", data: { status: "rejected", reason: "workflow-required-action-missed" } })
+    ].join("\n") + "\n";
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.1",
+      runId: "unit-run-child-failed-no-patch"
+    }, capabilityContext());
+
+    assert.equal(execution.ok, true);
+    const metadata = (execution.value as { evidence?: { metadata?: JsonObject } }).evidence?.metadata;
+
+    assert.equal(platform.harnessRunCount, 0);
+    assert.equal(platform.agentRunCount, 1);
+    assert.equal(metadata?.status, "fail");
+    assert.equal(metadata?.attemptCount, 1);
+    assert.equal(metadata?.repairAttempted, false);
+    assert.equal(metadata?.evaluationStatus, undefined);
+    assert.equal(metadata?.childTerminalReason, "workflow-required-action-missed");
+    assert.equal(metadata?.patchBytes, 0);
+  });
+
+  it("prioritizes child mutation convergence failure over provider cache diagnostics", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    await platform.writeFile("/workspace/.deepseek/swe-lite-runs/unit-run-child-mutation-stalled/summary.json", JSON.stringify({
+      schemaVersion: "1.0.0",
+      kind: "capability.swe-bench.run.summary",
+      taskNumber: 2,
+      runId: "unit-run-child-mutation-stalled",
+      status: "fail",
+      dryRun: false,
+      execute: true,
+      provider: "glm",
+      model: "glm-5.2",
+      instanceId: "demo__repo-2",
+      environmentStatus: "pass",
+      predictionStatus: "warn",
+      toolMatrix: { status: "complete" },
+      childTerminalReason: "workflow-required-action-missed",
+      childLastStageId: "stage:change",
+      childModelRequestCount: 9,
+      childSourceInspectionToolCount: 3,
+      childSourceMutationCount: 0,
+      childTestCommandCount: 0,
+      patchBytes: 0,
+      attemptCount: 1,
+      commandCount: 10,
+      diagnostics: [
+        {
+          code: "SWE_BENCH_PROVIDER_CACHE_BELOW_TARGET",
+          severity: "error",
+          message: "cache below target",
+          redaction: { class: "internal" }
+        }
+      ],
+      redaction: { class: "internal", fields: ["diagnostics.metadata"] }
+    }));
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.2",
+      runId: "unit-run-child-mutation-stalled",
+      resumeOnly: true
+    }, capabilityContext());
+
+    const metadata = (execution.value as { evidence?: { metadata?: JsonObject } }).evidence?.metadata;
+    const reasonCodes = metadata?.reasonCodes as readonly string[] | undefined;
+
+    assert.equal(metadata?.primaryReasonCode, "FLOW_MUTATION_INPUT_STALLED");
+    assert.equal(reasonCodes?.includes("CACHE_PROVIDER_BELOW_TARGET"), true);
+    assert.equal(metadata?.primaryFailureCategory, "flow-control");
+    assert.equal(execution.ok, true);
+  });
+
+  it("classifies empty predictions as runner packaging failures without model attribution", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    await platform.writeFile("/workspace/.deepseek/swe-lite-runs/unit-run-packaging-failure/summary.json", JSON.stringify({
+      schemaVersion: "1.0.0",
+      kind: "capability.swe-bench.run.summary",
+      taskNumber: 2,
+      runId: "unit-run-packaging-failure",
+      status: "warn",
+      dryRun: false,
+      execute: true,
+      provider: "glm",
+      model: "glm-5.1",
+      evaluationStatus: "warn",
+      evaluationResolved: false,
+      patchBytes: 0,
+      toolMatrix: { status: "complete" },
+      diagnostics: [
+        {
+          code: "SWE_BENCH_EMPTY_PATCH",
+          severity: "warn",
+          message: "Recovered SWE-bench prediction patch is empty.",
+          redaction: { class: "internal" }
+        }
+      ],
+      redaction: { class: "internal", fields: ["diagnostics.metadata"] }
+    }));
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.1",
+      runId: "unit-run-packaging-failure",
+      resumeOnly: true
+    }, capabilityContext());
+
+    assert.equal(execution.ok, true);
+    const metadata = (execution.value as { evidence?: { metadata?: JsonObject } }).evidence?.metadata;
+
+    assert.equal(metadata?.primaryReasonCode, "PREDICTION_EMPTY_PATCH");
+    assert.equal(metadata?.primaryFailureCategory, "packaging");
+    assert.equal(metadata?.modelAttributionAllowed, false);
+  });
+
+  it("classifies request budget exhaustion as timeout budget without model attribution", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    await platform.writeFile("/workspace/.deepseek/swe-lite-runs/unit-run-budget-timeout/summary.json", JSON.stringify({
+      schemaVersion: "1.0.0",
+      kind: "capability.swe-bench.run.summary",
+      taskNumber: 2,
+      runId: "unit-run-budget-timeout",
+      status: "warn",
+      dryRun: false,
+      execute: true,
+      provider: "glm",
+      model: "glm-5.1",
+      evaluationStatus: "warn",
+      evaluationResolved: false,
+      childTerminalReason: "swe-bench-request-budget-exceeded",
+      childModelRequestCount: 12,
+      childToolCallCount: 18,
+      childLastStage: "verify",
+      toolMatrix: { status: "complete" },
+      diagnostics: [],
+      redaction: { class: "internal", fields: ["diagnostics.metadata"] }
+    }));
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.1",
+      runId: "unit-run-budget-timeout",
+      resumeOnly: true
+    }, capabilityContext());
+
+    assert.equal(execution.ok, true);
+    const metadata = (execution.value as { evidence?: { metadata?: JsonObject } }).evidence?.metadata;
+
+    assert.equal(metadata?.primaryReasonCode, "FLOW_REQUEST_BUDGET_EXCEEDED");
+    assert.equal(metadata?.primaryFailureCategory, "timeout-budget");
+    assert.equal(metadata?.modelAttributionAllowed, false);
+  });
+
+  it("classifies invalid shell mutation channel gates as runner readiness without model attribution", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    await platform.writeFile("/workspace/.deepseek/swe-lite-runs/unit-run-invalid-mutation-channel/summary.json", JSON.stringify({
+      schemaVersion: "1.0.0",
+      kind: "capability.swe-bench.run.summary",
+      taskNumber: 2,
+      runId: "unit-run-invalid-mutation-channel",
+      status: "warn",
+      dryRun: false,
+      execute: true,
+      provider: "glm",
+      model: "glm-5.1",
+      evaluationStatus: "warn",
+      evaluationResolved: false,
+      childTerminalReason: "swe-bench-invalid-mutation-channel",
+      childModelRequestCount: 4,
+      childToolCallCount: 4,
+      childSourceMutationCount: 0,
+      childShellCommandCount: 2,
+      toolMatrix: { status: "complete" },
+      diagnostics: [
+        {
+          code: "SWE_BENCH_INVALID_MUTATION_CHANNEL_GATE",
+          severity: "warn",
+          message: "invalid mutation channel",
+          metadata: {
+            shellWorkspaceMutationRejectionCount: 2,
+            sourceMutationCount: 0
+          },
+          redaction: { class: "internal", fields: ["metadata"] }
+        }
+      ],
+      redaction: { class: "internal", fields: ["diagnostics.metadata"] }
+    }));
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.1",
+      runId: "unit-run-invalid-mutation-channel",
+      resumeOnly: true
+    }, capabilityContext());
+
+    assert.equal(execution.ok, true);
+    const metadata = (execution.value as { evidence?: { metadata?: JsonObject } }).evidence?.metadata;
+    const reasonCodes = metadata?.reasonCodes as readonly string[] | undefined;
+
+    assert.equal(metadata?.primaryReasonCode, "GATE_INVALID_MUTATION_CHANNEL");
+    assert.equal(reasonCodes?.includes("GATE_INVALID_MUTATION_CHANNEL"), true);
+    assert.equal(metadata?.primaryFailureCategory, "runner-readiness");
+    assert.equal(metadata?.modelAttributionAllowed, false);
+  });
+
+  it("allows model attribution only for official unresolved after governed evidence is sufficient", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    await platform.writeFile("/workspace/.deepseek/swe-lite-runs/unit-run-model-attribution/summary.json", JSON.stringify({
+      schemaVersion: "1.0.0",
+      kind: "capability.swe-bench.run.summary",
+      taskNumber: 2,
+      runId: "unit-run-model-attribution",
+      status: "warn",
+      dryRun: false,
+      execute: true,
+      provider: "glm",
+      model: "glm-5.1",
+      evaluationStatus: "warn",
+      evaluationResolved: false,
+      toolMatrix: { status: "complete" },
+      diagnostics: [
+        {
+          code: "SWE_BENCH_EVALUATION_UNRESOLVED",
+          severity: "warn",
+          message: "official unresolved",
+          redaction: { class: "internal" }
+        }
+      ],
+      redaction: { class: "internal", fields: ["diagnostics.metadata"] }
+    }));
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.1",
+      runId: "unit-run-model-attribution",
+      resumeOnly: true
+    }, capabilityContext());
+
+    assert.equal(execution.ok, true);
+    const metadata = (execution.value as { evidence?: { metadata?: JsonObject } }).evidence?.metadata;
+
+    assert.equal(metadata?.primaryReasonCode, "MODEL_PATCH_INSUFFICIENT_AFTER_GOVERNED_REPAIR");
+    assert.equal(metadata?.primaryFailureCategory, "model-behavior");
+    assert.equal(metadata?.modelAttributionAllowed, true);
+  });
 });
 
-function capabilityContext(): CapabilityExecutionContext {
+function capabilityContext(metadata: JsonObject = {}): CapabilityExecutionContext {
   const trace: TraceContext = {
     traceId: asId<"trace">("trace-swe-bench-run-test"),
     spanId: asId<"span">("span-swe-bench-run-test"),
@@ -5293,7 +6750,7 @@ function capabilityContext(): CapabilityExecutionContext {
     },
     trace,
     signal: new AbortController().signal,
-    metadata: {}
+    metadata
   };
 }
 

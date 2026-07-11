@@ -97,6 +97,19 @@ export interface CliEvaluationCheckResult extends JsonObject {
   readonly redaction: RedactionMetadata;
 }
 
+export interface CliEvaluationOutcomeGate extends JsonObject {
+  readonly status: "pass" | "fail";
+  readonly commandPassed: boolean;
+  readonly checksPassed: boolean;
+  readonly artifactsPresent: boolean;
+  readonly evidencePresent: boolean;
+  readonly terminalEventPresent: boolean;
+  readonly boundedCommandOutputEvidencePresent?: boolean;
+  readonly adversarialProbePresent?: boolean;
+  readonly reasonCodes: readonly string[];
+  readonly redaction: RedactionMetadata;
+}
+
 export interface CliEvaluationRunMetrics extends JsonObject {
   readonly elapsedMs?: number;
   readonly firstRunSuccess?: boolean;
@@ -205,6 +218,7 @@ export interface CliEvaluationTaskRunRecord extends JsonObject {
   readonly dryRun: boolean;
   readonly outcome: CliEvaluationOutcome;
   readonly checks: readonly CliEvaluationCheckResult[];
+  readonly outcomeGate?: CliEvaluationOutcomeGate;
   readonly metrics: CliEvaluationRunMetrics;
   readonly stagedTask?: CliEvaluationStagedTaskSnapshot;
   readonly instrumentationEvents: readonly CliEvaluationInstrumentationEvent[];
@@ -264,6 +278,28 @@ export interface CliEvaluationGapFinding extends JsonObject {
   readonly redaction: RedactionMetadata;
 }
 
+export interface CodexClassGapScorecardDimension extends JsonObject {
+  readonly dimensionId: "tool-surface" | "projection" | "task-closure" | "isolation" | "recovery";
+  readonly status: "pass" | "warn" | "fail" | "unavailable";
+  readonly score: number;
+  readonly evidence: readonly string[];
+  readonly blockers: readonly string[];
+  readonly nextAction: string;
+  readonly redaction: RedactionMetadata;
+}
+
+export interface CodexClassGapScorecard extends JsonObject {
+  readonly schemaVersion: string;
+  readonly kind: "codex-class.gap-scorecard";
+  readonly baselineId: "codex-class-observed";
+  readonly externalBaselineStatus: "available" | "deferred" | "unavailable";
+  readonly comparisonBoundary: string;
+  readonly dimensions: readonly CodexClassGapScorecardDimension[];
+  readonly overallStatus: "pass" | "warn" | "fail" | "unavailable";
+  readonly overallScore: number;
+  readonly redaction: RedactionMetadata;
+}
+
 export interface CliEvaluationComparisonSummary extends JsonObject {
   readonly schemaVersion: string;
   readonly kind: "cli.evaluation.comparison.summary";
@@ -279,6 +315,7 @@ export interface CliEvaluationComparisonSummary extends JsonObject {
   readonly packageScorecards?: readonly PackageScorecardSummary[];
   readonly packageScorecardAggregate?: PackageScorecardAggregate;
   readonly toolFamilyParityMatrix?: ToolFamilyParityMatrix;
+  readonly codexClassGapScorecard?: CodexClassGapScorecard;
   readonly gapFindings: readonly CliEvaluationGapFinding[];
   readonly publicBenchmarkReferences: readonly CliEvaluationPublicBenchmarkReference[];
   readonly evidencePaths: readonly string[];

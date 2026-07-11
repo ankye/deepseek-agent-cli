@@ -7,6 +7,7 @@ import type {
   ExecutionEnvelope,
   JsonObject,
   KernelError,
+  PlatformExecutionContext,
   PolicyDecision,
   RuntimeDependencies,
   RuntimeEvent,
@@ -20,7 +21,6 @@ import type {
   TraceContext
 } from "@deepseek/platform-contracts";
 import { APPROVAL_SCHEMA_VERSION, asId } from "@deepseek/platform-contracts";
-import type { PlatformExecutionContext } from "@deepseek/platform-contracts";
 import {
   analyzeResourceScope,
   createSandboxRequirement,
@@ -29,12 +29,11 @@ import {
 } from "@deepseek/policy-sandbox";
 import { DeterministicClock, DeterministicIdFactory, NoopRuntimeKernelLogger } from "./deterministic.js";
 import { kernelError } from "./errors.js";
-import {
-  buildExecutionEnvelope,
-  policyMetadataFor,
-  validateExecutionEnvelope
-} from "./envelope.js";
+import { buildExecutionEnvelope, policyMetadataFor, validateExecutionEnvelope } from "./envelope.js";
 import { registerRuntimeBuiltins } from "./echo-capability.js";
+import { normalizeResourceLocks } from "./resource-locks.js";
+import { assertRuntimeKernelDependencies, runtimeKernelDependencies } from "./runtime-kernel-dependencies.js";
+import { inputWithSessionWorkspaceRoot } from "./session-workspace-defaults.js";
 
 export class InProcessRuntimeKernel implements RuntimeKernel {
   private lifecycle: RuntimeKernelState = "created";
@@ -42,24 +41,7 @@ export class InProcessRuntimeKernel implements RuntimeKernel {
   private readonly cancelled = new Map<string, string>();
 
   constructor(private readonly deps: RuntimeKernelDependencies) {
-    const missing = [
-      "bus",
-      "workflow",
-      "scheduler",
-      "capabilities",
-      "policy",
-      "approvals",
-      "sandbox",
-      "sessions",
-      "observability",
-      "platform",
-      "clock",
-      "ids",
-      "logger"
-    ].filter((key) => (deps as unknown as Record<string, unknown>)[key] === undefined);
-    if (missing.length > 0) {
-      throw new Error(kernelError("KERNEL_CONFIGURATION_ERROR", `Missing runtime kernel dependencies: ${missing.join(", ")}`).message);
-    }
+    assertRuntimeKernelDependencies(deps);
   }
 
   async start(): Promise<void> {
@@ -121,8 +103,11 @@ export class InProcessRuntimeKernel implements RuntimeKernel {
     yield workflowOpened;
 
     const effectiveTimeoutMs = request.timeoutMs ?? binding.manifest.timeoutMs ?? 30_000;
+    const effectiveInput = await inputWithSessionWorkspaceRoot(this.deps.sessions, request.input, sessionId);
+    const envelopeRequest = { ...request, input: effectiveInput, timeoutMs: effectiveTimeoutMs };
+    const platformContext = await this.platformExecutionContext(binding.manifest.sideEffect, effectiveTimeoutMs, effectiveInput);
     const envelope = buildExecutionEnvelope({
-      request: { ...request, timeoutMs: effectiveTimeoutMs },
+      request: envelopeRequest,
       manifest: binding.manifest,
       sessionId,
       workflowId: String(workflow.workflowId),
@@ -130,7 +115,8 @@ export class InProcessRuntimeKernel implements RuntimeKernel {
       invocationId,
       trace,
       createdAt: this.deps.clock.now().toISOString(),
-      platformContext: await this.platformExecutionContext(binding.manifest.sideEffect, effectiveTimeoutMs, request.input)
+      platformContext,
+      resolveWorkspacePath: this.deps.platform.resolveWorkspacePath.bind(this.deps.platform)
     });
     const validationErrors = validateExecutionEnvelope(envelope);
     const envelopeEvent = this.event("execution.envelope.created", sessionId, trace, { envelope }, request.agentId, workflow.taskId);
@@ -149,7 +135,7 @@ export class InProcessRuntimeKernel implements RuntimeKernel {
       subject: request.caller,
       action: `execute:${String(binding.manifest.id)}`,
       resource: String(binding.manifest.id),
-      metadata: policyMetadataFor(envelope, request.input),
+      metadata: policyMetadataFor(envelope, effectiveInput),
       ...(platform ? { platform } : {}),
       secret: envelope.secretExposure,
       resourceScope: envelope.resourceScope,
@@ -268,17 +254,18 @@ export class InProcessRuntimeKernel implements RuntimeKernel {
           trace,
           metadata: { envelopeId: invocationId, capabilityId: binding.manifest.id }
         },
-        (taskContext) => binding.execute(request.input, {
+        (taskContext) => this.withResourceLocks(envelope.resourceLocks, () => binding.execute(effectiveInput, {
           envelope,
           trace,
           signal: taskContext.signal,
           ...(taskContext.cancellationReason ? { cancellationReason: taskContext.cancellationReason } : {}),
           metadata: {
+            ...(request.metadata ? request.metadata : {}),
             taskId: workflow.taskId,
             workflowId: workflow.workflowId,
             capabilityId: binding.manifest.id
           }
-        })
+        }))
       );
       await Promise.resolve();
       for await (const event of drainSchedulerEvents(this)) yield event;
@@ -539,10 +526,16 @@ export class InProcessRuntimeKernel implements RuntimeKernel {
 
   private toKernelError(error?: import("@deepseek/platform-contracts").RedactedError): KernelError {
     if (!error) return kernelError("KERNEL_EXECUTOR_FAILED", "Executor returned failure");
-    return kernelError("KERNEL_EXECUTOR_FAILED", error.message, {
+    const wrapped = kernelError("KERNEL_EXECUTOR_FAILED", error.message, {
       originalCode: error.code,
-      retryable: error.retryable
+      retryable: error.retryable,
+      ...(error.suggestedActions ? { suggestedActions: error.suggestedActions } : {}),
+      ...(error.details ? error.details : {})
     });
+    return {
+      ...wrapped,
+      ...(error.suggestedActions ? { suggestedActions: error.suggestedActions } : {})
+    };
   }
 
   private async publishLifecycle(state: string): Promise<void> {
@@ -560,6 +553,20 @@ export class InProcessRuntimeKernel implements RuntimeKernel {
       status: event.status,
       reason: event.reason ?? ""
     }, agentId, taskId ?? event.taskId);
+  }
+
+  private async withResourceLocks<T>(locks: readonly string[], work: () => Promise<T>): Promise<T> {
+    const descriptor = await this.deps.platform.descriptor();
+    const parsedLocks = normalizeResourceLocks(locks, { caseSensitive: descriptor.filesystem.caseSensitive });
+    if (parsedLocks.length === 0) return work();
+    let current = work;
+    for (let index = parsedLocks.length - 1; index >= 0; index -= 1) {
+      const lock = parsedLocks[index];
+      if (!lock) continue;
+      const next = current;
+      current = () => this.deps.scheduler.withLock(lock, next);
+    }
+    return current();
   }
 
   private async recordEvent(event: RuntimeEvent): Promise<void> {
@@ -667,21 +674,11 @@ export function createRuntimeKernel(
   deps: RuntimeDependencies,
   options: Partial<Pick<RuntimeKernelDependencies, "clock" | "ids" | "logger">> = {}
 ): RuntimeKernel {
-  return new InProcessRuntimeKernel({
-    bus: deps.bus,
-    workflow: deps.workflow,
-    scheduler: deps.concurrency,
-    capabilities: deps.capabilities,
-    policy: deps.policy,
-    approvals: deps.approvals,
-    sandbox: deps.sandbox,
-    sessions: deps.sessions,
-    observability: deps.observability,
-    platform: deps.platform,
+  return new InProcessRuntimeKernel(runtimeKernelDependencies(deps, {
     clock: options.clock ?? new DeterministicClock(),
     ids: options.ids ?? new DeterministicIdFactory(),
     logger: options.logger ?? new NoopRuntimeKernelLogger()
-  });
+  }));
 }
 
 export async function createDefaultRuntimeKernel(deps: RuntimeDependencies): Promise<RuntimeKernel> {

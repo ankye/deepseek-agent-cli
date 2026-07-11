@@ -51,6 +51,9 @@ export interface PromptAssemblerOptions {
 const DEFAULT_PACKAGE_VERSION = "0.1.0";
 const DEFAULT_PREVIEW_CHARS = 160;
 const STAGES: readonly PromptAssemblyStage[] = ["normalize", "collect-sections", "order-sections", "budget", "weave-messages", "project-tools", "trace"];
+const PROVIDER_HISTORY_DYNAMIC_MESSAGE_LIMIT = 6;
+const PROVIDER_HISTORY_COMPACT_TOOL_RESULT_CHARS = 360;
+const PROVIDER_HISTORY_SOURCE_RESULT_CHARS = 12_000;
 const EMPTY_REDACTION = { class: "internal" as const };
 
 export function createDefaultPromptAssembler(options: PromptAssemblerOptions = {}): PromptAssembler {
@@ -75,7 +78,7 @@ export class DefaultPromptAssembler implements PromptAssembler {
     const ordered = orderSections(rawSections);
     const budgeted = applyBudget(ordered, input, this.previewChars);
     const messages = weaveMessages(budgeted.included, input.history, input.prompt);
-    const toolPlan = projectTools(input.availableTools, input.toolPolicy);
+    const toolPlan = projectTools(input.availableTools, input.toolPolicy, input.toolOptIns ?? []);
     const promptText = messages.map((message) => `${message.role}: ${message.content}`).join("\n");
     const registryFingerprint = stableHash(this.providers.map((provider) => providerFingerprint(provider)).join("|"));
     const replay = createReplayEvidence({
@@ -284,7 +287,7 @@ function weaveMessages(sections: readonly PromptSection[], history: readonly Mod
 
 function historyWithStableTaskPrompt(history: readonly ModelChatMessage[], prompt: string): readonly ModelChatMessage[] {
   let marked = false;
-  return history.map((message) => {
+  const markedHistory: ModelChatMessage[] = history.map((message) => {
     if (marked || message.role !== "user" || message.content !== prompt || message.cacheHint) return message;
     marked = true;
     return {
@@ -292,6 +295,149 @@ function historyWithStableTaskPrompt(history: readonly ModelChatMessage[], promp
       cacheHint: { policy: "stable", freshness: "turn" }
     };
   });
+  return boundDynamicProviderHistory(markedHistory);
+}
+
+function boundDynamicProviderHistory(history: readonly ModelChatMessage[]): readonly ModelChatMessage[] {
+  const stableTaskIndex = history.findIndex((message) => message.role === "user" && message.cacheHint?.policy === "stable");
+  if (stableTaskIndex < 0) return history.slice(-PROVIDER_HISTORY_DYNAMIC_MESSAGE_LIMIT);
+  const prefix = history.slice(0, stableTaskIndex + 1);
+  const tail = history.slice(stableTaskIndex + 1);
+  return [...prefix, ...boundedTailWithToolPairs(tail, PROVIDER_HISTORY_DYNAMIC_MESSAGE_LIMIT)];
+}
+
+function boundedTailWithToolPairs(tail: readonly ModelChatMessage[], limit: number): readonly ModelChatMessage[] {
+  const sourceEvidence = latestSuccessfulSourceEvidencePair(tail);
+  const recentLimit = Math.max(0, limit - (sourceEvidence ? 2 : 0));
+  const selected: Array<{ readonly index: number; readonly message: ModelChatMessage }> = [];
+  const selectedToolCallIds = new Set<string>();
+  let recentToolResult = true;
+  for (let index = tail.length - 1; index >= 0 && selected.length < recentLimit; index -= 1) {
+    const message = tail[index];
+    if (!message) continue;
+    if (message.role === "tool") {
+      if (message.toolCallId === sourceEvidence?.toolCallId) continue;
+      const pair = toolPairFor(tail, index, selectedToolCallIds);
+      if (pair && selected.length + 2 <= recentLimit) {
+        const toolMessage = compactToolResultMessage(message, recentToolResult);
+        recentToolResult = false;
+        selected.push(
+          { index: pair.intentIndex, message: pair.intent },
+          { index, message: toolMessage }
+        );
+        selectedToolCallIds.add(pair.toolCallId);
+      }
+      continue;
+    }
+    if (message.toolCalls && message.toolCalls.length > 0) {
+      const allSelected = message.toolCalls.every((toolCall) => selectedToolCallIds.has(toolCall.id));
+      if (allSelected) continue;
+      continue;
+    }
+    selected.push({ index, message });
+  }
+  if (sourceEvidence) {
+    selected.push(
+      { index: sourceEvidence.intentIndex, message: sourceEvidence.intent },
+      { index: sourceEvidence.toolIndex, message: compactToolResultMessage(sourceEvidence.tool, false) }
+    );
+  }
+  return selected
+    .sort((left, right) => left.index - right.index)
+    .map((entry) => entry.message);
+}
+
+function compactToolResultMessage(message: ModelChatMessage, recent: boolean): ModelChatMessage {
+  if (message.role === "tool" && isSuccessfulSourceInspectionResult(message)) {
+    return compactSourceInspectionResult(message);
+  }
+  if (message.role !== "tool" || message.content.length <= PROVIDER_HISTORY_COMPACT_TOOL_RESULT_CHARS) return message;
+  const previewChars = Math.floor(PROVIDER_HISTORY_COMPACT_TOOL_RESULT_CHARS / 2);
+  const head = message.content.slice(0, previewChars).replace(/\s+$/g, "");
+  const tail = message.content.slice(-previewChars).replace(/^\s+/g, "");
+  return {
+    ...message,
+    content: [
+      `compacted ${recent ? "recent" : "older"} tool result: ${message.toolName ?? "tool"} ${message.toolCallId ?? ""}`.trim(),
+      `originalChars=${message.content.length}`,
+      "head:",
+      head,
+      ...(recent ? ["tail:", tail] : [])
+    ].join("\n")
+  };
+}
+
+function compactSourceInspectionResult(message: ModelChatMessage): ModelChatMessage {
+  if (message.content.length <= PROVIDER_HISTORY_SOURCE_RESULT_CHARS) return message;
+  const segmentChars = Math.floor(PROVIDER_HISTORY_SOURCE_RESULT_CHARS / 3);
+  const middleStart = Math.max(0, Math.floor((message.content.length - segmentChars) / 2));
+  return {
+    ...message,
+    content: [
+      `compacted source tool result: ${message.toolName ?? "tool"} ${message.toolCallId ?? ""}`.trim(),
+      `originalChars=${message.content.length}`,
+      "head:",
+      message.content.slice(0, segmentChars).replace(/\s+$/g, ""),
+      "middle:",
+      message.content.slice(middleStart, middleStart + segmentChars).replace(/^\s+|\s+$/g, ""),
+      "tail:",
+      message.content.slice(-segmentChars).replace(/^\s+/g, "")
+    ].join("\n")
+  };
+}
+
+function latestSuccessfulSourceEvidencePair(tail: readonly ModelChatMessage[]): {
+  readonly intent: ModelChatMessage;
+  readonly intentIndex: number;
+  readonly tool: ModelChatMessage;
+  readonly toolIndex: number;
+  readonly toolCallId: string;
+} | undefined {
+  for (let index = tail.length - 1; index >= 0; index -= 1) {
+    const message = tail[index];
+    if (!message || message.role !== "tool" || !isSuccessfulSourceInspectionResult(message)) continue;
+    const pair = toolPairFor(tail, index, new Set());
+    if (!pair) continue;
+    return {
+      intent: pair.intent,
+      intentIndex: pair.intentIndex,
+      tool: message,
+      toolIndex: index,
+      toolCallId: pair.toolCallId
+    };
+  }
+  return undefined;
+}
+
+function isSuccessfulSourceInspectionResult(message: ModelChatMessage): boolean {
+  if (message.role !== "tool" || !isSourceInspectionToolName(message.toolName)) return false;
+  const prefix = message.content.trimStart().slice(0, 160).toUpperCase();
+  return !prefix.startsWith("WORKFLOW_")
+    && !prefix.startsWith("TOOL EXECUTION FAILED")
+    && !prefix.startsWith("ERROR CODE:");
+}
+
+function isSourceInspectionToolName(toolName: string | undefined): boolean {
+  return toolName === "core.file.read"
+    || toolName === "core.file.list"
+    || toolName === "core.search.text"
+    || toolName === "core.workspace.glob";
+}
+
+function toolPairFor(
+  tail: readonly ModelChatMessage[],
+  toolIndex: number,
+  selectedToolCallIds: ReadonlySet<string>
+): { readonly intent: ModelChatMessage; readonly intentIndex: number; readonly toolCallId: string } | undefined {
+  const toolMessage = tail[toolIndex];
+  const toolCallId = toolMessage?.toolCallId;
+  if (!toolCallId || selectedToolCallIds.has(toolCallId)) return undefined;
+  for (let index = toolIndex - 1; index >= 0; index -= 1) {
+    const message = tail[index];
+    if (!message?.toolCalls?.some((toolCall) => toolCall.id === toolCallId)) continue;
+    return { intent: message, intentIndex: index, toolCallId };
+  }
+  return undefined;
 }
 
 function orderedSystemSectionsForProviderPrefix(sections: readonly PromptSection[]): readonly PromptSection[] {
@@ -317,7 +463,11 @@ function cacheHintForSection(section: PromptSection): NonNullable<ModelChatMessa
 
 function isStablePrefixSection(section: PromptSection): boolean {
   if (section.source === "self-repair") return false;
+  if (section.providerId === "core.task-output-contract") return false;
   if (section.providerId === "core.profile-workflow-state") return false;
+  if (section.providerId === "core.scheduling-next-action") return false;
+  if (section.providerId === "core.tool-policy") return false;
+  if (section.providerId === "core.tool-decision-board") return false;
   if (section.providerId === "core.project-instructions") {
     return section.source === "project"
       && section.kind === "project.instructions";
@@ -335,12 +485,12 @@ function isStablePrefixSection(section: PromptSection): boolean {
     );
 }
 
-function projectTools(tools: readonly CapabilityManifest[], policy: AgentLoopToolProjection): PromptToolPlan {
+function projectTools(tools: readonly CapabilityManifest[], policy: AgentLoopToolProjection, toolOptIns: readonly string[] = []): PromptToolPlan {
   const visibleTools: JsonObject[] = [];
   const excludedTools: JsonObject[] = [];
   for (const tool of tools) {
     const schema = modelToolSchema(tool);
-    if (isCapabilityVisibleForProjection(tool, policy)) {
+    if (isCapabilityVisibleForProjection(tool, policy, toolOptIns)) {
       visibleTools.push(schema);
     } else {
       excludedTools.push({
@@ -360,7 +510,7 @@ function projectTools(tools: readonly CapabilityManifest[], policy: AgentLoopToo
   };
 }
 
-function modelToolSchema(manifest: CapabilityManifest): JsonObject {
+export function modelToolSchema(manifest: CapabilityManifest): JsonObject {
   const safeName = toSafeToolName(String(manifest.id));
   return {
     type: "function",

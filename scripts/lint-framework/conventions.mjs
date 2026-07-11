@@ -173,7 +173,7 @@ export const lintConventions = {
     ]
   },
   governedExecution: {
-    approvedPackages: new Set(["runtime"]),
+    approvedPackages: new Set(["runtime", "core-coding-tools"]),
     deterministicPackages: new Set(["testing-regression"]),
     primitives: [
       {
@@ -290,6 +290,7 @@ export const lintConventions = {
       "src/packages/context-engine/src/index.ts",
       "src/packages/policy-sandbox/src/index.ts",
       "src/packages/runtime/src/agent-loop.ts",
+      "src/packages/runtime/src/agent-loop-tools.ts",
       "src/apps/cli/src/diagnostics/swe-bench-prediction.ts",
       "src/apps/cli/src/host/swe-bench-run-capabilities.ts"
     ])

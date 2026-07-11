@@ -1,6 +1,7 @@
 import { PROMPT_ASSEMBLY_SCHEMA_VERSION } from "@deepseek/platform-contracts";
 import type { PromptSectionProviderRegistration } from "../assembler.js";
 import { createPromptSection } from "../sections.js";
+import { isCapabilityVisibleForProjection } from "../tool-projection.js";
 
 export function createTaskOutputContractProvider(): PromptSectionProviderRegistration {
   return {
@@ -83,11 +84,13 @@ function explicitOutputContractSections(input: Parameters<PromptSectionProviderR
 }
 
 function fileMutationContractSections(input: Parameters<PromptSectionProviderRegistration["provide"]>[0]) {
-  if (input.mode !== "coding" || !fileMutationRequested(input.prompt)) return [];
+  if (!fileMutationRequested(input.prompt)) return [];
+  const requestedPaths = requestedPathLiterals(input.prompt);
+  const readyMutationTools = readyMutationProgressTools(input);
   const visibleToolNames = input.availableTools
-    .filter((tool) => tool.enabled !== false && (input.toolPolicy === "all" || input.toolPolicy === "read-write" || tool.sideEffect === "none" || tool.sideEffect === "read"))
+    .filter((tool) => tool.enabled !== false && isCapabilityVisibleForProjection(tool, input.toolPolicy))
     .map((tool) => safeToolName(String(tool.id)));
-  const preferredTools = ["core_file_read", "core_file_write", "core_file_edit", "core_shell_run"]
+  const preferredTools = ["core_file_read", "core_file_write", "core_file_edit", "core_test_run", "core_shell_run"]
     .filter((toolName) => visibleToolNames.includes(toolName));
   return [createPromptSection({
     id: "section.file-mutation-output-contract",
@@ -98,7 +101,12 @@ function fileMutationContractSections(input: Parameters<PromptSectionProviderReg
     content: [
       "File mutation output contract:",
       "- This task is only complete after the requested workspace files are changed on disk; a text-only answer is incomplete.",
-      "- Inspect the relevant files first, then use governed file write/edit tools to update them.",
+      readyMutationTools.length > 0
+        ? `- Current ready stage requires mutation progress: ${joinAsChoices(readyMutationTools)}.`
+        : "- Inspect the relevant files first, then use governed file write/edit tools to update them.",
+      ...(readyMutationTools.length > 0 ? ["- Do not continue with read/search/list-only inspection unless a mutation tool is blocked."] : []),
+      "- Preserve any requested path literals exactly, including case.",
+      ...(requestedPaths.length > 0 ? [`- Requested path literals: ${requestedPaths.join(", ")}.`] : []),
       ...(preferredTools.length > 0 ? [`- Prefer exact visible tool names for this flow: ${preferredTools.join(", ")}.`] : []),
       "- Remove placeholder markers such as TODO or TBD when the task asks to replace them.",
       "- Run the local checker after writing files when a checker is available. If it fails, make a bounded correction and rerun when possible."
@@ -130,8 +138,52 @@ function stripRelativePrefix(value: string): string {
 }
 
 function fileMutationRequested(prompt: string): boolean {
+  if (/不要(?:修改|写入|编辑|删除|创建|生成)|不应(?:修改|写入|编辑|删除|创建|生成)|不应该(?:修改|写入|编辑|删除|创建|生成)|do not (?:modify|write|edit|delete|create|generate)/i.test(prompt)) {
+    return false;
+  }
   return /\b(update|write|edit|create|modify|fix|repair|refactor|add|remove|delete)\b/i.test(prompt)
-    || /更新|写入|编辑|修改|修复|新增|创建|删除|补齐/.test(prompt);
+    || /更新|写入|编辑|修改|修复|新增|创建|删除|补齐|生成/.test(prompt);
+}
+
+function requestedPathLiterals(prompt: string): readonly string[] {
+  const paths = new Set<string>();
+  for (const match of prompt.matchAll(/(?:^|[\s"'`，。；：、,;:(（])((?:\.\/)?(?:(?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+|[A-Za-z0-9_.-]+\.[A-Za-z0-9][A-Za-z0-9_.-]*))(?=$|[\s"'`，。；：、,;:)）])/g)) {
+    const path = match[1]?.replace(/^\.\//, "");
+    if (path && !path.includes("://") && !path.startsWith("../") && !path.includes("/../")) paths.add(path);
+  }
+  return [...paths];
+}
+
+function readyMutationProgressTools(input: Parameters<PromptSectionProviderRegistration["provide"]>[0]): readonly string[] {
+  const workflow = input.profilePolicy?.stagedTaskWorkflow;
+  if (!workflow) return [];
+  const stagesById = new Map(workflow.graph.stages.map((stage) => [stage.stageId, stage]));
+  const evidenceSucceeded = workflow.runState.stageStates.some((state) => {
+    const stage = stagesById.get(state.stageId);
+    return state.status === "succeeded" && stage?.kind === "collect-evidence";
+  });
+  if (!evidenceSucceeded) return [];
+  for (const state of workflow.runState.stageStates) {
+    if (state.status !== "ready") continue;
+    const stage = stagesById.get(state.stageId);
+    if (stage?.kind !== "produce" && stage?.kind !== "repair") continue;
+    const mutationTools = (stage.allowedTools ?? []).filter(isMutationCapabilityId);
+    if (mutationTools.length > 0) return mutationTools;
+  }
+  return [];
+}
+
+function isMutationCapabilityId(capabilityId: string): boolean {
+  return capabilityId.includes(".edit")
+    || capabilityId.includes(".write")
+    || capabilityId.includes(".patch")
+    || capabilityId.includes("patch.apply")
+    || capabilityId.includes("file.write");
+}
+
+function joinAsChoices(values: readonly string[]): string {
+  if (values.length <= 1) return values[0] ?? "mutation tool";
+  return `${values.slice(0, -1).join(", ")} or ${values.at(-1)}`;
 }
 
 function safeToolName(capabilityId: string): string {

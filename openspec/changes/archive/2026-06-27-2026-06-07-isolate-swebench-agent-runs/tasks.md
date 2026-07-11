@@ -35,7 +35,7 @@
 - [x] Allow framework-owned SWE-bench Lite range normalization for 200-instance campaign prompts such as `第 1 到第 200 题`.
 - [x] Split SWE-bench cache evidence into provider token cache SLO metrics and context projection cache observability metrics.
 - [x] Add temporary architecture split-plan baselines for `src/apps/cli/src/diagnostics/swe-bench-prediction.ts` and `src/apps/cli/src/host/swe-bench-run-capabilities.ts`; follow-up extraction should split prediction, harness evaluation, and batch run orchestration into separate modules.
-- [ ] Verify with focused tests, OpenSpec validation, typecheck, lint, boundary checks, and a fresh simple-prompt GLM probe.
+- [x] Verify with focused tests, OpenSpec validation, typecheck, lint, boundary checks, and a fresh simple-prompt GLM probe.
 
 - [x] 增加 run-scoped SWE-bench 短 prompt 路由与 stale workspace 拒绝的 OpenSpec 场景。
 - [x] 增加先失败 runtime task-delivery 测试，证明短 prompt 不再暴露 `.deepseek/swebench-workspaces`。
@@ -74,4 +74,4 @@
 - [x] 允许框架层 SWE-bench Lite range normalization 覆盖 `第 1 到第 200 题` 这类 200-instance campaign prompt。
 - [x] 将 SWE-bench cache evidence 拆成 provider token cache SLO 指标与 context projection cache 可观测指标。
 - [x] 为 `src/apps/cli/src/diagnostics/swe-bench-prediction.ts` 与 `src/apps/cli/src/host/swe-bench-run-capabilities.ts` 增加临时 architecture split-plan baseline；后续需要把 prediction、harness evaluation 与 batch run orchestration 拆成独立 modules。
-- [ ] 运行 focused tests、OpenSpec validation、typecheck、lint、boundary checks，并重新用简单 prompt 做 GLM probe。
+- [x] 运行 focused tests、OpenSpec validation、typecheck、lint、boundary checks，并重新用简单 prompt 做 GLM probe。

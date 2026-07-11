@@ -41,16 +41,19 @@ export async function runCli(
   const writer = (line: string) => Promise.resolve(write(line));
   const inlineWriter = createInlineWriter(write, terminalProfile);
   const bufferedInline = shouldBufferInline(write, terminalProfile);
+  const effectiveRunOptions = options.workspaceRoot
+    ? { ...runOptions, workspaceRoot: options.workspaceRoot }
+    : runOptions;
   if (options.command === "help") {
     for (const line of cliUsageLines()) await writer(line);
     return;
   }
   if (options.command === "readiness") {
-    await runReadinessCommand(options, writer);
+    await runReadinessCommand(options, writer, effectiveRunOptions);
     return;
   }
   if (options.command === "diagnostics") {
-    await runDiagnosticsCommand(options, writer);
+    await runDiagnosticsCommand(options, writer, effectiveRunOptions);
     return;
   }
   if (options.command === "extension") {
@@ -58,7 +61,7 @@ export async function runCli(
     return;
   }
   if (options.command === "index-provider") {
-    await runIndexProviderCommand(options, writer);
+    await runIndexProviderCommand(options, writer, effectiveRunOptions);
     return;
   }
   if (options.command === "mode") {
@@ -66,31 +69,31 @@ export async function runCli(
     return;
   }
   if (options.command === "memory") {
-    await runMemoryCommand(options, writer, runOptions);
+    await runMemoryCommand(options, writer, effectiveRunOptions);
     return;
   }
   if (options.command === "context") {
-    await runContextCommand(options, writer, runOptions);
+    await runContextCommand(options, writer, effectiveRunOptions);
     return;
   }
   if (options.command === "checks") {
-    await runDevCheckCommand(options, writer, runOptions);
+    await runDevCheckCommand(options, writer, effectiveRunOptions);
     return;
   }
   if (options.command === "file") {
-    await runFileManagerCommand(options, writer, runOptions);
+    await runFileManagerCommand(options, writer, effectiveRunOptions);
     return;
   }
   if (options.command === "repo") {
-    await runRepoNavigatorCommand(options, writer, runOptions);
+    await runRepoNavigatorCommand(options, writer, effectiveRunOptions);
     return;
   }
   if (options.command === "git") {
-    await runGitReviewCommand(options, writer, runOptions);
+    await runGitReviewCommand(options, writer, effectiveRunOptions);
     return;
   }
   if (options.command === "jump") {
-    await runJumpNavigatorCommand(options, writer, runOptions);
+    await runJumpNavigatorCommand(options, writer, effectiveRunOptions);
     return;
   }
   if (options.command === "palette") {
@@ -98,7 +101,7 @@ export async function runCli(
     return;
   }
   if (options.command === "revert") {
-    await runRevertCommand(options, writer, runOptions);
+    await runRevertCommand(options, writer, effectiveRunOptions);
     return;
   }
   if (options.command === "tools-smoke") {
@@ -106,7 +109,7 @@ export async function runCli(
     return;
   }
   if (options.command === "session") {
-    await runSessionCommand(options, writer, runOptions);
+    await runSessionCommand(options, writer, effectiveRunOptions);
     return;
   }
   if (options.command === "mcp") {
@@ -114,8 +117,8 @@ export async function runCli(
     return;
   }
   if (options.command === "chat") {
-    await runChatCommand(options, writer, inlineWriter, bufferedInline, input, terminalProfile, runOptions);
+    await runChatCommand(options, writer, inlineWriter, bufferedInline, input, terminalProfile, effectiveRunOptions);
     return;
   }
-  await runOneShotCommand(options, writer, inlineWriter, bufferedInline, terminalProfile, runOptions);
+  await runOneShotCommand(options, writer, inlineWriter, bufferedInline, terminalProfile, effectiveRunOptions);
 }

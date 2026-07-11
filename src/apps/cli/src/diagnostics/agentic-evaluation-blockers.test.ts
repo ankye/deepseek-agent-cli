@@ -134,9 +134,18 @@ describe("agentic evaluation blocker catalog", () => {
     assert.equal(ids.has("agentic.blocker.102.swe-bench-request-budget-exceeded"), true);
   });
 
-  it("treats twelve model requests as a suspicious request-budget signal", () => {
+  it("does not treat twelve model requests as the widened request-budget signal", () => {
     const findings = evaluateAgenticEvaluationBlockers({
       modelRequestCount: 12
+    });
+    const ids = new Set(findings.map((finding) => finding.blocker.id));
+
+    assert.equal(ids.has("agentic.blocker.102.swe-bench-request-budget-exceeded"), false);
+  });
+
+  it("treats twenty-four model requests as the widened request-budget signal", () => {
+    const findings = evaluateAgenticEvaluationBlockers({
+      modelRequestCount: 24
     });
     const ids = new Set(findings.map((finding) => finding.blocker.id));
 
@@ -461,6 +470,61 @@ describe("agentic evaluation blocker catalog", () => {
     assert.equal(summary.successfulTestCommandCount, 1);
     assert.equal(summary.diagnosticCodes.includes("SWE_BENCH_READY_FOR_HARNESS_GATE"), true);
     assert.equal(ids.has("agentic.blocker.102.swe-bench-request-budget-exceeded"), false);
+  });
+
+  it("does not count non-test core.test.run commands as verification evidence", () => {
+    const trace = [
+      JSON.stringify({
+        kind: "model.tool.intent",
+        data: {
+          toolCallId: "call-invalid-test-tool",
+          name: "core.test.run",
+          input: {
+            command: "cat",
+            args: ["django/forms/widgets.py"]
+          },
+          iteration: 1
+        }
+      }),
+      JSON.stringify({
+        kind: "model.tool.result",
+        data: {
+          toolCallId: "call-invalid-test-tool",
+          toolName: "core.test.run",
+          terminalKind: "capability.completed",
+          evidence: {
+            status: "success",
+            metadata: { exitCode: 0 }
+          }
+        }
+      }),
+      JSON.stringify({
+        kind: "agent.loop.budget.consumed",
+        data: {
+          budget: {
+            kind: "model-iteration",
+            stopReason: "swe-bench-request-budget-exceeded"
+          },
+          gate: "SWE_BENCH_REQUEST_BUDGET_GATE",
+          modelRequestCount: 12,
+          sourceInspectionToolCount: 8,
+          sourceMutationCount: 0,
+          shellCommandCount: 0,
+          testCommandCount: 0,
+          successfulTestCommandCount: 0
+        }
+      }),
+      ""
+    ].join("\n");
+
+    const summary = summarizeSweBenchChildTrace(trace, "/workspace/trace.jsonl");
+    const ids = new Set(summary.blockerFindings.map((finding) => finding.blockerId));
+
+    assert.equal(summary.testCommandCount, 0);
+    assert.equal(summary.successfulTestCommandCount, 0);
+    assert.equal(summary.invalidTestToolCommandCount, 1);
+    assert.equal(summary.diagnosticCodes.includes("SWE_BENCH_INVALID_TEST_TOOL_COMMAND_GATE"), true);
+    assert.equal(ids.has("agentic.blocker.123.invalid-test-tool-command"), true);
   });
 
   it("classifies pytest internal dependency API mismatches as environment blockers", () => {

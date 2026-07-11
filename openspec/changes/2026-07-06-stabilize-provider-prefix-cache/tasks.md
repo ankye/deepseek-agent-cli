@@ -1,0 +1,33 @@
+# Tasks / 任务
+
+- [x] Add regression coverage for stable provider-prefix fingerprints with changing stage-scoped tool plans.
+- [x] Update SWE-bench cache trace stability helpers so provider-prefix evidence overrides dynamic tool-plan drift for prefix-busted classification.
+- [x] Preserve true prompt-prefix-busted diagnostics when provider-prefix evidence is absent or unstable.
+- [x] Validate focused diagnostics tests, prompt assembly tests, typecheck, and CLI build.
+- [x] Re-run SWE-bench Lite task 1 and record child request count, resolution, and cache diagnostics.
+- [x] Add coverage for dynamic output-contract guidance and stable profile/task-intent contracts across tool projections.
+- [x] Add reverse diagnostic coverage proving true provider-prefix drift still reports prefix-busted diagnostics when tool plans also drift.
+- [x] Add runtime integration coverage proving provider-prefix fingerprints remain stable when staged workflow tool projection changes.
+- [x] Fix runtime regressions found while broadening coverage: case-insensitive resource locks, ready-stage budget review re-entry, terminal failed close, and supervisor stage evaluation/tool projection consistency.
+- [x] Add CLI regression coverage proving `diagnostics swe-bench run` is parsed as a governed run action and routes to `core.swe.bench.run` instead of the prediction adapter.
+- [x] Re-run current CLI SWE-bench Lite task 1 through `diagnostics swe-bench run`; it resolved `astropy__astropy-12907` with 4 child model requests, 1 successful test command, and cache-only warnings.
+- [x] Add shared board cache contract coverage so dynamic board ids, records, recommendations, and counters do not change provider-prefix fingerprints.
+- [x] Add a stable prompt assembly provider for shared board schema and parent-child sharing rules while keeping runtime board records in the dynamic tail.
+- [x] Validate focused prompt assembly tests, OpenSpec, typecheck, and CLI build after shared board prefix changes.
+- [x] Re-run SWE-bench Lite task 1 and compare provider cache summary against prior low-hit traces; `swe-lite-task-1-deepseek-support-tools-v3-20260706-1` resolved `astropy__astropy-12907` with 8 child model requests, 1 mutation, 1 successful test, stable provider prefix, and remaining provider cache dynamic-tail miss at 74.4%.
+
+- [x] 为 provider-prefix fingerprint 稳定但 stage-scoped tool plan 变化的场景增加回归覆盖。
+- [x] 更新 SWE-bench cache trace 稳定性 helper，使 provider-prefix evidence 在 prefix-busted 分类中优先于动态 tool-plan 漂移。
+- [x] 在 provider-prefix evidence 缺失或不稳定时保留真实 prompt-prefix-busted 诊断。
+- [x] 验证 focused diagnostics tests、prompt assembly tests、typecheck 与 CLI build。
+- [x] 重新运行 SWE-bench Lite 第一题，并记录 child request count、resolved 状态与 cache 诊断。
+- [x] 增加动态 output-contract guidance 以及跨 tool projection 的稳定 profile/task-intent contract 覆盖。
+- [x] 增加反向诊断覆盖，证明真实 provider-prefix 漂移在 tool plan 同时漂移时仍会报告 prefix-busted 诊断。
+- [x] 增加 runtime 集成覆盖，证明 staged workflow tool projection 变化时 provider-prefix fingerprint 仍保持稳定。
+- [x] 修复扩展覆盖时发现的 runtime 回归：大小写不敏感 resource locks、ready-stage budget review 回流、terminal failed close，以及 supervisor stage evaluation/tool projection 一致性。
+- [x] 增加 CLI 回归覆盖，证明 `diagnostics swe-bench run` 会被解析为受治理 run action，并路由到 `core.swe.bench.run`，不会再误入 prediction adapter。
+- [x] 使用当前 CLI 重新运行 SWE-bench Lite 第一题；`astropy__astropy-12907` 已 resolved，child model requests 为 4，成功测试命令为 1，仅剩 cache 相关 warning。
+- [x] 增加共享看板缓存契约覆盖，确保动态 board id、records、recommendations 和 counters 不会改变 provider-prefix fingerprints。
+- [x] 增加稳定 prompt assembly provider，用于共享看板 schema 和父子共享规则，同时将运行时 board records 保持在动态 tail。
+- [x] 在共享看板 prefix 变更后验证 focused prompt assembly tests、OpenSpec、typecheck 和 CLI build。
+- [x] 重新运行 SWE-bench Lite 第一题，并与此前低命中 trace 的 provider cache summary 对比；`swe-lite-task-1-deepseek-support-tools-v3-20260706-1` 已 resolved `astropy__astropy-12907`，child model requests 为 8，mutation 为 1，成功测试为 1，provider prefix 稳定，剩余 provider cache dynamic-tail miss，命中率 74.4%。

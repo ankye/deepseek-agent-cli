@@ -7,6 +7,22 @@ import type { CapabilityToolFamilyMetadata, ToolFamilyProjectionFilter } from ".
 export type SideEffectLevel = "none" | "read" | "write" | "network" | "process";
 export type TrustStatus = "trusted" | "workspace" | "untrusted" | "quarantined";
 
+export type CapabilityRiskClass =
+  | "none"
+  | "read-only"
+  | "workspace-write"
+  | "process-run"
+  | "test-process"
+  | "network"
+  | "memory"
+  | "orchestration";
+
+export interface CapabilityRiskMetadata extends JsonObject {
+  readonly riskClass: CapabilityRiskClass;
+  readonly mutatesWorkspace: boolean;
+  readonly policyHooks: readonly string[];
+}
+
 export interface CapabilityManifest {
   readonly id: CapabilityId;
   readonly name: string;
@@ -29,6 +45,7 @@ export interface CapabilityManifest {
   readonly sandboxRequirements?: SandboxRequirement;
   readonly audit?: SandboxAuditEvidence;
   readonly security?: JsonObject;
+  readonly risk?: CapabilityRiskMetadata;
 }
 
 export interface CapabilityExecutionContext {

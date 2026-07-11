@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { APPROVAL_SCHEMA_VERSION, asId } from "@deepseek/platform-contracts";
-import type { ApprovalBroker, ApprovalId, ApprovalRequest, CapabilityManifest, PolicyDecision, PolicyEngine, PolicyRequest, SessionEvent } from "@deepseek/platform-contracts";
+import type { ApprovalBroker, ApprovalId, ApprovalRequest, CapabilityManifest, JsonObject, PolicyDecision, PolicyEngine, PolicyRequest, SessionEvent } from "@deepseek/platform-contracts";
 import {
   buildExecutionEnvelope,
   collectRuntimeEvents,
@@ -154,6 +154,35 @@ describe("runtime kernel contracts", () => {
     assert.equal(events.some((event) => event.kind === "execution.rejected" && event.error?.code === "KERNEL_POLICY_DENIED"), true);
     assert.equal(events.some((event) => event.kind === "policy.decided" && typeof event.data.record === "object"), true);
     assert.equal(events.some((event) => event.kind === "scheduler.queued"), false);
+    await kernel.shutdown();
+  });
+
+  it("propagates request metadata into capability execution context", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await deps.capabilities.register(runtimeEchoCapability, async (_input, context) => ({
+      ok: true,
+      value: {
+        activeModel: context.metadata.activeModel,
+        activeModelProvider: context.metadata.activeModelProvider,
+        capabilityId: context.metadata.capabilityId
+      }
+    }));
+    const kernel = await createDefaultRuntimeKernel(deps);
+    const events = await collectRuntimeEvents(kernel.execute({
+      capabilityId: runtimeEchoCapability.id,
+      caller: "contract-test",
+      input: {},
+      timeoutMs: 30_000,
+      metadata: {
+        activeModel: "glm-5.2",
+        activeModelProvider: "glm"
+      }
+    } as Parameters<typeof kernel.execute>[0]));
+
+    const output = events.find((event) => event.kind === "capability.output")?.data.output as JsonObject | undefined;
+    assert.equal(output?.activeModel, "glm-5.2");
+    assert.equal(output?.activeModelProvider, "glm");
+    assert.equal(output?.capabilityId, runtimeEchoCapability.id);
     await kernel.shutdown();
   });
 

@@ -2,6 +2,7 @@ import type { AgentLoopOutputMode, CliResultList, CliResultListItem, CliTargetRe
 import { CLI_PALETTE_SCHEMA_VERSION } from "@deepseek/platform-contracts";
 import type { CliOptions, CliRunOptions } from "../types.js";
 import { createCliAgentRuntime } from "../host/runtime.js";
+import { resolveCliWorkspaceRoot } from "../host/workspace-root.js";
 
 export type RepoNavigatorAction = "files" | "grep" | "recall" | "project-index";
 
@@ -21,10 +22,11 @@ export interface RepoNavigatorResult extends JsonObject {
 }
 
 export async function runRepoNavigatorCommand(options: CliOptions, write: (line: string) => Promise<void>, runOptions: CliRunOptions): Promise<void> {
-  const runtime = await createCliAgentRuntime({ live: options.live, workspaceRoot: process.cwd() }, runOptions);
+  const workspaceRoot = await resolveCliWorkspaceRoot(runOptions);
+  const runtime = await createCliAgentRuntime({ live: options.live, workspaceRoot }, runOptions);
   try {
     const input = repoInput(options);
-    const result = await resolveRepoNavigator(runtime.deps.platform, process.cwd(), input.action, input.query);
+    const result = await resolveRepoNavigator(runtime.deps.platform, workspaceRoot, input.action, input.query);
     for (const line of renderRepoNavigatorResult(result, options.output)) await write(line);
   } finally {
     await runtime.kernel.shutdown("cli-repo-navigator-completed");

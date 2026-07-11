@@ -16,9 +16,7 @@ import type {
 } from "@deepseek/platform-contracts";
 import {
   isJsonObject,
-  numberValue,
   providerError,
-  stringValue
 } from "../../../shared/common.js";
 
 export interface DeepSeekJsonOutputParseResult extends JsonObject {
@@ -37,7 +35,6 @@ export function buildDeepSeekOpenAIProviderRequest(
   const reasoningEffort = request.reasoning?.enabled === false
     ? undefined
     : deepSeekReasoningEffort(request.reasoning?.providerEffort ?? request.reasoning?.effort);
-  const providerCacheControl = providerCacheControlFor(request, config);
   const body: JsonObject = {
     model: request.profile.model,
     messages: providerMessagesFrom(request),
@@ -48,7 +45,6 @@ export function buildDeepSeekOpenAIProviderRequest(
     ...(request.reasoning ? { thinking: { type: request.reasoning.enabled === false ? "disabled" : "enabled" } } : {}),
     ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
     ...(validateDeepSeekJsonOutputRequest(request).ok && request.output?.format === "json_object" ? { response_format: { type: "json_object" } } : {}),
-    ...(providerCacheControl ? { cache_control: providerCacheControl } : {}),
     ...(request.profile.providerOptions ? request.profile.providerOptions : {})
   };
   const effectiveTimeoutMs = request.timeoutMs ?? timeoutMs;
@@ -283,24 +279,6 @@ function providerMessagesFrom(request: ModelRequest): readonly JsonObject[] {
     });
   }
   return messages;
-}
-
-function providerCacheControlFor(request: ModelRequest, config: ModelProviderConfig): JsonObject | undefined {
-  const capability = request.profile.cacheHints ?? config.cacheHints;
-  if (!capability?.explicitPrefixCacheHints) return undefined;
-  const pipeline = isJsonObject(request.metadata?.contextPipeline) ? request.metadata.contextPipeline : undefined;
-  const pipelineFingerprint = stringValue(pipeline?.pipelineFingerprint);
-  const cacheHintSummary = isJsonObject(pipeline?.cacheHintSummary) ? pipeline.cacheHintSummary : undefined;
-  if (!pipelineFingerprint || !cacheHintSummary) return undefined;
-  return {
-    type: "deepseek-prefix-cache",
-    pipeline_fingerprint: pipelineFingerprint,
-    stable_blocks: numberValue(cacheHintSummary.stable) ?? 0,
-    ephemeral_blocks: numberValue(cacheHintSummary.ephemeral) ?? 0,
-    no_store_blocks: numberValue(cacheHintSummary.noStore) ?? 0,
-    ttl_blocks: numberValue(cacheHintSummary.ttlBound) ?? 0,
-    ...(capability.maxCacheHintBlocks !== undefined ? { max_hint_blocks: capability.maxCacheHintBlocks } : {})
-  };
 }
 
 function headers(config: ModelProviderConfig, credentialValue = ""): JsonObject {

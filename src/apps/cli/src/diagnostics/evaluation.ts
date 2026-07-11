@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import type {
+  CliEvaluationBaselineAggregate,
   CliEvaluationBaselineDefinition,
   CliEvaluationComparisonSummary,
   CliEvaluationDiagnostic,
@@ -7,6 +8,8 @@ import type {
   CliEvaluationPublicBenchmarkReference,
   CliEvaluationTaskDefinition,
   CliEvaluationTaskRunRecord,
+  CodexClassGapScorecard,
+  CodexClassGapScorecardDimension,
   JsonObject,
   PlatformRuntime
 } from "@deepseek/platform-contracts";
@@ -17,7 +20,8 @@ import { buildToolFamilyParityMatrix, coreCapabilityFamilyMappings } from "@deep
 import {
   aggregateBaselines,
   deriveGapFindings,
-  emptyMetrics
+  emptyMetrics,
+  roundRatio
 } from "./evaluation-metrics.js";
 import { executeEvaluationTask, shouldRetryEvaluationTask } from "./evaluation-task-execution.js";
 import { buildOptionalEvaluationStagedTaskSnapshot } from "./evaluation-stage-graph.js";
@@ -122,6 +126,12 @@ export function evaluationJsonLines(summary: CliEvaluationComparisonSummary): re
       kind: "diagnostics.evaluate.tool-family-parity",
       matrix: summary.toolFamilyParityMatrix,
       redaction: summary.toolFamilyParityMatrix.redaction
+    }] : []),
+    ...(summary.codexClassGapScorecard ? [{
+      schemaVersion: summary.schemaVersion,
+      kind: "diagnostics.evaluate.codex-class-gap-scorecard",
+      scorecard: summary.codexClassGapScorecard,
+      redaction: summary.codexClassGapScorecard.redaction
     }] : []),
     ...summary.gapFindings.map((finding) => ({
       schemaVersion: summary.schemaVersion,
@@ -329,6 +339,7 @@ function comparisonSummary(
   const hasWarn = diagnostics.some((item) => item.severity === "warn") || baselines.some((baseline) => baseline.status !== "available");
   const baselineAggregates = aggregateBaselines(taskRuns);
   const gapFindings = deriveGapFindings(baselineAggregates);
+  const codexClassGapScorecard = buildCodexClassGapScorecard(baselines, baselineAggregates, packageScorecards, toolFamilyParityMatrix);
   return {
     schemaVersion: CLI_TASK_EVALUATION_SCHEMA_VERSION,
     kind: "cli.evaluation.comparison.summary",
@@ -346,6 +357,7 @@ function comparisonSummary(
       packageScorecardAggregate: packageScorecards.aggregate
     } : {}),
     ...(toolFamilyParityMatrix ? { toolFamilyParityMatrix } : {}),
+    codexClassGapScorecard,
     gapFindings,
     publicBenchmarkReferences: publicBenchmarkReferences(),
     evidencePaths: [],
@@ -359,6 +371,145 @@ function comparisonSummary(
           : "Run diagnostics evaluate --full --execute-task all --live to prove all delivery evaluation tasks.",
     redaction: { class: "internal", fields: ["taskRuns.task.promptDigest", "publicBenchmarkReferences.url", "evidencePaths", "gapFindings.message"] }
   };
+}
+
+function buildCodexClassGapScorecard(
+  baselines: readonly CliEvaluationBaselineDefinition[],
+  aggregates: readonly CliEvaluationBaselineAggregate[],
+  packageScorecards: Awaited<ReturnType<typeof collectPackageScorecards>> | undefined,
+  toolFamilyParityMatrix: ToolFamilyParityMatrix | undefined
+): CodexClassGapScorecard {
+  const externalCodex = baselines.find((baseline) => baseline.baselineId === "codex");
+  const externalBaselineStatus = externalCodex?.status === "available"
+    ? "available"
+    : externalCodex?.status === "unavailable"
+      ? "unavailable"
+      : "deferred";
+  const deepseekAggregate = aggregates.find((aggregate) => aggregate.baselineId === "deepseek-cli");
+  const dimensions = [
+    toolSurfaceDimension(toolFamilyParityMatrix),
+    projectionDimension(toolFamilyParityMatrix),
+    taskClosureDimension(deepseekAggregate),
+    isolationDimension(baselines),
+    recoveryDimension(deepseekAggregate, packageScorecards?.aggregate)
+  ];
+  const overallScore = roundRatio(dimensions.reduce((sum, dimension) => sum + dimension.score, 0) / dimensions.length);
+  return {
+    schemaVersion: CLI_TASK_EVALUATION_SCHEMA_VERSION,
+    kind: "codex-class.gap-scorecard",
+    baselineId: "codex-class-observed",
+    externalBaselineStatus,
+    comparisonBoundary: externalBaselineStatus === "available"
+      ? "External Codex adapter was explicitly configured; compare only recorded task evidence and exposed metrics."
+      : "External Codex evidence is unavailable or deferred; scorecard is bounded to DeepSeek-owned Codex-class capability dimensions.",
+    dimensions,
+    overallStatus: scorecardStatus(dimensions),
+    overallScore,
+    redaction: { class: "internal", fields: ["dimensions.evidence", "dimensions.blockers", "comparisonBoundary"] }
+  };
+}
+
+function toolSurfaceDimension(matrix: ToolFamilyParityMatrix | undefined): CodexClassGapScorecardDimension {
+  if (!matrix) return scorecardDimension("tool-surface", "unavailable", 0, [], ["tool-family parity matrix unavailable"], "Run diagnostics evaluate from the repository root so tool-family parity evidence can be loaded.");
+  const score = matrix.deliveryCapabilityScore;
+  const blockers = matrix.deliveryCapabilityBlockingFamilyIds.slice(0, 12);
+  return scorecardDimension(
+    "tool-surface",
+    score >= matrix.deliveryCapabilityTargetScore ? "pass" : "warn",
+    score,
+    [`deliveryCapabilityScore=${score}`, `liveCoveredFamilyCount=${matrix.liveCoveredFamilyCount}`, `implementedFamilyCount=${matrix.implementedFamilyCount}`],
+    blockers,
+    blockers.length > 0 ? "Close blocking tool families or mark them explicit opt-in before claiming Codex-class surface coverage." : "Keep Tier 2 and Tier 3 connectors opt-in and maintain live coverage evidence."
+  );
+}
+
+function projectionDimension(matrix: ToolFamilyParityMatrix | undefined): CodexClassGapScorecardDimension {
+  if (!matrix) return scorecardDimension("projection", "unavailable", 0, [], ["tool-family projection evidence unavailable"], "Regenerate evaluation evidence after profile family compilation.");
+  const requiredTier1Families = ["file.write", "file.edit", "patch.apply", "shell.run", "build.test-lint-typecheck", "git.status-diff"];
+  const blocking = requiredTier1Families.filter((familyId) => matrix.deliveryCapabilityBlockingFamilyIds.includes(familyId as ToolFamilyId));
+  const score = blocking.length === 0 ? 1 : roundRatio(1 - (blocking.length / requiredTier1Families.length));
+  return scorecardDimension(
+    "projection",
+    blocking.length === 0 ? "pass" : "fail",
+    score,
+    ["profile capability ids are compiled into required families", `tier1ProjectionBlockingFamilies=${blocking.length}`],
+    blocking,
+    blocking.length === 0 ? "Use prompt assembly projection evidence to diagnose remaining model behavior." : "Fix profile projection or host registration for blocking Tier 1 families."
+  );
+}
+
+function taskClosureDimension(aggregate: CliEvaluationBaselineAggregate | undefined): CodexClassGapScorecardDimension {
+  if (!aggregate || aggregate.executedRunCount === 0) {
+    return scorecardDimension("task-closure", "warn", 0.25, [], ["no executed DeepSeek CLI evaluation runs"], "Run diagnostics evaluate --execute-task all after tool projection and credentials are ready.");
+  }
+  const evidence = aggregate.evidenceCreditRate ?? 0;
+  const verification = aggregate.verificationCreditRate ?? 0;
+  const score = roundRatio((evidence + verification) / 2);
+  return scorecardDimension(
+    "task-closure",
+    score >= 0.9 ? "pass" : "warn",
+    score,
+    [`evidenceCreditRate=${evidence}`, `verificationCreditRate=${verification}`, `executedRunCount=${aggregate.executedRunCount}`],
+    score >= 0.9 ? [] : ["task outcomes lack complete evidence or verification credit"],
+    score >= 0.9 ? "Maintain final-outcome gating on artifacts, diffs, tests, and terminal events." : "Gate pass outcomes on evidence, not final text."
+  );
+}
+
+function isolationDimension(baselines: readonly CliEvaluationBaselineDefinition[]): CodexClassGapScorecardDimension {
+  const unavailable = baselines.filter((baseline) => baseline.status === "unavailable");
+  const deferred = baselines.filter((baseline) => baseline.status === "deferred");
+  const score = unavailable.length === 0 ? (deferred.length === 0 ? 1 : 0.75) : 0.25;
+  return scorecardDimension(
+    "isolation",
+    unavailable.length === 0 ? (deferred.length === 0 ? "pass" : "warn") : "fail",
+    score,
+    [`baselineCount=${baselines.length}`, `deferredBaselineCount=${deferred.length}`, `unavailableBaselineCount=${unavailable.length}`],
+    unavailable.map((baseline) => baseline.baselineId),
+    unavailable.length === 0 ? "Keep credential evidence redacted and explicitly mark external baselines deferred unless configured." : "Fix credential/environment readiness before attributing failures to model quality."
+  );
+}
+
+function recoveryDimension(
+  aggregate: CliEvaluationBaselineAggregate | undefined,
+  packageAggregate: Awaited<ReturnType<typeof collectPackageScorecards>>["aggregate"] | undefined
+): CodexClassGapScorecardDimension {
+  const repair = aggregate?.repairCreditRate ?? 0;
+  const delivery = packageAggregate?.averageDeliveryCapabilityScore ?? 0;
+  const score = roundRatio(Math.max(repair, delivery));
+  return scorecardDimension(
+    "recovery",
+    score >= 0.9 ? "pass" : "warn",
+    score,
+    [`repairCreditRate=${repair}`, `packageDeliveryCapabilityScore=${delivery}`],
+    score >= 0.9 ? [] : ["live repair evidence is incomplete or package delivery score is below target"],
+    score >= 0.9 ? "Continue recording repeated failures, retries, alternatives, and terminal blockers." : "Add executed recovery scenarios after core tool projection is stable."
+  );
+}
+
+function scorecardDimension(
+  dimensionId: CodexClassGapScorecardDimension["dimensionId"],
+  status: CodexClassGapScorecardDimension["status"],
+  score: number,
+  evidence: readonly string[],
+  blockers: readonly string[],
+  nextAction: string
+): CodexClassGapScorecardDimension {
+  return {
+    dimensionId,
+    status,
+    score,
+    evidence,
+    blockers,
+    nextAction,
+    redaction: { class: "internal", fields: ["evidence", "blockers"] }
+  };
+}
+
+function scorecardStatus(dimensions: readonly CodexClassGapScorecardDimension[]): CodexClassGapScorecard["overallStatus"] {
+  if (dimensions.some((dimension) => dimension.status === "fail")) return "fail";
+  if (dimensions.some((dimension) => dimension.status === "warn")) return "warn";
+  if (dimensions.some((dimension) => dimension.status === "unavailable")) return "unavailable";
+  return "pass";
 }
 
 export async function collectToolFamilyParityMatrix(platform: PlatformRuntime): Promise<ToolFamilyParityMatrix> {

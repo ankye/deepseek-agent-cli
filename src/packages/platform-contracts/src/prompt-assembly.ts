@@ -3,7 +3,7 @@ import type { CompatibilityMetadata, JsonObject, RedactedError, RedactionMetadat
 import type { ContextPipelineManifest, ContextProjectionResult } from "./context.js";
 import type { EvidenceFirstRuntimeContext } from "./evidence-first.js";
 import type { SelfRepairOutcomeSummary } from "./self-repair.js";
-import type { AgentLoopOutputContract, AgentLoopProfilePolicyMetadata, AgentLoopProjectRuleEvidence, AgentLoopReferenceContext, AgentLoopToolProjection } from "./runtime.js";
+import type { AgentLoopOutputContract, AgentLoopProfilePolicyMetadata, AgentLoopProjectRuleEvidence, AgentLoopReferenceContext, AgentLoopToolProjection, ToolDecisionBoard } from "./runtime.js";
 import type { AgentModeName, AgentPhasePlan, AgentReasoningEffortMapping, AgentVerifierResult, AgentWorkOrder } from "./agent-mode.js";
 import type { InteractionModeName } from "./interaction-mode.js";
 import type { ModelChatMessage, ModelProfile, ModelReasoningOptions, ModelToolChoice } from "./model.js";
@@ -18,6 +18,7 @@ export type PromptSectionKind =
   | "system.identity"
   | "system.operating-rules"
   | "system.mode"
+  | "system.scheduling-next-action"
   | "project.instructions"
   | "task.intent"
   | "task.decision-request"
@@ -198,9 +199,11 @@ export interface PromptAssemblyInput {
   readonly contextProjection?: ContextProjectionResult;
   readonly contextPipelineManifest?: ContextPipelineManifest;
   readonly taskDecision?: TaskDecisionRequest;
+  readonly schedulingNextAction?: PromptSchedulingNextAction;
   readonly profilePolicy?: AgentLoopProfilePolicyMetadata;
   readonly evidenceFirst?: EvidenceFirstRuntimeContext;
   readonly selfRepair?: SelfRepairOutcomeSummary;
+  readonly toolDecisionBoard?: ToolDecisionBoard;
   readonly projectRules?: readonly AgentLoopProjectRuleEvidence[];
   readonly interactionMode?: InteractionModeName;
   readonly agentMode?: AgentModeName;
@@ -212,8 +215,20 @@ export interface PromptAssemblyInput {
   readonly outputContract?: AgentLoopOutputContract;
   readonly availableTools: readonly CapabilityManifest[];
   readonly toolPolicy: AgentLoopToolProjection;
+  readonly toolOptIns?: readonly string[];
   readonly budget: PromptBudgetConfig;
   readonly compatibility: CompatibilityMetadata;
+}
+
+export interface PromptSchedulingNextAction extends JsonObject {
+  readonly schemaVersion: "1.0.0";
+  readonly actionClass: "focused-evidence" | "mutation" | "standard-verification" | "package" | "failure-analysis" | "repair" | "rerun" | "blocker" | "terminal-report";
+  readonly stageId?: string;
+  readonly requiredNextAction: string;
+  readonly allowedCapabilityIds: readonly string[];
+  readonly acceptedEvidenceRefs: readonly string[];
+  readonly correctionText?: string;
+  readonly redaction: RedactionMetadata;
 }
 
 export interface PromptAssemblyResult extends JsonObject {

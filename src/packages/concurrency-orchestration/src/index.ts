@@ -7,6 +7,7 @@ import type {
   TaskId,
   TaskScope
 } from "@deepseek/platform-contracts";
+import { posix } from "node:path";
 
 type TaskTerminalStatus = Extract<TaskEvent["status"], "completed" | "failed" | "cancelled" | "timed-out">;
 
@@ -128,22 +129,22 @@ export class DeterministicScheduler implements ConcurrencyOrchestrator {
   }
 
   async withLock<T>(lock: ResourceLock, work: () => Promise<T>): Promise<T> {
-    const key = `${lock.kind}:${lock.key}`;
-    const previous = this.lockChains.get(key) ?? Promise.resolve();
+    const key = lockChainKey(lock);
+    const previous = [...this.lockChains.entries()]
+      .filter(([activeKey]) => resourceLockKeysConflict(activeKey, key))
+      .map(([, active]) => active);
     let release!: () => void;
     const current = new Promise<void>((resolve) => {
       release = resolve;
     });
-    this.lockChains.set(
-      key,
-      previous.then(() => current)
-    );
-    await previous;
+    const queued = Promise.all(previous).then(() => current);
+    this.lockChains.set(key, queued);
+    await Promise.all(previous);
     try {
       return await work();
     } finally {
       release();
-      if (this.lockChains.get(key) === current) {
+      if (this.lockChains.get(key) === queued) {
         this.lockChains.delete(key);
       }
     }
@@ -240,4 +241,51 @@ export function defaultResourceLocks(): readonly ResourceLock["kind"][] {
     "hook-execution",
     "remote-transport"
   ];
+}
+
+function lockChainKey(lock: ResourceLock): string {
+  const kind = normalizeResourceLockKind(lock.kind);
+  return `${kind}:${normalizeLockKey(kind, lock.key)}`;
+}
+
+function resourceLockKeysConflict(left: string, right: string): boolean {
+  if (left === right) return true;
+  const leftSeparator = left.indexOf(":");
+  const rightSeparator = right.indexOf(":");
+  if (leftSeparator <= 0 || rightSeparator <= 0) return false;
+  const leftKind = left.slice(0, leftSeparator);
+  const rightKind = right.slice(0, rightSeparator);
+  if (!resourceLockKindsConflict(leftKind, rightKind)) return false;
+  const leftKey = left.slice(leftSeparator + 1);
+  const rightKey = right.slice(rightSeparator + 1);
+  if (!isHierarchicalLockKind(leftKind) || !isHierarchicalLockKind(rightKind)) return false;
+  return pathKeyContains(leftKey, rightKey) || pathKeyContains(rightKey, leftKey);
+}
+
+function normalizeResourceLockKind(kind: ResourceLock["kind"]): ResourceLock["kind"] {
+  return kind === "path" ? "workspace" : kind;
+}
+
+function resourceLockKindsConflict(leftKind: string, rightKind: string): boolean {
+  if (leftKind === rightKind) return true;
+  return (leftKind === "workspace" && rightKind === "process-slot") || (leftKind === "process-slot" && rightKind === "workspace");
+}
+
+function isHierarchicalLockKind(kind: string): boolean {
+  return kind === "workspace" || kind === "process-slot";
+}
+
+function normalizeLockKey(kind: ResourceLock["kind"], key: string): string {
+  return isHierarchicalLockKind(kind) ? normalizePathLikeLockKey(key) : key.trim();
+}
+
+function pathKeyContains(parent: string, child: string): boolean {
+  return parent === child || parent === "." || parent === "/" || child.startsWith(`${parent}/`);
+}
+
+function normalizePathLikeLockKey(key: string): string {
+  const normalized = posix.normalize(key.replace(/\\/g, "/").trim());
+  if (normalized === ".") return ".";
+  if (normalized === "/") return "/";
+  return normalized.startsWith("./") ? normalized.slice(2) : normalized.replace(/\/$/, "");
 }
