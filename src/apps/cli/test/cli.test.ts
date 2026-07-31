@@ -619,6 +619,22 @@ describe("cli host adapter", () => {
       live: false,
       diagnosticsInput: { command: "evaluate", full: false, smoke: false, dryRun: true, baseline: "claude-code", allowExternalBaseline: false, baselineArgs: [], extraArgs: [] }
     });
+    assert.deepEqual(parseCliArgs(["diagnostics", "swe-bench", "run", "--task", "1", "--execute", "--trusted", "--output", "json"]), {
+      command: "diagnostics",
+      diagnosticsCommand: "swe-bench",
+      prompt: "",
+      output: "json",
+      live: false,
+      approvalMode: "trusted",
+      diagnosticsInput: {
+        command: "swe-bench",
+        action: "run",
+        dryRun: false,
+        task: "1",
+        execute: true,
+        extraArgs: []
+      }
+    });
     assert.deepEqual(parseCliArgs(["diagnostics", "evaluate", "--baseline", "codex", "--allow-external-baseline", "--baseline-command", "codex", "--baseline-arg", "--version", "--dry-run", "--output", "json"]), {
       command: "diagnostics",
       diagnosticsCommand: "evaluate",
@@ -3660,6 +3676,42 @@ describe("cli host adapter", () => {
     await kernel.shutdown("cli-test-diagnostics-swe-bench-run");
   });
 
+  it("propagates failed SWE-bench evidence through diagnostics status", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    const toolDeps = { ...deps, policy: new AllowAllPolicyEngine() };
+    await registerRuntimeCoreTools(toolDeps, "/workspace");
+    await registerFakeCliSweBenchRunCapability(toolDeps, [], {
+      status: "fail",
+      evaluationResolved: false,
+      bestAttempt: 1,
+      lastAttempt: 3
+    });
+    const kernel = await createDefaultRuntimeKernel(toolDeps);
+    const lines: string[] = [];
+
+    await runCli(
+      ["diagnostics", "swe-bench", "run", "--task", "2", "--execute", "--provider", "glm", "--model", "glm-5.2", "--run-id", "failed-run", "--output", "json"],
+      (line: string) => {
+        lines.push(line);
+      },
+      [],
+      { stdinIsTTY: false, stdoutIsTTY: false },
+      {
+        workspaceRoot: "/workspace",
+        createRuntime: async () => ({ deps: toolDeps, kernel })
+      }
+    );
+
+    const parsed = JSON.parse(lines[0] ?? "{}") as {
+      status?: string;
+      sweBench?: { status?: string; run?: { ok?: boolean } };
+    };
+    assert.equal(parsed.status, "fail");
+    assert.equal(parsed.sweBench?.status, "fail");
+    assert.equal(parsed.sweBench?.run?.ok, true);
+    await kernel.shutdown("cli-test-diagnostics-swe-bench-failed-evidence");
+  });
+
   it("runs scriptable session commands with typed failures for unknown sessions", async () => {
     const resumeLines: string[] = [];
     await runCli(["session", "resume", "session-missing", "--output", "json"], (line: string) => {
@@ -6443,7 +6495,8 @@ function capabilityContext(): CapabilityExecutionContext {
 
 async function registerFakeCliSweBenchRunCapability(
   deps: Pick<ReturnType<typeof createDeterministicRuntimeDependencies>, "capabilities">,
-  capturedInputs: JsonObject[] = []
+  capturedInputs: JsonObject[] = [],
+  runnerMetadata: JsonObject = {}
 ): Promise<void> {
   const definition = defineToolManifest(
     "swe.bench.run",
@@ -6475,7 +6528,7 @@ async function registerFakeCliSweBenchRunCapability(
             affectedPaths: [],
             preview: boundedText("fake swe-bench run", 4_000),
             diagnostics: [],
-            metadata: { redaction: { class: "internal" as const } },
+            metadata: { ...runnerMetadata, redaction: { class: "internal" as const } },
             replay: replay(context),
             redaction: { class: "internal" as const, fields: ["metadata"] }
           }

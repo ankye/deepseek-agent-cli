@@ -88,7 +88,7 @@ function isFocusedEvidenceCapability(
   }
   if (capabilityId === "core.file.list" || capabilityId.endsWith(".list")) return false;
   if (capabilityId === "core.search.text" || capabilityId.endsWith(".search")) {
-    return hasFocusedSearchInput(toolInput) && !terminalEvidenceEmpty(terminal);
+    return hasFocusedSearchInput(toolInput) && terminalSearchEvidenceHasContent(terminal);
   }
   if (capabilityId === "core.workspace.glob" || capabilityId.endsWith(".glob")) return false;
   return true;
@@ -169,6 +169,30 @@ function terminalEvidencePreviewHasContent(preview: unknown): boolean {
   if (typeof record.lineCount === "number" && record.lineCount > 0) return true;
   if (typeof record.byteLength === "number" && record.byteLength > 0) return true;
   return false;
+}
+
+export function terminalSearchEvidenceHasContent(terminal: RuntimeEvent | undefined): boolean {
+  if (!terminal) return true;
+  if (terminalEvidenceEmpty(terminal)) return false;
+  const output = terminal.data.output;
+  if (!output || typeof output !== "object") return true;
+  const evidence = (output as { readonly evidence?: unknown }).evidence;
+  if (!evidence || typeof evidence !== "object") return true;
+  const preview = (evidence as { readonly preview?: unknown }).preview;
+  if (!preview || typeof preview !== "object") return true;
+  const text = (preview as { readonly text?: unknown }).text;
+  if (typeof text !== "string") return true;
+  const lines = text.split(/\r?\n/g).map((line) => line.trim()).filter(Boolean);
+  if (lines.length === 0) return false;
+  return !lines.every(isPathOnlySearchResultLine);
+}
+
+function isPathOnlySearchResultLine(line: string): boolean {
+  if (line.includes(":") || /\s/.test(line)) return false;
+  const normalized = line.replace(/\\/g, "/").replace(/^\.\//, "");
+  if (isBroadWorkspacePath(normalized) || normalized.endsWith("/")) return false;
+  return /^(?:[^/]+\/)+[^/]+\.[A-Za-z0-9][A-Za-z0-9._-]*$/.test(normalized) ||
+    /^[^/]+\.[A-Za-z0-9][A-Za-z0-9._-]*$/.test(normalized);
 }
 
 function terminalEvidenceEmpty(terminal: RuntimeEvent | undefined): boolean {

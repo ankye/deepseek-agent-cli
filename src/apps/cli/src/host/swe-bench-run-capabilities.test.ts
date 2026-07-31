@@ -30,6 +30,7 @@ class FakeSweBenchRunPlatform extends FakePlatformRuntime {
   checkoutEditableInstallExitCode = 0;
   checkoutCloneExitCode = 0;
   checkoutCloneOutput = "cloned\n";
+  rejectEmptyGitApply = false;
   gitDiffOutput = [
     "diff --git a/src/example.py b/src/example.py",
     "--- a/src/example.py",
@@ -39,6 +40,12 @@ class FakeSweBenchRunPlatform extends FakePlatformRuntime {
     "+new",
     ""
   ].join("\n");
+  gitDiffOutputs: string[] = [];
+  harnessOutcomes: Array<{
+    readonly resolved: boolean;
+    readonly failToPassFailures: readonly string[];
+    readonly passToPassFailures: readonly string[];
+  }> = [];
   skipHarnessReportWrite = false;
   repoAlreadyExists = false;
   checkoutRequiresPreClean = false;
@@ -102,6 +109,11 @@ class FakeSweBenchRunPlatform extends FakePlatformRuntime {
       if (this.checkoutRequiresPreClean && !this.preCheckoutCleanSeen) return result("working tree would be overwritten\n", 1);
       return result("checked out\n");
     }
+    if (command === "git" && args[0] === "-C" && args[2] === "apply" && this.rejectEmptyGitApply) {
+      const patchPath = String(args.at(-1) ?? "");
+      const patch = await this.readFile(patchPath).catch(() => "");
+      if (patch.length === 0) return result("error: No valid patches in input\n", 128);
+    }
     if (String(command).endsWith("/.venv/bin/python") && args[0] === "-m" && args[1] === "pip" && args[2] === "install" && args[3] === "-e") {
       return result(this.checkoutEditableInstallExitCode === 0 ? "installed\n" : "editable install failed\n", this.checkoutEditableInstallExitCode);
     }
@@ -122,14 +134,23 @@ class FakeSweBenchRunPlatform extends FakePlatformRuntime {
       const modelName = typeof predictions[0]?.model_name_or_path === "string" ? predictions[0].model_name_or_path : "glm-5.1";
       const instanceId = typeof predictions[0]?.instance_id === "string" ? predictions[0].instance_id : "demo__repo-2";
       const taskNumber = Number(instanceId.replace(/^demo__repo-/, ""));
-      const resolved = this.resolvedTaskNumbers.has(taskNumber) || (this.resolveOnSecondHarness && this.harnessRunCount >= 2);
+      const harnessOutcome = this.harnessOutcomes[this.harnessRunCount - 1];
+      const resolved = harnessOutcome?.resolved ?? (
+        this.resolvedTaskNumbers.has(taskNumber) || (this.resolveOnSecondHarness && this.harnessRunCount >= 2)
+      );
+      const failToPassFailures = harnessOutcome?.failToPassFailures ?? (
+        resolved ? [] : ["tests/test_demo.py::test_expected_fix"]
+      );
+      const passToPassFailures = harnessOutcome?.passToPassFailures ?? (
+        resolved ? [] : ["tests/test_demo.py::test_regressed"]
+      );
       if (!this.skipHarnessReportWrite) {
         await this.writeFile(`${cwd}/logs/run_evaluation/${runId}/${modelName}/${instanceId}/report.json`, JSON.stringify({
           [instanceId]: {
             resolved,
             tests_status: {
-              FAIL_TO_PASS: { success: resolved ? ["tests/test_demo.py::test_expected_fix"] : [], failure: resolved ? [] : ["tests/test_demo.py::test_expected_fix"] },
-              PASS_TO_PASS: { success: ["tests/test_demo.py::test_existing"], failure: resolved ? [] : ["tests/test_demo.py::test_regressed"] }
+              FAIL_TO_PASS: { success: resolved ? ["tests/test_demo.py::test_expected_fix"] : [], failure: failToPassFailures },
+              PASS_TO_PASS: { success: ["tests/test_demo.py::test_existing"], failure: passToPassFailures }
             }
           }
         }));
@@ -139,7 +160,7 @@ class FakeSweBenchRunPlatform extends FakePlatformRuntime {
       return result("Evaluation complete\n");
     }
     if (command === "git" && args[0] === "diff") {
-      return result(this.gitDiffOutput);
+      return result(this.gitDiffOutputs[this.agentRunCount - 1] ?? this.gitDiffOutput);
     }
     if (command === process.execPath) {
       this.agentRunCount += 1;
@@ -175,6 +196,25 @@ function solvedChildTraceWithTerminal(terminalEvents: readonly JsonObject[]): st
     JSON.stringify({ kind: "model.tool.intent", data: { toolCallId: "test-1", name: "core.test.run", input: { command: "python", args: ["-m", "pytest", "tests/test_demo.py"] } } }),
     JSON.stringify({ kind: "model.tool.result", data: { toolCallId: "test-1", toolName: "core.test.run", terminalKind: "capability.completed", output: "1 passed" } }),
     ...terminalEvents.map((event) => JSON.stringify(event))
+  ].join("\n") + "\n";
+}
+
+function failedChildTraceWithoutMutation(): string {
+  return [
+    JSON.stringify({ kind: "model.requested", data: { iteration: 1 } }),
+    JSON.stringify({
+      kind: "agent.loop.failed",
+      data: { status: "rejected", reason: "flow-mutation-recovery-exhausted" }
+    })
+  ].join("\n") + "\n";
+}
+
+function mutatedChildTraceWithoutTest(): string {
+  return [
+    JSON.stringify({ kind: "model.requested", data: { iteration: 1 } }),
+    JSON.stringify({ kind: "model.tool.intent", data: { toolCallId: "edit-1", name: "core.file.edit", input: { path: "src/example.py" } } }),
+    JSON.stringify({ kind: "model.tool.result", data: { toolCallId: "edit-1", toolName: "core.file.edit", terminalKind: "capability.completed" } }),
+    JSON.stringify({ kind: "agent.loop.failed", data: { status: "rejected", reason: "verification-command-missing" } })
   ].join("\n") + "\n";
 }
 
@@ -707,11 +747,23 @@ describe("CLI SWE-bench run capability", () => {
 
     const state = JSON.parse(await platform.readFile(statePath as string)) as JsonObject;
     const stageStates = state.stageStates as JsonObject[] | undefined;
+    const refs = state.refs as JsonObject[] | undefined;
+    const behaviorRef = refs?.find((ref) => ref.refId === "ref:runner:problem-behavior-contract");
+    const verifyStage = stageStates?.find((stage) => stage.stageId === "verify");
     assert.equal(state.schemaVersion, "1.0.0");
     assert.equal(state.taskRunId, "staged:runner:unit-run-child-dynamic-state:2");
     assert.equal(stageStates?.find((stage) => stage.stageId === "prepare")?.status, "succeeded");
     assert.equal(stageStates?.find((stage) => stage.stageId === "understand")?.status, "pending");
     assert.deepEqual(stageStates?.find((stage) => stage.stageId === "understand")?.outputRefs, []);
+    assert.equal(behaviorRef?.type, "diagnostic");
+    assert.equal(
+      behaviorRef?.path,
+      "/workspace/.deepseek/swe-lite-runs/unit-run-child-dynamic-state/instance.json"
+    );
+    assert.equal(
+      (verifyStage?.inputRefs as string[] | undefined)?.includes("ref:runner:problem-behavior-contract"),
+      true
+    );
   });
 
   it("fails before child model dispatch when managed child mutation tools are unavailable", async () => {
@@ -1372,7 +1424,7 @@ describe("CLI SWE-bench run capability", () => {
     assert.equal(batch?.completedResolvedRate, 1 / 3);
     assert.equal(task9?.status, "resolved");
     assert.equal(task9?.resumedFromSummary, true);
-    assert.equal(task8?.primaryReasonCode, "CACHE_PROVIDER_BELOW_TARGET");
+    assert.equal(task8?.primaryReasonCode, "OFFICIAL_UNRESOLVED_AFTER_REPAIR");
     assert.equal((task8?.reasonCodes as string[] | undefined)?.includes("CACHE_PROVIDER_BELOW_TARGET"), true);
     assert.equal((task8?.reasonCodes as string[] | undefined)?.includes("CACHE_PROVIDER_PIPELINE_TELEMETRY_ABSENT"), true);
     assert.equal((task8?.reasonCodes as string[] | undefined)?.includes("CACHE_PROVIDER_PIPELINE_MISSING"), false);
@@ -1387,7 +1439,7 @@ describe("CLI SWE-bench run capability", () => {
     assert.equal(persistedTask10.failToPassFailureCount, 16);
     assert.equal(value.evidence?.preview?.text?.includes("reviewCodes=SWE_BENCH_BATCH_BACKPRESSURE_ACTIVE"), true);
     assert.equal(value.evidence?.preview?.text?.includes("resumed=3"), true);
-    assert.equal(value.evidence?.preview?.text?.includes("taskReview=8:CACHE_PROVIDER_BELOW_TARGET;10:MODEL_PATCH_INSUFFICIENT_AFTER_GOVERNED_REPAIR"), true);
+    assert.equal(value.evidence?.preview?.text?.includes("taskReview=8:OFFICIAL_UNRESOLVED_AFTER_REPAIR;10:MODEL_PATCH_INSUFFICIENT_AFTER_GOVERNED_REPAIR"), true);
   });
 
   it("does not overwrite existing single-task evidence when execute is false", async () => {
@@ -1466,14 +1518,14 @@ describe("CLI SWE-bench run capability", () => {
     assert.equal(metadata?.evaluationResolvedRate, 0);
     assert.equal(metadata?.failToPassFailureCount, 1);
     assert.equal(metadata?.passToPassFailureCount, 1);
-    assert.equal(metadata?.primaryReasonCode, "REPAIR_FEEDBACK_LOW_FIDELITY");
-    assert.equal(metadata?.failureCategory, "repair-feedback");
-    assert.equal(metadata?.actionability, "repair-feedback-fix");
-    assert.deepEqual(metadata?.reasonCodes, ["REPAIR_FEEDBACK_LOW_FIDELITY", "VERIFICATION_ORACLE_GAP", "OFFICIAL_UNRESOLVED_AFTER_REPAIR"]);
+    assert.equal(metadata?.primaryReasonCode, "OFFICIAL_UNRESOLVED_AFTER_REPAIR");
+    assert.equal(metadata?.failureCategory, "model-patch");
+    assert.equal(metadata?.actionability, "model-feedback");
+    assert.deepEqual(metadata?.reasonCodes, ["OFFICIAL_UNRESOLVED_AFTER_REPAIR", "REPAIR_FEEDBACK_LOW_FIDELITY", "VERIFICATION_ORACLE_GAP"]);
     assert.equal(value.evidence?.status, "failed");
     assert.equal(preview.includes("status=warn"), true);
     assert.equal(preview.includes("evaluation=warn resolved=false rate=0.0%"), true);
-    assert.equal(preview.includes("failure=REPAIR_FEEDBACK_LOW_FIDELITY action=repair-feedback-fix"), true);
+    assert.equal(preview.includes("failure=OFFICIAL_UNRESOLVED_AFTER_REPAIR action=model-feedback"), true);
   });
 
   it("runs a numbered task batch with resume and reports aggregate scores", async () => {
@@ -1518,7 +1570,7 @@ describe("CLI SWE-bench run capability", () => {
     assert.deepEqual(batch?.unresolvedTaskNumbers, [4]);
     assert.equal(batch?.resolvedRate, 2 / 3);
     assert.equal(batch?.completedResolvedRate, 2 / 3);
-    assert.equal(childRuns.length, 3);
+    assert.equal(childRuns.length, 4);
     assert.deepEqual(platform.datasetRequests, [3, 4]);
     assert.equal(value.evidence?.status, "failed");
     assert.equal(value.evidence?.preview?.text?.includes("batch tasks=3 resolved=2 unresolved=1 skipped=1 rate=66.7%"), true);
@@ -2591,9 +2643,9 @@ describe("CLI SWE-bench run capability", () => {
     const batch = value.evidence?.metadata?.batch as JsonObject | undefined;
     const state = (batch?.taskStates as JsonObject[]).find((taskState) => taskState.taskNumber === 8);
 
-    assert.equal(state?.primaryReasonCode, "CACHE_PROVIDER_HISTORY_TAIL_MISS");
-    assert.equal(state?.failureCategory, "cache-economics");
-    assert.equal(state?.actionability, "framework-fix");
+    assert.equal(state?.primaryReasonCode, "OFFICIAL_UNRESOLVED_AFTER_REPAIR");
+    assert.equal(state?.failureCategory, "model-patch");
+    assert.equal(state?.actionability, "model-feedback");
     assert.equal((state?.reasonCodes as string[]).includes("MODEL_PATCH_INSUFFICIENT_AFTER_GOVERNED_REPAIR"), false);
     assert.equal((state?.blockerIds as string[]).includes("agentic.blocker.103.provider-cache-history-tail-miss"), true);
   });
@@ -2649,9 +2701,9 @@ describe("CLI SWE-bench run capability", () => {
     const batch = value.evidence?.metadata?.batch as JsonObject | undefined;
     const state = (batch?.taskStates as JsonObject[]).find((taskState) => taskState.taskNumber === 8);
 
-    assert.equal(state?.primaryReasonCode, "CACHE_PROVIDER_DYNAMIC_TAIL_MISS");
-    assert.equal(state?.failureCategory, "cache-economics");
-    assert.equal(state?.actionability, "framework-fix");
+    assert.equal(state?.primaryReasonCode, "OFFICIAL_UNRESOLVED_AFTER_REPAIR");
+    assert.equal(state?.failureCategory, "model-patch");
+    assert.equal(state?.actionability, "model-feedback");
     assert.equal((state?.reasonCodes as string[]).includes("MODEL_PATCH_INSUFFICIENT_AFTER_GOVERNED_REPAIR"), false);
     assert.equal((state?.blockerIds as string[]).includes("agentic.blocker.118.provider-cache-dynamic-tail-miss"), true);
   });
@@ -2707,9 +2759,9 @@ describe("CLI SWE-bench run capability", () => {
     const batch = value.evidence?.metadata?.batch as JsonObject | undefined;
     const state = (batch?.taskStates as JsonObject[]).find((taskState) => taskState.taskNumber === 8);
 
-    assert.equal(state?.primaryReasonCode, "CACHE_PROVIDER_MULTI_MESSAGE_BREAKPOINT");
-    assert.equal(state?.failureCategory, "cache-economics");
-    assert.equal(state?.actionability, "framework-fix");
+    assert.equal(state?.primaryReasonCode, "OFFICIAL_UNRESOLVED_AFTER_REPAIR");
+    assert.equal(state?.failureCategory, "model-patch");
+    assert.equal(state?.actionability, "model-feedback");
     assert.equal((state?.reasonCodes as string[]).includes("MODEL_PATCH_INSUFFICIENT_AFTER_GOVERNED_REPAIR"), false);
     assert.equal((state?.blockerIds as string[]).includes("agentic.blocker.120.provider-cache-multi-message-breakpoint"), true);
   });
@@ -2765,9 +2817,9 @@ describe("CLI SWE-bench run capability", () => {
     const batch = value.evidence?.metadata?.batch as JsonObject | undefined;
     const state = (batch?.taskStates as JsonObject[]).find((taskState) => taskState.taskNumber === 8);
 
-    assert.equal(state?.primaryReasonCode, "CACHE_PROVIDER_BREAKPOINT_SHAPE_TELEMETRY_MISSING");
-    assert.equal(state?.failureCategory, "cache-economics");
-    assert.equal(state?.actionability, "framework-fix");
+    assert.equal(state?.primaryReasonCode, "OFFICIAL_UNRESOLVED_AFTER_REPAIR");
+    assert.equal(state?.failureCategory, "model-patch");
+    assert.equal(state?.actionability, "model-feedback");
     assert.equal((state?.reasonCodes as string[]).includes("MODEL_PATCH_INSUFFICIENT_AFTER_GOVERNED_REPAIR"), false);
     assert.equal((state?.blockerIds as string[]).includes("agentic.blocker.121.provider-cache-breakpoint-shape-telemetry-missing"), true);
   });
@@ -2823,9 +2875,9 @@ describe("CLI SWE-bench run capability", () => {
     const batch = value.evidence?.metadata?.batch as JsonObject | undefined;
     const state = (batch?.taskStates as JsonObject[]).find((taskState) => taskState.taskNumber === 8);
 
-    assert.equal(state?.primaryReasonCode, "CACHE_PROVIDER_HISTORY_UNBOUNDED_AFTER_GATE");
-    assert.equal(state?.failureCategory, "cache-economics");
-    assert.equal(state?.actionability, "framework-fix");
+    assert.equal(state?.primaryReasonCode, "OFFICIAL_UNRESOLVED_AFTER_REPAIR");
+    assert.equal(state?.failureCategory, "model-patch");
+    assert.equal(state?.actionability, "model-feedback");
     assert.equal((state?.reasonCodes as string[]).includes("MODEL_PATCH_INSUFFICIENT_AFTER_GOVERNED_REPAIR"), false);
     assert.equal((state?.blockerIds as string[]).includes("agentic.blocker.108.provider-history-unbounded-after-gate"), true);
   });
@@ -3271,9 +3323,9 @@ describe("CLI SWE-bench run capability", () => {
     const batch = value.evidence?.metadata?.batch as JsonObject | undefined;
     const state = (batch?.taskStates as JsonObject[]).find((taskState) => taskState.taskNumber === 8);
 
-    assert.equal(state?.primaryReasonCode, "CACHE_PROVIDER_PREFIX_HINT_MISSING");
-    assert.equal(state?.failureCategory, "cache-economics");
-    assert.equal(state?.actionability, "framework-fix");
+    assert.equal(state?.primaryReasonCode, "OFFICIAL_UNRESOLVED_AFTER_REPAIR");
+    assert.equal(state?.failureCategory, "model-patch");
+    assert.equal(state?.actionability, "model-feedback");
     assert.equal((state?.reasonCodes as string[]).includes("MODEL_PATCH_INSUFFICIENT_AFTER_GOVERNED_REPAIR"), false);
     assert.equal((state?.blockerIds as string[]).includes("agentic.blocker.104.provider-cache-prefix-hint-missing"), true);
   });
@@ -3336,7 +3388,7 @@ describe("CLI SWE-bench run capability", () => {
     const state = (batch?.taskStates as JsonObject[]).find((taskState) => taskState.taskNumber === 8);
     const reasonCodes = state?.reasonCodes as string[];
 
-    assert.equal(state?.primaryReasonCode, "CACHE_PROVIDER_PREFIX_DRIFT");
+    assert.equal(state?.primaryReasonCode, "OFFICIAL_UNRESOLVED_AFTER_REPAIR");
     assert.equal(reasonCodes.includes("CACHE_PROVIDER_PREFIX_DRIFT"), true);
     assert.equal(reasonCodes.includes("CACHE_PROVIDER_BREAKPOINT_SHAPE_MISS"), true);
     assert.equal((state?.blockerIds as string[]).includes("agentic.blocker.111.provider-cache-prefix-drift"), true);
@@ -3405,9 +3457,9 @@ describe("CLI SWE-bench run capability", () => {
     const batch = value.evidence?.metadata?.batch as JsonObject | undefined;
     const state = (batch?.taskStates as JsonObject[]).find((taskState) => taskState.taskNumber === 3);
 
-    assert.equal(state?.primaryReasonCode, "CACHE_PROVIDER_BELOW_TARGET");
-    assert.equal(state?.failureCategory, "cache-economics");
-    assert.equal(state?.actionability, "framework-fix");
+    assert.equal(state?.primaryReasonCode, "OFFICIAL_UNRESOLVED_AFTER_REPAIR");
+    assert.equal(state?.failureCategory, "model-patch");
+    assert.equal(state?.actionability, "model-feedback");
     assert.equal((state?.reasonCodes as string[]).includes("FLOW_POST_EDIT_VERIFICATION_MISSING"), false);
     assert.equal((state?.reasonCodes as string[]).includes("FLOW_REQUEST_BUDGET_EXCEEDED"), false);
     assert.equal((state?.reasonCodes as string[]).includes("VERIFICATION_ORACLE_GAP"), true);
@@ -3480,15 +3532,15 @@ describe("CLI SWE-bench run capability", () => {
     const value = execution.value as { evidence?: { metadata?: JsonObject; preview?: { text?: string } } };
     const metadata = value.evidence?.metadata;
 
-    assert.equal(metadata?.primaryReasonCode, "CACHE_PROVIDER_BELOW_TARGET");
-    assert.equal(metadata?.failureCategory, "cache-economics");
-    assert.equal(metadata?.actionability, "framework-fix");
+    assert.equal(metadata?.primaryReasonCode, "OFFICIAL_UNRESOLVED_AFTER_REPAIR");
+    assert.equal(metadata?.failureCategory, "model-patch");
+    assert.equal(metadata?.actionability, "model-feedback");
     assert.equal((metadata?.reasonCodes as string[] | undefined)?.includes("FLOW_POST_EDIT_VERIFICATION_MISSING"), false);
     assert.equal((metadata?.reasonCodes as string[] | undefined)?.includes("FLOW_REQUEST_BUDGET_EXCEEDED"), false);
     assert.equal((metadata?.reasonCodes as string[] | undefined)?.includes("CACHE_WHOLE_PROMPT_DYNAMIC_PREFIX_STABLE"), true);
     assert.equal((metadata?.reasonCodes as string[] | undefined)?.includes("VERIFICATION_ORACLE_GAP"), true);
     assert.equal((metadata?.reasonCodes as string[] | undefined)?.includes("MODEL_PATCH_INSUFFICIENT_AFTER_GOVERNED_REPAIR"), false);
-    assert.equal(value.evidence?.preview?.text?.includes("failure=CACHE_PROVIDER_BELOW_TARGET action=framework-fix"), true);
+    assert.equal(value.evidence?.preview?.text?.includes("failure=OFFICIAL_UNRESOLVED_AFTER_REPAIR action=model-feedback"), true);
   });
 
   it("refreshes a single existing task summary when resumeOnly is requested", async () => {
@@ -3570,12 +3622,12 @@ describe("CLI SWE-bench run capability", () => {
 
     assert.deepEqual(platform.datasetRequests, []);
     assert.equal(platform.executedCommands.filter(isAgentRunCommand).length, 0);
-    assert.equal(metadata?.primaryReasonCode, "CACHE_PROVIDER_BELOW_TARGET");
-    assert.equal(metadata?.failureCategory, "cache-economics");
+    assert.equal(metadata?.primaryReasonCode, "OFFICIAL_UNRESOLVED_AFTER_REPAIR");
+    assert.equal(metadata?.failureCategory, "model-patch");
     assert.equal((metadata?.reasonCodes as string[] | undefined)?.includes("FLOW_REQUEST_BUDGET_EXCEEDED"), false);
     assert.equal((metadata?.reasonCodes as string[] | undefined)?.includes("VERIFICATION_ORACLE_GAP"), true);
-    assert.equal(persisted.primaryReasonCode, "CACHE_PROVIDER_BELOW_TARGET");
-    assert.equal(value.evidence?.preview?.text?.includes("failure=CACHE_PROVIDER_BELOW_TARGET action=framework-fix"), true);
+    assert.equal(persisted.primaryReasonCode, "OFFICIAL_UNRESOLVED_AFTER_REPAIR");
+    assert.equal(value.evidence?.preview?.text?.includes("failure=OFFICIAL_UNRESOLVED_AFTER_REPAIR action=model-feedback"), true);
   });
 
   it("reconstructs provider cache below-target diagnostics while refreshing single task traces", async () => {
@@ -3684,7 +3736,7 @@ describe("CLI SWE-bench run capability", () => {
     assert.equal((metadata?.reviewCodes as string[] | undefined)?.includes("SWE_BENCH_EVALUATION_UNRESOLVED"), true);
     assert.equal((metadata?.reviewCodes as string[] | undefined)?.includes("SWE_BENCH_PROVIDER_CACHE_BELOW_TARGET"), true);
     assert.equal((metadata?.diagnostics as JsonObject[]).some((entry) => entry.code === "SWE_BENCH_PROVIDER_CACHE_BELOW_TARGET"), true);
-    assert.equal(metadata?.primaryReasonCode, "CACHE_PROVIDER_BELOW_TARGET");
+    assert.equal(metadata?.primaryReasonCode, "OFFICIAL_UNRESOLVED_AFTER_REPAIR");
     assert.equal((persisted.diagnostics as JsonObject[]).some((entry) => entry.code === "SWE_BENCH_PROVIDER_CACHE_BELOW_TARGET"), true);
   });
 
@@ -3810,9 +3862,9 @@ describe("CLI SWE-bench run capability", () => {
     assert.equal(diagnostics.some((entry) => entry.code === "PROMPT_WHOLE_FINGERPRINT_DYNAMIC_WITH_STABLE_PREFIX"), false);
     assert.equal(reviewCodes.includes("SWE_BENCH_PROVIDER_CACHE_PREFIX_DRIFT"), false);
     assert.equal(reasonCodes.includes("CACHE_PROVIDER_PREFIX_DRIFT"), false);
-    assert.equal(metadata?.primaryReasonCode, "CACHE_PROVIDER_BELOW_TARGET");
+    assert.equal(metadata?.primaryReasonCode, "OFFICIAL_UNRESOLVED_AFTER_REPAIR");
     assert.equal(persistedDiagnostics.some((entry) => entry.code === "SWE_BENCH_PROVIDER_CACHE_PREFIX_DRIFT"), false);
-    assert.equal(persisted.primaryReasonCode, "CACHE_PROVIDER_BELOW_TARGET");
+    assert.equal(persisted.primaryReasonCode, "OFFICIAL_UNRESOLVED_AFTER_REPAIR");
   });
 
   it("enriches legacy missing-pytest traces with repo-local runner evidence during resumeOnly refresh", async () => {
@@ -4364,7 +4416,7 @@ describe("CLI SWE-bench run capability", () => {
     assert.equal(reasonCodes.includes("CACHE_PROVIDER_BREAKPOINT_SHAPE_TELEMETRY_MISSING"), true);
     assert.equal(blockerIds.includes("agentic.blocker.112.provider-cache-breakpoint-shape-miss"), false);
     assert.equal(blockerIds.includes("agentic.blocker.121.provider-cache-breakpoint-shape-telemetry-missing"), true);
-    assert.equal(metadata?.primaryReasonCode, "CACHE_PROVIDER_BELOW_TARGET");
+    assert.equal(metadata?.primaryReasonCode, "OFFICIAL_UNRESOLVED_AFTER_REPAIR");
     assert.equal(persistedDiagnostics.some((entry) => entry.code === "SWE_BENCH_PROVIDER_CACHE_BREAKPOINT_SHAPE_MISS"), false);
     assert.equal(persistedDiagnostics.some((entry) => entry.code === "SWE_BENCH_PROVIDER_CACHE_BREAKPOINT_SHAPE_TELEMETRY_MISSING"), true);
   });
@@ -4413,7 +4465,7 @@ describe("CLI SWE-bench run capability", () => {
     const state = (batch?.taskStates as JsonObject[] | undefined)?.[0];
 
     assert.equal(execution.ok, true);
-    assert.equal(state?.primaryReasonCode, "CACHE_WHOLE_PROMPT_DYNAMIC_PREFIX_STABLE");
+    assert.equal(state?.primaryReasonCode, "OFFICIAL_UNRESOLVED_AFTER_REPAIR");
     assert.equal((state?.reasonCodes as string[] | undefined)?.includes("CACHE_WHOLE_PROMPT_DYNAMIC_PREFIX_STABLE"), true);
     assert.equal((state?.blockerIds as string[]).includes("agentic.blocker.107.whole-prompt-dynamic-prefix-stable"), true);
   });
@@ -5952,11 +6004,214 @@ describe("CLI SWE-bench run capability", () => {
     assert.equal(repairContext.includes("tests/test_demo.py::test_expected_fix"), true);
     assert.equal(repairContext.includes("Official harness failure excerpts"), true);
     assert.equal(repairContext.includes("ValueError: could not convert string to float: 'no'"), true);
+    assert.equal(repairContext.includes("Official fail-to-pass tests may be hidden or injected by the harness"), true);
     assert.equal(value.evidence?.status, "completed");
     assert.equal(value.evidence?.metadata?.attemptCount, 2);
     assert.equal(value.evidence?.metadata?.repairAttempted, true);
     assert.equal(value.evidence?.metadata?.evaluationResolved, true);
     assert.equal(value.evidence?.preview?.text?.includes("attempts=2 repair=true"), true);
+  });
+
+  it("runs a second supervised repair when the first repair remains unresolved with new official failure evidence", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    platform.harnessTestOutputByInstanceId.set("demo__repo-2", [
+      "tests/test_demo.py::test_expected_fix FAILED",
+      "tests/test_demo.py:42: in test_expected_fix",
+      "    assert parsed.unit == Unit('nm')",
+      "E   AssertionError: assert None == Unit('nm')",
+      "FAILED tests/test_demo.py::test_expected_fix - AssertionError: assert None == Unit('nm')",
+      ""
+    ].join("\n"));
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.1",
+      runId: "unit-run-second-repair"
+    }, capabilityContext());
+
+    assert.equal(execution.ok, true);
+    const childRuns = platform.executedCommands.filter(isAgentRunCommand);
+    const secondRepairContextPath = argAfter(childRuns[2]?.args ?? [], "--additional-user-context-file");
+    const secondRepairContext = secondRepairContextPath ? await platform.readFile(secondRepairContextPath) : "";
+    const value = execution.value as { evidence?: { metadata?: JsonObject; preview?: { text?: string } } };
+
+    assert.equal(platform.harnessRunCount, 3);
+    assert.equal(childRuns.length, 3);
+    assert.equal(secondRepairContext.includes("Repair attempt number: 3"), true);
+    assert.equal(secondRepairContext.includes("AssertionError: assert None == Unit('nm')"), true);
+    assert.equal(value.evidence?.metadata?.attemptCount, 3);
+    assert.equal(value.evidence?.metadata?.repairAttempted, true);
+    assert.equal(value.evidence?.preview?.text?.includes("attempts=3 repair=true"), true);
+  });
+
+  it("carries authoritative harness feedback across a pre-harness repair failure", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    const patch = [
+      "diff --git a/src/example.py b/src/example.py",
+      "--- a/src/example.py",
+      "+++ b/src/example.py",
+      "@@ -1 +1 @@",
+      "-old",
+      "+partial-fix",
+      ""
+    ].join("\n");
+    platform.gitDiffOutputs = [patch, patch, patch];
+    platform.agentStdouts = [solvedChildTrace(), failedChildTraceWithoutMutation(), solvedChildTrace()];
+    platform.harnessOutcomes = [
+      {
+        resolved: false,
+        failToPassFailures: ["tests/test_demo.py::test_expected_fix"],
+        passToPassFailures: []
+      },
+      {
+        resolved: true,
+        failToPassFailures: [],
+        passToPassFailures: []
+      }
+    ];
+    platform.harnessTestOutputByInstanceId.set("demo__repo-2", [
+      "tests/test_demo.py::test_expected_fix FAILED",
+      "E   AssertionError: expected repaired behavior",
+      "FAILED tests/test_demo.py::test_expected_fix - AssertionError: expected repaired behavior",
+      ""
+    ].join("\n"));
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.1",
+      runId: "unit-run-carry-official-feedback"
+    }, capabilityContext());
+
+    assert.equal(execution.ok, true);
+    const childRuns = platform.executedCommands.filter(isAgentRunCommand);
+    const thirdContextPath = argAfter(childRuns[2]?.args ?? [], "--additional-user-context-file");
+    const thirdContext = thirdContextPath ? await platform.readFile(thirdContextPath) : "";
+    const metadata = (execution.value as { evidence?: { metadata?: JsonObject } }).evidence?.metadata;
+
+    assert.equal(platform.agentRunCount, 3);
+    assert.equal(platform.harnessRunCount, 2);
+    assert.equal(metadata?.evaluationResolved, true);
+    assert.match(thirdContext, /Attempt 2 stopped before official harness readiness/);
+    assert.match(thirdContext, /flow-mutation-recovery-exhausted/);
+    assert.match(thirdContext, /tests\/test_demo\.py::test_expected_fix/);
+    assert.match(thirdContext, /AssertionError: expected repaired behavior/);
+  });
+
+  it("restores the best SWE-bench candidate after a regression and later pre-harness failure", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    const runRoot = "/workspace/.deepseek/swe-lite-runs/unit-run-best-candidate";
+    const patchOne = [
+      "diff --git a/src/example.py b/src/example.py",
+      "--- a/src/example.py",
+      "+++ b/src/example.py",
+      "@@ -1 +1 @@",
+      "-old",
+      "+best-candidate",
+      ""
+    ].join("\n");
+    const patchTwo = [
+      "diff --git a/src/example.py b/src/example.py",
+      "--- a/src/example.py",
+      "+++ b/src/example.py",
+      "@@ -1 +1 @@",
+      "-old",
+      "+regressed-candidate",
+      ""
+    ].join("\n");
+    platform.gitDiffOutputs = [patchOne, patchTwo, patchOne];
+    platform.agentStdouts = [solvedChildTrace(), solvedChildTrace(), failedChildTraceWithoutMutation()];
+    platform.harnessOutcomes = [
+      {
+        resolved: false,
+        failToPassFailures: ["tests/test_demo.py::test_expected_fix"],
+        passToPassFailures: []
+      },
+      {
+        resolved: false,
+        failToPassFailures: ["tests/test_demo.py::test_expected_fix"],
+        passToPassFailures: ["tests/test_demo.py::test_existing"]
+      }
+    ];
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.1",
+      runId: "unit-run-best-candidate"
+    }, capabilityContext());
+
+    assert.equal(execution.ok, true);
+    const metadata = (execution.value as { evidence?: { metadata?: JsonObject } }).evidence?.metadata;
+    assert.equal(metadata?.bestAttempt, 1);
+    assert.equal(metadata?.lastAttempt, 3);
+    assert.equal(metadata?.evaluationResolved, false);
+    assert.equal(metadata?.passToPassFailureCount, 0);
+    assert.equal(await platform.readFile(`${runRoot}/candidate-attempt-1.patch`), patchOne);
+    assert.equal(await platform.readFile(`${runRoot}/candidate-attempt-2.patch`), patchTwo);
+    assert.equal(
+      await platform.readFile(`${runRoot}/prediction.jsonl`),
+      await platform.readFile(`${runRoot}/prediction-attempt-1.jsonl`)
+    );
+    assert.equal(platform.executedCommands.some((entry) =>
+      entry.command === "git" && entry.args.includes("apply")
+    ), true);
+  });
+
+  it("restores the stable earlier best candidate after a final harness-ready tie", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    const patch = (label: string) => [
+      "diff --git a/src/example.py b/src/example.py",
+      "--- a/src/example.py",
+      "+++ b/src/example.py",
+      "@@ -1 +1 @@",
+      "-old",
+      `+${label}`,
+      ""
+    ].join("\n");
+    platform.gitDiffOutputs = [patch("attempt-one"), patch("attempt-two"), patch("attempt-three")];
+    platform.agentStdouts = [solvedChildTrace(), solvedChildTrace(), solvedChildTrace()];
+    platform.harnessOutcomes = [
+      { resolved: false, failToPassFailures: ["tests/test_demo.py::test_expected_fix"], passToPassFailures: [] },
+      { resolved: false, failToPassFailures: ["tests/test_demo.py::test_expected_fix"], passToPassFailures: ["tests/test_demo.py::test_existing"] },
+      { resolved: false, failToPassFailures: ["tests/test_demo.py::test_expected_fix"], passToPassFailures: [] }
+    ];
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.1",
+      runId: "unit-run-final-best-tie"
+    }, capabilityContext());
+
+    const metadata = (execution.value as { evidence?: { metadata?: JsonObject } }).evidence?.metadata;
+    const applyCommands = platform.executedCommands.filter((entry) =>
+      entry.command === "git" && entry.args.includes("apply")
+    );
+    assert.equal(metadata?.bestAttempt, 1);
+    assert.equal(metadata?.lastAttempt, 3);
+    assert.equal(applyCommands.length, 2);
+    assert.equal(
+      await platform.readFile("/workspace/.deepseek/swe-lite-runs/unit-run-final-best-tie/prediction.jsonl"),
+      await platform.readFile("/workspace/.deepseek/swe-lite-runs/unit-run-final-best-tie/prediction-attempt-1.jsonl")
+    );
   });
 
   it("passes official harness failures as repair evidence in the second child workflow state", async () => {
@@ -6001,15 +6256,104 @@ describe("CLI SWE-bench run capability", () => {
     assert.equal((repairFeedbackRef?.metadata as JsonObject | undefined)?.attemptNumber, 2);
     assert.equal((repairFeedbackRef?.metadata as JsonObject | undefined)?.failingTestCount, 2);
     assert.equal((repairFeedbackRef?.metadata as JsonObject | undefined)?.failureExcerptCount, 1);
-    assert.equal((understandStage?.outputRefs as string[] | undefined)?.includes("ref:runner:official-repair-feedback"), true);
-    assert.equal(understandStage?.status, "succeeded");
+    assert.equal(repairFeedbackRef?.path, "/workspace/.deepseek/swe-lite-runs/unit-run-repair-state/repo/.deepseek/swe-bench-repair-context.md");
+    assert.equal((understandStage?.inputRefs as string[] | undefined)?.includes("ref:runner:official-repair-feedback"), true);
+    assert.deepEqual(understandStage?.outputRefs, []);
+    assert.equal(understandStage?.status, "pending");
     assert.equal((changeStage?.inputRefs as string[] | undefined)?.includes("ref:runner:official-repair-feedback"), true);
     assert.equal(changeStage?.status, "pending");
+  });
+
+  it("passes local failing test source excerpts as repair evidence", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    platform.resolveOnSecondHarness = true;
+    platform.harnessTestOutputByInstanceId.set("demo__repo-2", [
+      "tests/test_demo.py::test_expected_fix FAILED",
+      "tests/test_demo.py:42: in test_expected_fix",
+      "    assert parsed.unit == Unit('nm')",
+      "E   AssertionError: assert None == Unit('nm')",
+      "FAILED tests/test_demo.py::test_expected_fix - AssertionError: assert None == Unit('nm')",
+      ""
+    ].join("\n"));
+    await platform.writeFile("/workspace/.deepseek/swe-lite-runs/unit-run-repair-test-source/repo/tests/test_demo.py", [
+      "def helper():",
+      "    return None",
+      "",
+      "def test_expected_fix():",
+      "    parsed = read_table()",
+      "    assert parsed.unit == Unit('nm')",
+      ""
+    ].join("\n"));
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.1",
+      runId: "unit-run-repair-test-source"
+    }, capabilityContext());
+
+    assert.equal(execution.ok, true);
+    const childRuns = platform.executedCommands.filter(isAgentRunCommand);
+    const repairContextPath = argAfter(childRuns[1]?.args ?? [], "--additional-user-context-file");
+    const repairContext = repairContextPath ? await platform.readFile(repairContextPath) : "";
+
+    assert.equal(repairContext.includes("Local failing test source excerpts"), true);
+    assert.equal(repairContext.includes("def test_expected_fix():"), true);
+    assert.equal(repairContext.includes("assert parsed.unit == Unit('nm')"), true);
+  });
+
+  it("does not present an unrelated file prefix as missing hidden test source", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    platform.resolveOnSecondHarness = true;
+    platform.harnessTestOutputByInstanceId.set("demo__repo-2", [
+      "=================================== FAILURES ===================================",
+      "______________________________ test_hidden_fix _______________________________",
+      "",
+      "    def test_hidden_fix():",
+      ">       assert parse_value('no') == 1",
+      "E       ValueError: invalid value",
+      "",
+      "FAILED tests/test_demo.py::test_hidden_fix - ValueError: invalid value",
+      ""
+    ].join("\n"));
+    await platform.writeFile("/workspace/.deepseek/swe-lite-runs/unit-run-hidden-test-source/repo/tests/test_demo.py", [
+      "def test_public_behavior():",
+      "    assert parse_value('yes') == 1",
+      ""
+    ].join("\n"));
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.1",
+      runId: "unit-run-hidden-test-source"
+    }, capabilityContext());
+
+    const childRuns = platform.executedCommands.filter(isAgentRunCommand);
+    const repairContextPath = argAfter(childRuns[1]?.args ?? [], "--additional-user-context-file");
+    const repairContext = repairContextPath ? await platform.readFile(repairContextPath) : "";
+    const metadata = (execution.value as { evidence?: { metadata?: JsonObject } }).evidence?.metadata;
+    const diagnostics = metadata?.diagnostics as JsonObject[] | undefined;
+
+    assert.equal(repairContext.includes("Local failing test source excerpts"), false);
+    assert.equal(repairContext.includes("def test_public_behavior():"), false);
+    assert.equal(diagnostics?.some((entry) => entry.code === "SWE_BENCH_LOCAL_TEST_SYMBOL_UNAVAILABLE"), true);
   });
 
   it("diagnoses low-fidelity repair feedback when official failure excerpts are unavailable", async () => {
     const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
     platform.resolveOnSecondHarness = true;
+    platform.datasetInstances.set(2, {
+      problemStatement: "Please support header rows in RestructuredText output"
+    });
     const deps = createDeterministicRuntimeDependencies({ platform });
     await registerCliSweBenchRunCapabilities(deps, "/workspace", {
       env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
@@ -6025,8 +6369,17 @@ describe("CLI SWE-bench run capability", () => {
     assert.equal(execution.ok, true);
     const value = execution.value as { evidence?: { metadata?: JsonObject } };
     const diagnostics = value.evidence?.metadata?.diagnostics as JsonObject[] | undefined;
+    const childRuns = platform.executedCommands.filter(isAgentRunCommand);
+    const repairContextPath = argAfter(childRuns[1]?.args ?? [], "--additional-user-context-file");
+    const repairContext = repairContextPath ? await platform.readFile(repairContextPath) : "";
 
     assert.equal(diagnostics?.some((entry) => entry.code === "REPAIR_FEEDBACK_LOW_FIDELITY"), true);
+    assert.equal(repairContext.includes("Original problem statement:"), true);
+    assert.equal(repairContext.includes("Please support header rows in RestructuredText output"), true);
+    assert.equal(repairContext.includes("Previous patch excerpt:"), true);
+    assert.equal(repairContext.includes("+new"), true);
+    assert.equal(repairContext.includes("construct and run a focused local reproduction"), true);
+    assert.equal(repairContext.includes("Do not add unused parallel classes"), true);
     assert.equal(value.evidence?.metadata?.primaryFailureCategory, "runner-readiness");
     assert.equal(value.evidence?.metadata?.modelAttributionAllowed, false);
   });
@@ -6412,16 +6765,25 @@ describe("CLI SWE-bench run capability", () => {
     assert.equal(childIndex > editableIndex, true);
   });
 
-  it("stops before harness or repair when the child loop fails without a patch", async () => {
+  it("retries a model-owned pre-harness empty patch with structured feedback", async () => {
     const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
-    platform.gitDiffOutput = "";
-    platform.agentStdout = [
+    platform.gitDiffOutputs = ["", [
+      "diff --git a/src/example.py b/src/example.py",
+      "--- a/src/example.py",
+      "+++ b/src/example.py",
+      "@@ -1 +1 @@",
+      "-old",
+      "+new",
+      ""
+    ].join("\n")];
+    platform.agentStdouts = [[
       JSON.stringify({ kind: "model.requested", data: { iteration: 1 } }),
       JSON.stringify({ kind: "model.tool.intent", data: { toolCallId: "read-1", name: "core.file.read", input: { path: "src/example.py" } } }),
       JSON.stringify({ kind: "model.tool.result", data: { toolCallId: "read-1", toolName: "core.file.read", terminalKind: "capability.completed" } }),
       JSON.stringify({ kind: "workflow.required-action.missed", data: { requestedCapabilityId: "core.file.read", repeatedProgressEvidence: true } }),
       JSON.stringify({ kind: "agent.loop.failed", data: { status: "rejected", reason: "workflow-required-action-missed" } })
-    ].join("\n") + "\n";
+    ].join("\n") + "\n", solvedChildTrace()];
+    platform.resolvedTaskNumbers.add(2);
     const deps = createDeterministicRuntimeDependencies({ platform });
     await registerCliSweBenchRunCapabilities(deps, "/workspace", {
       env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
@@ -6436,15 +6798,99 @@ describe("CLI SWE-bench run capability", () => {
 
     assert.equal(execution.ok, true);
     const metadata = (execution.value as { evidence?: { metadata?: JsonObject } }).evidence?.metadata;
+    const childRuns = platform.executedCommands.filter(isAgentRunCommand);
+    const retryContextPath = argAfter(childRuns[1]?.args ?? [], "--additional-user-context-file");
+    const retryContext = retryContextPath ? await platform.readFile(retryContextPath) : "";
 
-    assert.equal(platform.harnessRunCount, 0);
-    assert.equal(platform.agentRunCount, 1);
-    assert.equal(metadata?.status, "fail");
-    assert.equal(metadata?.attemptCount, 1);
-    assert.equal(metadata?.repairAttempted, false);
-    assert.equal(metadata?.evaluationStatus, undefined);
-    assert.equal(metadata?.childTerminalReason, "workflow-required-action-missed");
-    assert.equal(metadata?.patchBytes, 0);
+    assert.equal(platform.harnessRunCount, 1);
+    assert.equal(platform.agentRunCount, 2);
+    assert.equal(metadata?.status, "warn");
+    assert.equal(metadata?.attemptCount, 2);
+    assert.equal(metadata?.repairAttempted, true);
+    assert.equal(metadata?.evaluationResolved, true);
+    assert.match(retryContext, /Previous supervised attempt feedback/);
+    assert.match(retryContext, /workflow-required-action-missed/);
+    assert.match(retryContext, /source mutation count: 0/i);
+    assert.match(retryContext, /required next action: source mutation and standard test/i);
+  });
+
+  it("resumes a mutated pre-harness candidate at verification", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    const patch = [
+      "diff --git a/src/example.py b/src/example.py",
+      "--- a/src/example.py",
+      "+++ b/src/example.py",
+      "@@ -1 +1 @@",
+      "-old",
+      "+new",
+      ""
+    ].join("\n");
+    platform.gitDiffOutputs = [patch, patch];
+    platform.agentStdouts = [mutatedChildTraceWithoutTest(), solvedChildTrace()];
+    platform.resolvedTaskNumbers.add(2);
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.1",
+      runId: "unit-run-pre-harness-resume-verify"
+    }, capabilityContext());
+
+    assert.equal(execution.ok, true);
+    const secondState = JSON.parse(await platform.readFile(
+      "/workspace/.deepseek/swe-lite-runs/unit-run-pre-harness-resume-verify/runner-stage-state-attempt-2.json"
+    )) as JsonObject;
+    const stageStates = secondState.stageStates as JsonObject[];
+
+    assert.equal(stageStates.find((stage) => stage.stageId === "understand")?.status, "succeeded");
+    assert.equal(stageStates.find((stage) => stage.stageId === "change")?.status, "succeeded");
+    assert.equal(stageStates.find((stage) => stage.stageId === "verify")?.status, "pending");
+  });
+
+  it("continues to a third attempt without applying an earlier empty candidate", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    platform.rejectEmptyGitApply = true;
+    platform.gitDiffOutputs = ["", "", [
+      "diff --git a/src/example.py b/src/example.py",
+      "--- a/src/example.py",
+      "+++ b/src/example.py",
+      "@@ -1 +1 @@",
+      "-old",
+      "+new",
+      ""
+    ].join("\n")];
+    platform.agentStdouts = [
+      failedChildTraceWithoutMutation(),
+      failedChildTraceWithoutMutation(),
+      solvedChildTrace()
+    ];
+    platform.resolvedTaskNumbers.add(2);
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.1",
+      runId: "unit-run-empty-candidate-third-attempt"
+    }, capabilityContext());
+
+    const metadata = (execution.value as { evidence?: { metadata?: JsonObject } }).evidence?.metadata;
+    const applyCommands = platform.executedCommands.filter((entry) =>
+      entry.command === "git" && entry.args[2] === "apply"
+    );
+
+    assert.equal(platform.agentRunCount, 3);
+    assert.equal(platform.harnessRunCount, 1);
+    assert.equal(metadata?.attemptCount, 3);
+    assert.equal(metadata?.evaluationResolved, true);
+    assert.equal(applyCommands.length, 0);
   });
 
   it("prioritizes child mutation convergence failure over provider cache diagnostics", async () => {
@@ -6502,6 +6948,111 @@ describe("CLI SWE-bench run capability", () => {
     assert.equal(reasonCodes?.includes("CACHE_PROVIDER_BELOW_TARGET"), true);
     assert.equal(metadata?.primaryFailureCategory, "flow-control");
     assert.equal(execution.ok, true);
+  });
+
+  it("does not let cache readiness mask exhausted exact mutation recovery", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    await platform.writeFile("/workspace/.deepseek/swe-lite-runs/unit-run-exact-recovery-exhausted/summary.json", JSON.stringify({
+      schemaVersion: "1.0.0",
+      kind: "capability.swe-bench.run.summary",
+      taskNumber: 2,
+      runId: "unit-run-exact-recovery-exhausted",
+      status: "fail",
+      dryRun: false,
+      execute: true,
+      provider: "glm",
+      model: "glm-5.2",
+      instanceId: "demo__repo-2",
+      environmentStatus: "pass",
+      predictionStatus: "fail",
+      evaluationStatus: "warn",
+      evaluationResolved: false,
+      bestAttempt: 1,
+      lastAttempt: 3,
+      childTerminalReason: "flow-mutation-recovery-exhausted",
+      lastAttemptTerminalReason: "flow-mutation-recovery-exhausted",
+      childLastStageId: "stage:change",
+      childModelRequestCount: 8,
+      childSourceInspectionToolCount: 4,
+      childSourceMutationCount: 1,
+      childTestCommandCount: 1,
+      patchBytes: 128,
+      attemptCount: 3,
+      commandCount: 12,
+      diagnostics: [{
+        code: "SWE_BENCH_PROVIDER_CACHE_BELOW_TARGET",
+        severity: "error",
+        message: "cache below target",
+        redaction: { class: "internal" }
+      }],
+      redaction: { class: "internal", fields: ["diagnostics.metadata"] }
+    }));
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.2",
+      runId: "unit-run-exact-recovery-exhausted",
+      resumeOnly: true
+    }, capabilityContext());
+
+    const metadata = (execution.value as { evidence?: { metadata?: JsonObject } }).evidence?.metadata;
+    const reasonCodes = metadata?.reasonCodes as readonly string[] | undefined;
+    assert.equal(metadata?.primaryReasonCode, "FLOW_MUTATION_RECOVERY_EXHAUSTED");
+    assert.equal(reasonCodes?.includes("CACHE_PROVIDER_BELOW_TARGET"), true);
+    assert.equal(reasonCodes?.includes("OFFICIAL_UNRESOLVED_AFTER_REPAIR"), true);
+    assert.equal(metadata?.primaryFailureCategory, "flow-control");
+    assert.equal(execution.ok, true);
+  });
+
+  it("infers the latest single-task run id when resuming without an explicit run id", async () => {
+    const platform = new FakeSweBenchRunPlatform("fake", "/workspace");
+    const olderSummary = {
+      schemaVersion: "1.0.0",
+      kind: "capability.swe-bench.run.summary",
+      status: "fail",
+      taskNumber: 2,
+      runId: "swe-lite-task-2",
+      dryRun: false,
+      execute: true,
+      provider: "glm",
+      model: "glm-5.2",
+      evaluationStatus: "warn",
+      evaluationResolved: false,
+      attemptCount: 1,
+      commandCount: 4,
+      diagnostics: [],
+      redaction: { class: "internal", fields: ["diagnostics.metadata"] }
+    };
+    const newerSummary = {
+      ...olderSummary,
+      runId: "swe-lite-task-2-fresh",
+      attemptCount: 2,
+      commandCount: 8
+    };
+    await platform.writeFile("/workspace/.deepseek/swe-lite-runs/swe-lite-task-2/summary.json", JSON.stringify(olderSummary));
+    await platform.writeFile("/workspace/.deepseek/swe-lite-runs/swe-lite-task-2-fresh/summary.json", JSON.stringify(newerSummary));
+    const deps = createDeterministicRuntimeDependencies({ platform });
+    await registerCliSweBenchRunCapabilities(deps, "/workspace", {
+      env: { GLM_ANTHROPIC_API_KEY: "fixture-secret-value" }
+    });
+
+    const execution = await deps.capabilities.execute(asId<"capability">("core.swe.bench.run"), {
+      taskNumber: 2,
+      provider: "glm",
+      model: "glm-5.2",
+      resumeOnly: true
+    }, capabilityContext());
+
+    const metadata = (execution.value as { evidence?: { metadata?: JsonObject } }).evidence?.metadata;
+
+    assert.equal(execution.ok, true);
+    assert.equal(metadata?.runId, "swe-lite-task-2-fresh");
+    assert.equal(metadata?.attemptCount, 2);
   });
 
   it("classifies empty predictions as runner packaging failures without model attribution", async () => {

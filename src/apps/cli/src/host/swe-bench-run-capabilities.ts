@@ -1,4 +1,4 @@
-import { dirname } from "node:path";
+import { dirname, isAbsolute } from "node:path";
 import { MAX_EXECUTION_TIMEOUT_MS, STAGED_TASK_COMPATIBILITY, STAGED_TASK_SCHEMA_VERSION, TOOL_FAMILY_CATALOG_SCHEMA_VERSION, asId } from "@deepseek/platform-contracts";
 import type {
   CapabilityExecutionContext,
@@ -24,7 +24,12 @@ import type { SweBenchEvaluationCacheSummary } from "../diagnostics/swe-bench-ca
 import { summarizeSweBenchChildTrace } from "../diagnostics/swe-bench-child-trace.js";
 import type { SweBenchChildTraceSummary } from "../diagnostics/swe-bench-child-trace.js";
 import { collectSweBenchPrediction, sweBenchCacheDiagnostics } from "../diagnostics/swe-bench-prediction.js";
-import type { SweBenchHarnessFailureExcerpt, SweBenchPredictionSummary, SweBenchRepairContext } from "../diagnostics/swe-bench-prediction.js";
+import type { SweBenchHarnessFailureExcerpt, SweBenchLocalTestSourceExcerpt, SweBenchPredictionSummary, SweBenchRepairContext } from "../diagnostics/swe-bench-prediction.js";
+import {
+  compareSweBenchAttemptCandidates,
+  selectBestSweBenchAttemptCandidate,
+  type SweBenchAttemptCandidate
+} from "./swe-bench-attempt-candidates.js";
 
 const CHECKOUT_ENV_BOOTSTRAP_TIMEOUT_MS = 120_000;
 const CHECKOUT_ENV_EDITABLE_INSTALL_TIMEOUT_MS = 180_000;
@@ -95,6 +100,10 @@ interface SweBenchRunSummary extends JsonObject {
   readonly verificationCommandMissing?: boolean;
   readonly patchBytes?: number;
   readonly attemptCount?: number;
+  readonly bestAttempt?: number;
+  readonly lastAttempt?: number;
+  readonly attemptCandidates?: readonly JsonObject[];
+  readonly lastAttemptTerminalReason?: string;
   readonly repairAttempted?: boolean;
   readonly batch?: SweBenchRunBatchSummary;
   readonly children?: readonly SweBenchRunSummary[];
@@ -102,6 +111,11 @@ interface SweBenchRunSummary extends JsonObject {
   readonly diagnostics: readonly JsonObject[];
   readonly redaction: { readonly class: "internal"; readonly fields?: readonly string[] };
 }
+
+type SweBenchRunAttemptCandidate = SweBenchAttemptCandidate<
+  SweBenchPredictionSummary,
+  SweBenchPredictionSummary
+>;
 
 interface SweBenchRunnerToolMatrixEvidence extends JsonObject {
   readonly schemaVersion: "1.0.0";
@@ -249,7 +263,10 @@ export async function registerCliSweBenchRunCapabilities(
       const explicitRunId = stringField(input, "runId");
       const resumeOnly = input.resumeOnly === true;
       const resume = input.resume === true || resumeOnly;
-      const runId = sanitizeRunId(explicitRunId ?? defaultRunIdForInvocation(taskNumbers, resume));
+      const inferredResumeRunId = !explicitRunId && resume && taskNumbers.length === 1
+        ? await latestSingleTaskResumeRunId(platform, workspaceRoot, taskNumbers[0] as number, provider, model)
+        : undefined;
+      const runId = sanitizeRunId(explicitRunId ?? inferredResumeRunId ?? defaultRunIdForInvocation(taskNumbers, resume));
       const timeoutMs = governedSweBenchRunTimeout(numberField(input, "timeoutMs"));
       const common: {
         readonly platform: PlatformRuntime;
@@ -471,6 +488,32 @@ function backpressureEvidenceFromBatchSummary(
     };
   }
   return undefined;
+}
+
+async function latestSingleTaskResumeRunId(
+  platform: PlatformRuntime,
+  workspaceRoot: string,
+  taskNumber: number,
+  provider: "deepseek" | "glm",
+  model: string
+): Promise<string | undefined> {
+  const runRoot = platform.resolvePath(workspaceRoot, ".deepseek", "swe-lite-runs");
+  const files = await platform.findFiles("summary.json", runRoot).catch(() => []);
+  const candidates: { readonly runId: string; readonly mtimeMs: number; readonly path: string }[] = [];
+  for (const path of files) {
+    if (!normalizedPath(path).endsWith("/summary.json")) continue;
+    const parsed = parseJsonObject(await platform.readFile(path).catch(() => ""));
+    if (!parsed || !isResumableTerminalSummary(parsed)) continue;
+    if (numberField(parsed, "taskNumber") !== taskNumber) continue;
+    if (parsed.provider !== provider || stringField(parsed, "model") !== model) continue;
+    candidates.push({
+      runId: stringField(parsed, "runId") ?? runIdFromBatchSummaryPath(path),
+      mtimeMs: await statFileMtimeMs(platform, path),
+      path
+    });
+  }
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs || b.path.localeCompare(a.path));
+  return candidates[0]?.runId;
 }
 
 function batchSummaryMentionsTask(summary: JsonObject, taskNumber: number): boolean {
@@ -780,15 +823,21 @@ async function runSweBenchCapability(input: {
   }
   await persistRunProgress(input.platform, runRoot, input.runId, input.taskNumber, "checkout.env", "completed", diagnostics, { instanceId: instance.instanceId });
 
-  const maxAttempts = 2;
+  const maxAttempts = 3;
   let prediction: SweBenchPredictionSummary | undefined;
   let evaluation: SweBenchPredictionSummary | undefined;
   let repairContext: SweBenchRepairContext | undefined;
+  const attemptCandidates: SweBenchRunAttemptCandidate[] = [];
+  let lastAttemptPrediction: SweBenchPredictionSummary | undefined;
+  let terminalCache: SweBenchEvaluationCacheSummary | undefined;
+  let candidateRestoreFailed = false;
+  let checkoutRestoredToAttempt: number | undefined;
   let attemptCommandCount = 0;
   let attemptCount = 0;
   let repairAttempted = false;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     attemptCount = attempt;
+    checkoutRestoredToAttempt = undefined;
     const attemptTraceOutputPath = input.platform.resolvePath(runRoot, `trace-attempt-${attempt}.jsonl`);
     const supervisorWorkflowStatePath = await writeRunnerStageStateForChild({
       platform: input.platform,
@@ -820,12 +869,27 @@ async function runSweBenchCapability(input: {
     await persistRunProgress(input.platform, runRoot, input.runId, input.taskNumber, "attempt.predict.completed", prediction.status === "fail" ? "failed" : "completed", diagnostics, { attempt, instanceId: instance.instanceId });
     await copyAttemptTraceToLatest(input.platform, attemptTraceOutputPath, latestTraceOutputPath, diagnostics);
     attemptCommandCount += prediction.executedCommands.length;
+    lastAttemptPrediction = prediction;
     if (childPredictionFailedBeforeHarness(prediction)) {
+      const retryablePreHarnessFailure = attempt < maxAttempts && childPredictionPreHarnessFailureIsRetryable(prediction);
       const cache = await readSweBenchCacheTrace(input.platform, attemptTraceOutputPath, SWE_BENCH_PROVIDER_CACHE_THRESHOLD).catch(() => undefined);
+      terminalCache = cache;
+      const candidate = await persistAttemptCandidate({
+        platform: input.platform,
+        runRoot,
+        attempt,
+        sharedPredictionPath: outputPath,
+        tracePath: attemptTraceOutputPath,
+        prediction,
+        diagnostics
+      });
+      if (candidate) attemptCandidates.push(candidate);
       diagnostics.push({
         code: childPredictionHarnessReadinessCode(prediction),
-        severity: "error",
-        message: "Managed child agent did not produce harness-ready mutation and test evidence; skipping official harness and repair attempts.",
+        severity: retryablePreHarnessFailure ? "warn" : "error",
+        message: retryablePreHarnessFailure
+          ? "Managed child agent did not produce harness-ready mutation and test evidence; consuming this attempt and launching a bounded supervised retry."
+          : "Managed child agent did not produce harness-ready mutation and test evidence; skipping official harness and further attempts.",
         metadata: {
           attempt,
           terminalKind: prediction.childTrace?.terminalKind,
@@ -838,20 +902,48 @@ async function runSweBenchCapability(input: {
         redaction: { class: "internal", fields: ["metadata"] }
       });
       await persistRunProgress(input.platform, runRoot, input.runId, input.taskNumber, "attempt.evaluate.skipped", "failed", diagnostics, { attempt, instanceId: instance.instanceId });
-      return persistAndReturn(summary({
-        input,
-        runRoot,
-        diagnostics,
-        toolMatrix,
-        environmentStatus: environment.status,
-        prediction,
-        ...(cache ? { cache } : {}),
-        instanceId: instance.instanceId,
-        attemptCount,
-        repairAttempted,
-        commandCount: environment.executedSteps.length + checkoutCommands + checkoutEnvironmentCommands + attemptCommandCount,
-        status: "fail"
-      }));
+      const bestCandidate = selectBestSweBenchAttemptCandidate(attemptCandidates);
+      if (bestCandidate && bestCandidate.attempt !== attempt) {
+        candidateRestoreFailed = !await restoreSweBenchAttemptCandidate({
+          platform: input.platform,
+          repoDir,
+          runRoot,
+          runId: input.runId,
+          taskNumber: input.taskNumber,
+          baseCommit: instance.baseCommit,
+          candidate: bestCandidate,
+          timeoutMs: input.timeoutMs,
+          diagnostics
+        });
+        if (!candidateRestoreFailed) checkoutRestoredToAttempt = bestCandidate.attempt;
+      }
+      if (retryablePreHarnessFailure && !candidateRestoreFailed) {
+        repairAttempted = true;
+        repairContext = repairContextFromPreHarnessFailure({
+          prediction,
+          attemptNumber: attempt + 1,
+          previousRunId: input.runId,
+          problemStatement: instance.problemStatement,
+          ...(repairContext ? { previousRepairContext: repairContext } : {})
+        });
+        diagnostics.push({
+          code: "SWE_BENCH_PRE_HARNESS_RETRY_REQUESTED",
+          severity: "info",
+          message: "A model-owned pre-harness generation failure consumed one attempt; launching the next attempt with structured convergence feedback.",
+          metadata: {
+            attempt,
+            nextAttempt: attempt + 1,
+            stageId: prediction.childTrace?.lastStageId,
+            terminalKind: prediction.childTrace?.terminalKind,
+            terminalReason: prediction.childTrace?.terminalReason,
+            sourceMutationCount: prediction.childTrace?.sourceMutationCount ?? 0,
+            testCommandCount: prediction.childTrace?.testCommandCount ?? 0
+          },
+          redaction: { class: "internal", fields: ["metadata"] }
+        });
+        continue;
+      }
+      break;
     }
     const runId = uniqueHarnessEvaluationRunId(input.runId, attempt);
     await persistRunProgress(input.platform, runRoot, input.runId, input.taskNumber, "attempt.evaluate.start", "started", diagnostics, { attempt, instanceId: instance.instanceId });
@@ -872,10 +964,40 @@ async function runSweBenchCapability(input: {
     });
     await persistRunProgress(input.platform, runRoot, input.runId, input.taskNumber, "attempt.evaluate.completed", evaluation.status === "fail" ? "failed" : "completed", diagnostics, { attempt, instanceId: instance.instanceId });
     attemptCommandCount += evaluation.executedCommands.length;
+    const candidate = await persistAttemptCandidate({
+      platform: input.platform,
+      runRoot,
+      attempt,
+      sharedPredictionPath: outputPath,
+      tracePath: attemptTraceOutputPath,
+      prediction,
+      evaluation,
+      diagnostics
+    });
+    if (candidate) attemptCandidates.push(candidate);
     if (evaluation.evaluation?.resolved !== false || attempt === maxAttempts) break;
+    const bestCandidate = selectBestSweBenchAttemptCandidate(attemptCandidates);
+    if (candidate && bestCandidate && compareSweBenchAttemptCandidates(candidate, bestCandidate) < 0) {
+      candidateRestoreFailed = !await restoreSweBenchAttemptCandidate({
+        platform: input.platform,
+        repoDir,
+        runRoot,
+        runId: input.runId,
+        taskNumber: input.taskNumber,
+        baseCommit: instance.baseCommit,
+        candidate: bestCandidate,
+        timeoutMs: input.timeoutMs,
+        diagnostics
+      });
+      if (candidateRestoreFailed) break;
+      checkoutRestoredToAttempt = bestCandidate.attempt;
+      await projectBestPredictionArtifact(input.platform, bestCandidate, outputPath, diagnostics);
+    }
     repairAttempted = true;
-    const failingTests = failingTestsFromEvaluation(evaluation).slice(0, 12);
-    const failureExcerpts = failureExcerptsFromEvaluation(evaluation).slice(0, 6);
+    const repairEvaluation = bestCandidate?.evaluation ?? evaluation;
+    const repairPrediction = bestCandidate?.prediction ?? prediction;
+    const failingTests = failingTestsFromEvaluation(repairEvaluation).slice(0, 12);
+    const failureExcerpts = failureExcerptsFromEvaluation(repairEvaluation).slice(0, 6);
     diagnostics.push({
       code: "SWE_BENCH_REPAIR_ATTEMPT_REQUESTED",
       severity: "info",
@@ -883,7 +1005,7 @@ async function runSweBenchCapability(input: {
       metadata: {
         attempt,
         nextAttempt: attempt + 1,
-        unresolvedInstanceIds: evaluation.evaluation.batch.unresolvedInstanceIds,
+        unresolvedInstanceIds: repairEvaluation.evaluation?.batch.unresolvedInstanceIds ?? [],
         failingTests,
         failureExcerptCount: failureExcerpts.length
       },
@@ -902,9 +1024,48 @@ async function runSweBenchCapability(input: {
         redaction: { class: "internal", fields: ["metadata"] }
       });
     }
-    repairContext = repairContextFromEvaluation(evaluation, attempt + 1, prediction.predictions[0]?.model_patch.length);
+    const localTestSourceExcerpts = await localFailingTestSourceExcerpts(input.platform, repoDir, failingTests, diagnostics);
+    const previousPatch = repairPrediction.predictions[0]?.model_patch;
+    repairContext = repairContextFromEvaluation({
+      evaluation: repairEvaluation,
+      attemptNumber: attempt + 1,
+      ...(previousPatch !== undefined ? { previousPatch } : {}),
+      problemStatement: instance.problemStatement,
+      localTestSourceExcerpts,
+      ...(bestCandidate && bestCandidate.attempt !== attempt ? {
+        restoredFromAttempt: bestCandidate.attempt,
+        discardedRegressedAttempt: attempt
+      } : {})
+    });
   }
-  if (!prediction || !evaluation) {
+  const bestCandidate = selectBestSweBenchAttemptCandidate(attemptCandidates);
+  const lastCandidate = attemptCandidates.find((candidate) => candidate.attempt === attemptCount);
+  if (
+    bestCandidate &&
+    lastCandidate &&
+    bestCandidate.attempt !== lastCandidate.attempt &&
+    checkoutRestoredToAttempt !== bestCandidate.attempt &&
+    !candidateRestoreFailed
+  ) {
+    candidateRestoreFailed = !await restoreSweBenchAttemptCandidate({
+      platform: input.platform,
+      repoDir,
+      runRoot,
+      runId: input.runId,
+      taskNumber: input.taskNumber,
+      baseCommit: instance.baseCommit,
+      candidate: bestCandidate,
+      timeoutMs: input.timeoutMs,
+      diagnostics
+    });
+    if (!candidateRestoreFailed) checkoutRestoredToAttempt = bestCandidate.attempt;
+  }
+  if (bestCandidate) {
+    await projectBestPredictionArtifact(input.platform, bestCandidate, outputPath, diagnostics);
+  }
+  const authoritativePrediction = bestCandidate?.prediction ?? prediction;
+  const authoritativeEvaluation = bestCandidate?.evaluation ?? evaluation;
+  if (!authoritativePrediction) {
     return persistAndReturn(summary({
       input,
       runRoot,
@@ -916,21 +1077,30 @@ async function runSweBenchCapability(input: {
       status: "fail"
     }));
   }
-  for (const item of prediction.diagnostics) diagnostics.push(predictionDiagnostic(item));
-  for (const item of evaluation.diagnostics) diagnostics.push(predictionDiagnostic(item));
+  for (const source of [authoritativePrediction, authoritativeEvaluation, lastAttemptPrediction]) {
+    if (!source) continue;
+    for (const item of source.diagnostics) diagnostics.push(predictionDiagnostic(item));
+  }
   return persistAndReturn(summary({
     input,
     runRoot,
     diagnostics,
     toolMatrix,
     environmentStatus: environment.status,
-    prediction,
-    evaluation,
+    prediction: authoritativePrediction,
+    ...(authoritativeEvaluation ? { evaluation: authoritativeEvaluation } : {}),
+    ...(terminalCache ? { cache: terminalCache } : {}),
+    ...(lastAttemptPrediction ? { lastAttemptPrediction } : {}),
     instanceId: instance.instanceId,
     attemptCount,
+    ...(bestCandidate ? { bestAttempt: bestCandidate.attempt } : {}),
+    lastAttempt: attemptCount,
+    attemptCandidates: attemptCandidates.map(attemptCandidateMetadata),
     repairAttempted,
     commandCount: environment.executedSteps.length + checkoutCommands + checkoutEnvironmentCommands + attemptCommandCount,
-    status: combinedStatus(prediction.status, evaluation.status, diagnostics)
+    status: candidateRestoreFailed || !authoritativeEvaluation
+      ? "fail"
+      : combinedStatus(authoritativePrediction.status, authoritativeEvaluation.status, diagnostics)
   }));
 }
 
@@ -941,9 +1111,32 @@ function childPredictionFailedBeforeHarness(prediction: SweBenchPredictionSummar
   if (patchBytes > 0) {
     return childTrace.sourceMutationCount === 0 || childTrace.testCommandCount === 0;
   }
-  return childTrace.terminalKind === "agent.loop.failed" ||
+  return patchBytes === 0 ||
+    childTrace.terminalKind === "agent.loop.failed" ||
     childTrace.terminalStatus === "rejected" ||
     childTrace.terminalReason === "workflow-required-action-missed";
+}
+
+function childPredictionPreHarnessFailureIsRetryable(prediction: SweBenchPredictionSummary): boolean {
+  const childTrace = prediction.childTrace;
+  if (!childTrace) return false;
+  const infrastructureFailure = prediction.diagnostics.some((diagnostic) => {
+    const code = String(diagnostic.id ?? diagnostic.code ?? "").toUpperCase();
+    return code.includes("CHECKOUT") ||
+      code.includes("ENVIRONMENT") ||
+      code.includes("PERMISSION") ||
+      code.includes("CREDENTIAL") ||
+      code.includes("CONFIGURATION") ||
+      code.includes("PROVIDER_UNAVAILABLE") ||
+      code.includes("TOOL_UNAVAILABLE");
+  });
+  if (infrastructureFailure) return false;
+  const patchBytes = prediction.predictions[0]?.model_patch.length ?? 0;
+  return patchBytes === 0 ||
+    childTrace.sourceMutationCount === 0 ||
+    childTrace.testCommandCount === 0 ||
+    childTrace.terminalKind === "agent.loop.budget.consumed" ||
+    childTrace.terminalKind === "agent.loop.failed";
 }
 
 function childPredictionHarnessReadinessCode(prediction: SweBenchPredictionSummary): string {
@@ -1202,6 +1395,9 @@ function failureReasonCodesFromDiagnostic(diagnostic: JsonObject): readonly stri
   if (code === "REPAIR_FEEDBACK_LOW_FIDELITY") return ["REPAIR_FEEDBACK_LOW_FIDELITY"];
   if (code === "SWE_BENCH_REPAIR_FEEDBACK_INSUFFICIENT" || code === "SWE_BENCH_REPAIR_DIFF_MISSING") return ["REPAIR_FEEDBACK_INSUFFICIENT"];
   if (code === "SWE_BENCH_EVALUATION_UNRESOLVED") return ["OFFICIAL_UNRESOLVED_AFTER_REPAIR"];
+  if (code === "SWE_BENCH_ATTEMPT_ARTIFACT_PERSIST_FAILED") return ["RUNNER_ATTEMPT_ARTIFACT_PERSIST_FAILED"];
+  if (code === "SWE_BENCH_BEST_PREDICTION_PROJECT_FAILED") return ["RUNNER_ATTEMPT_ARTIFACT_PERSIST_FAILED"];
+  if (code === "SWE_BENCH_CANDIDATE_RESTORE_FAILED") return ["RUNNER_CANDIDATE_RESTORE_FAILED"];
   if (code === "RUNNER_TOOL_MATRIX_INCOMPLETE") return ["RUNNER_TOOL_MATRIX_INCOMPLETE"];
   if (code === "RUNNER_MUTATION_TOOL_UNAVAILABLE") return ["RUNNER_MUTATION_TOOL_UNAVAILABLE"];
   if (code === "RUNNER_VERIFICATION_TOOL_UNAVAILABLE") return ["RUNNER_VERIFICATION_TOOL_UNAVAILABLE"];
@@ -1247,6 +1443,7 @@ function failureReasonCodesFromChildTraceLike(input: JsonObject): readonly strin
   if (terminalReason === "swe-bench-request-budget-exceeded") codes.push("FLOW_REQUEST_BUDGET_EXCEEDED");
   if (terminalReason === "swe-bench-source-inspection-defiance") codes.push("GATE_SOURCE_INSPECTION_DEFIANCE");
   if (terminalReason === "swe-bench-invalid-mutation-channel") codes.push("GATE_INVALID_MUTATION_CHANNEL");
+  if (terminalReason === "flow-mutation-recovery-exhausted") codes.push("FLOW_MUTATION_RECOVERY_EXHAUSTED");
   const modelRequestCount = numberField(input, "modelRequestCount");
   if (
     modelRequestCount !== undefined &&
@@ -1292,6 +1489,7 @@ function failureReasonPriority(code: string, child?: SweBenchRunSummary): number
     FLOW_TOOL_CALL_LIMIT: 35,
     FLOW_READY_FOR_HARNESS_GATE_MISSING: 35.25,
     FLOW_MUTATION_INPUT_STALLED: 35.3,
+    FLOW_MUTATION_RECOVERY_EXHAUSTED: 35.31,
     FLOW_POST_EDIT_VERIFICATION_MISSING: 35.5,
     GATE_SOURCE_INSPECTION_DEFIANCE: 35.7,
     GATE_SOURCE_INSPECTION_PRESSURE: 35.75,
@@ -1323,9 +1521,11 @@ function failureReasonPriority(code: string, child?: SweBenchRunSummary): number
     REPAIR_FEEDBACK_LOW_FIDELITY: 105,
     REPAIR_FEEDBACK_INSUFFICIENT: 110,
     VERIFICATION_ORACLE_GAP: 115,
-    PREDICTION_EMPTY_PATCH: 118,
-    MODEL_PATCH_INSUFFICIENT_AFTER_GOVERNED_REPAIR: 120,
-    OFFICIAL_UNRESOLVED_AFTER_REPAIR: 130,
+    RUNNER_ATTEMPT_ARTIFACT_PERSIST_FAILED: 44,
+    RUNNER_CANDIDATE_RESTORE_FAILED: 44.5,
+    PREDICTION_EMPTY_PATCH: 45,
+    MODEL_PATCH_INSUFFICIENT_AFTER_GOVERNED_REPAIR: 50,
+    OFFICIAL_UNRESOLVED_AFTER_REPAIR: 55,
     BATCH_PENDING_GOVERNANCE_BACKPRESSURE: 140
   };
   return priorities[code] ?? 1_000;
@@ -1351,6 +1551,8 @@ function childHasRequestBudgetEvidence(child: SweBenchRunSummary | undefined): b
 
 function failureCategoryForReasonCode(code: string): string {
   if (code === "RUNNER_DATASET_RESOLVE_FAILED") return "runner-readiness";
+  if (code === "RUNNER_CANDIDATE_RESTORE_FAILED") return "runner-readiness";
+  if (code === "RUNNER_ATTEMPT_ARTIFACT_PERSIST_FAILED") return "packaging";
   if (code === "RUNNER_TOOL_MATRIX_INCOMPLETE" || code === "RUNNER_MUTATION_TOOL_UNAVAILABLE" || code === "RUNNER_VERIFICATION_TOOL_UNAVAILABLE") return "missing-tools";
   if (code === "ENV_DOCKER_CONTEXT_UNAVAILABLE" || code === "ENV_DOCKER_CONTEXT_EMPTY" || code === "ENV_DOCKER_IMAGE_NOT_FOUND" || code === "ENV_TEST_DEPENDENCY_INCOMPATIBLE" || code === "ENV_TEST_DEPENDENCY_MISSING" || code === "ENV_POST_VERIFICATION_BLOCKER" || code === "CHECKOUT_EDITABLE_INSTALL_WARN") return "environment";
   if (code === "HARNESS_TOPLEVEL_ERROR_ONLY" || code === "HARNESS_INSTANCE_REPORT_MISSING") return "harness";
@@ -1367,6 +1569,7 @@ function failureCategoryForReasonCode(code: string): string {
 
 function actionabilityForReasonCode(code: string): string {
   if (code === "RUNNER_DATASET_RESOLVE_FAILED") return "framework-fix";
+  if (code === "RUNNER_CANDIDATE_RESTORE_FAILED" || code === "RUNNER_ATTEMPT_ARTIFACT_PERSIST_FAILED") return "framework-fix";
   if (code === "RUNNER_TOOL_MATRIX_INCOMPLETE" || code === "RUNNER_MUTATION_TOOL_UNAVAILABLE" || code === "RUNNER_VERIFICATION_TOOL_UNAVAILABLE") return "framework-fix";
   if (code === "ENV_DOCKER_CONTEXT_UNAVAILABLE" || code === "ENV_DOCKER_CONTEXT_EMPTY" || code === "ENV_DOCKER_IMAGE_NOT_FOUND" || code === "ENV_TEST_DEPENDENCY_INCOMPATIBLE" || code === "ENV_TEST_DEPENDENCY_MISSING" || code === "ENV_POST_VERIFICATION_BLOCKER" || code === "CHECKOUT_EDITABLE_INSTALL_WARN") return "environment-fix";
   if (code === "MODEL_PATCH_INSUFFICIENT_AFTER_GOVERNED_REPAIR" || code === "OFFICIAL_UNRESOLVED_AFTER_REPAIR") return "model-feedback";
@@ -1987,6 +2190,163 @@ async function copyAttemptTraceToLatest(
   }
 }
 
+async function persistAttemptCandidate(input: {
+  readonly platform: PlatformRuntime;
+  readonly runRoot: string;
+  readonly attempt: number;
+  readonly sharedPredictionPath: string;
+  readonly tracePath: string;
+  readonly prediction: SweBenchPredictionSummary;
+  readonly evaluation?: SweBenchPredictionSummary;
+  readonly diagnostics: JsonObject[];
+}): Promise<SweBenchRunAttemptCandidate | undefined> {
+  const patchPath = input.platform.resolvePath(input.runRoot, `candidate-attempt-${input.attempt}.patch`);
+  const predictionPath = input.platform.resolvePath(input.runRoot, `prediction-attempt-${input.attempt}.jsonl`);
+  const metadataPath = input.platform.resolvePath(input.runRoot, `candidate-attempt-${input.attempt}.json`);
+  const score = input.evaluation?.evaluation;
+  const candidate: SweBenchRunAttemptCandidate = {
+    attempt: input.attempt,
+    patchPath,
+    predictionPath,
+    tracePath: input.tracePath,
+    metadataPath,
+    prediction: input.prediction,
+    ...(input.evaluation ? { evaluation: input.evaluation } : {}),
+    sourceMutationCount: input.prediction.childTrace?.sourceMutationCount ?? 0,
+    testCommandCount: input.prediction.childTrace?.testCommandCount ?? 0,
+    patchBytes: Buffer.byteLength(input.prediction.predictions[0]?.model_patch ?? "", "utf8"),
+    harnessReady: !childPredictionFailedBeforeHarness(input.prediction),
+    localVerificationPassed: (input.prediction.childTrace?.successfulTestCommandCount ?? 0) > 0,
+    harnessReportValid: score?.completed === true,
+    resolved: score?.resolved === true,
+    passToPassFailures: score?.tests.passToPass.failure ?? 0,
+    failToPassFailures: score?.tests.failToPass.failure ?? 0
+  };
+  try {
+    const predictionJsonl = await input.platform.readFile(input.sharedPredictionPath);
+    await input.platform.writeFile(patchPath, input.prediction.predictions[0]?.model_patch ?? "");
+    await input.platform.writeFile(predictionPath, predictionJsonl);
+    await input.platform.writeFile(metadataPath, JSON.stringify(attemptCandidateMetadata(candidate), null, 2));
+    return candidate;
+  } catch (error) {
+    input.diagnostics.push({
+      code: "SWE_BENCH_ATTEMPT_ARTIFACT_PERSIST_FAILED",
+      severity: "error",
+      message: error instanceof Error ? error.message : String(error),
+      metadata: { attempt: input.attempt, patchPath, predictionPath, tracePath: input.tracePath, metadataPath },
+      redaction: { class: "internal", fields: ["metadata"] }
+    });
+    return undefined;
+  }
+}
+
+function attemptCandidateMetadata(candidate: SweBenchRunAttemptCandidate): JsonObject {
+  return {
+    attempt: candidate.attempt,
+    patchPath: candidate.patchPath,
+    predictionPath: candidate.predictionPath,
+    tracePath: candidate.tracePath,
+    metadataPath: candidate.metadataPath,
+    sourceMutationCount: candidate.sourceMutationCount,
+    testCommandCount: candidate.testCommandCount,
+    patchBytes: candidate.patchBytes,
+    harnessReady: candidate.harnessReady,
+    localVerificationPassed: candidate.localVerificationPassed,
+    harnessReportValid: candidate.harnessReportValid,
+    resolved: candidate.resolved,
+    passToPassFailures: candidate.passToPassFailures,
+    failToPassFailures: candidate.failToPassFailures,
+    redaction: { class: "internal" }
+  };
+}
+
+async function restoreSweBenchAttemptCandidate(input: {
+  readonly platform: PlatformRuntime;
+  readonly repoDir: string;
+  readonly runRoot: string;
+  readonly runId: string;
+  readonly taskNumber: number;
+  readonly baseCommit: string;
+  readonly candidate: SweBenchRunAttemptCandidate;
+  readonly timeoutMs: number;
+  readonly diagnostics: JsonObject[];
+}): Promise<boolean> {
+  const timeoutMs = Math.min(input.timeoutMs, CHECKOUT_CLONE_TIMEOUT_MS);
+  const commands: Array<{ readonly stage: string; readonly args: readonly string[] }> = [
+    { stage: "candidate.restore.reset", args: ["-C", input.repoDir, "reset", "--hard", input.baseCommit] },
+    { stage: "candidate.restore.clean", args: ["-C", input.repoDir, "clean", "-fdx", "-e", ".venv"] },
+    ...(input.candidate.patchBytes > 0
+      ? [{ stage: "candidate.restore.apply", args: ["-C", input.repoDir, "apply", "--binary", input.candidate.patchPath] }]
+      : [])
+  ];
+  for (const command of commands) {
+    await persistRunProgress(
+      input.platform,
+      input.runRoot,
+      input.runId,
+      input.taskNumber,
+      command.stage,
+      "started",
+      input.diagnostics,
+      { attempt: input.candidate.attempt }
+    );
+    const result = await input.platform.runProcess("git", command.args, {
+      cwd: input.repoDir,
+      timeoutMs
+    });
+    if (result.exitCode !== 0) {
+      input.diagnostics.push({
+        code: "SWE_BENCH_CANDIDATE_RESTORE_FAILED",
+        severity: "error",
+        message: `git candidate restore exited with code ${result.exitCode}`,
+        metadata: { attempt: input.candidate.attempt, stage: command.stage, exitCode: result.exitCode },
+        redaction: { class: "internal", fields: ["metadata"] }
+      });
+      await persistRunProgress(
+        input.platform,
+        input.runRoot,
+        input.runId,
+        input.taskNumber,
+        command.stage,
+        "failed",
+        input.diagnostics,
+        { attempt: input.candidate.attempt, exitCode: result.exitCode }
+      );
+      return false;
+    }
+    await persistRunProgress(
+      input.platform,
+      input.runRoot,
+      input.runId,
+      input.taskNumber,
+      command.stage,
+      "completed",
+      input.diagnostics,
+      { attempt: input.candidate.attempt }
+    );
+  }
+  return true;
+}
+
+async function projectBestPredictionArtifact(
+  platform: PlatformRuntime,
+  candidate: SweBenchRunAttemptCandidate,
+  outputPath: string,
+  diagnostics: JsonObject[]
+): Promise<void> {
+  try {
+    await platform.writeFile(outputPath, await platform.readFile(candidate.predictionPath));
+  } catch (error) {
+    diagnostics.push({
+      code: "SWE_BENCH_BEST_PREDICTION_PROJECT_FAILED",
+      severity: "error",
+      message: error instanceof Error ? error.message : String(error),
+      metadata: { attempt: candidate.attempt, predictionPath: candidate.predictionPath, outputPath },
+      redaction: { class: "internal", fields: ["metadata"] }
+    });
+  }
+}
+
 async function resolveDatasetInstance(platform: PlatformRuntime, workspaceRoot: string, taskNumber: number, timeoutMs: number): Promise<SweBenchDatasetInstance> {
   const python = platform.resolvePath(workspaceRoot, ".deepseek", "swebench-venv", "bin", "python");
   const code = [
@@ -2552,9 +2912,13 @@ function summary(input: {
   readonly environmentStatus?: string;
   readonly prediction?: SweBenchPredictionSummary;
   readonly evaluation?: SweBenchPredictionSummary;
+  readonly lastAttemptPrediction?: SweBenchPredictionSummary;
   readonly cache?: SweBenchEvaluationCacheSummary;
   readonly instanceId?: string;
   readonly attemptCount?: number;
+  readonly bestAttempt?: number;
+  readonly lastAttempt?: number;
+  readonly attemptCandidates?: readonly JsonObject[];
   readonly repairAttempted?: boolean;
   readonly commandCount: number;
   readonly status: "pass" | "warn" | "fail";
@@ -2563,7 +2927,7 @@ function summary(input: {
   const evaluation = input.evaluation;
   const score = evaluation?.evaluation;
   const cache = score?.cache ?? input.cache;
-  const childTrace = prediction?.childTrace;
+  const childTrace = input.lastAttemptPrediction?.childTrace ?? prediction?.childTrace;
   const patchBytes = prediction?.predictions[0]?.model_patch.length;
   const packageOutputRefs = packageEvidenceRefs(input.runRoot, childTrace);
   const diagnostics = runSummaryDiagnostics(
@@ -2620,6 +2984,12 @@ function summary(input: {
     ...(childTrace ? { verificationCommandMissing: childTrace.shellCommandCount > 0 && childTrace.testCommandCount === 0 } : {}),
     ...(patchBytes !== undefined ? { patchBytes } : {}),
     ...(input.attemptCount !== undefined ? { attemptCount: input.attemptCount } : {}),
+    ...(input.bestAttempt !== undefined ? { bestAttempt: input.bestAttempt } : {}),
+    ...(input.lastAttempt !== undefined ? { lastAttempt: input.lastAttempt } : {}),
+    ...(input.attemptCandidates ? { attemptCandidates: input.attemptCandidates } : {}),
+    ...(input.lastAttemptPrediction?.childTrace?.terminalReason
+      ? { lastAttemptTerminalReason: input.lastAttemptPrediction.childTrace.terminalReason }
+      : {}),
     ...(input.repairAttempted !== undefined ? { repairAttempted: input.repairAttempted } : {}),
     commandCount: input.commandCount,
     diagnostics,
@@ -2827,7 +3197,7 @@ async function writeRunnerStageStateForChild(input: {
   readonly repairContext?: SweBenchRepairContext;
 }): Promise<string> {
   const stageEvaluations = input.repairContext
-    ? runnerRepairStageEvaluations(input.toolMatrix, input.diagnostics)
+    ? runnerRepairStageEvaluations(input.toolMatrix, input.diagnostics, input.repairContext)
     : runnerInitialStageEvaluations(input.toolMatrix, input.diagnostics);
   const state = runnerStageRunState({
     runId: input.runId,
@@ -2844,17 +3214,27 @@ async function writeRunnerStageStateForChild(input: {
 
 function runnerRepairStageEvaluations(
   toolMatrix: SweBenchRunnerToolMatrixEvidence,
-  diagnostics: readonly JsonObject[]
+  diagnostics: readonly JsonObject[],
+  repairContext: SweBenchRepairContext
 ): readonly JsonObject[] {
   const prepareBlockerCode = runnerPrepareBlockerCode(toolMatrix, diagnostics, undefined);
   if (prepareBlockerCode) {
     return runnerStageEvaluations(toolMatrix, diagnostics, undefined, undefined, undefined, undefined);
   }
+  const resumeAtVerify = repairContext.failureKind === "pre-harness-generation" &&
+    (repairContext.previousPatchBytes ?? 0) > 0 &&
+    (repairContext.previousSourceMutationCount ?? 0) > 0 &&
+    (repairContext.previousTestCommandCount ?? 0) === 0;
+  const completedStageIds = new Set(resumeAtVerify
+    ? ["prepare", "understand", "change"]
+    : ["prepare"]);
   return ["prepare", "understand", "change", "verify", "score", "package", "return"].map((stageId) => ({
     schemaVersion: "1.0.0",
     stageId,
-    status: stageId === "prepare" || stageId === "understand" ? "passed" : "pending",
-    reason: "evidence-pending",
+    status: completedStageIds.has(stageId) ? "passed" : "pending",
+    reason: resumeAtVerify && completedStageIds.has(stageId)
+      ? "pre-harness-mutation-evidence-preserved"
+      : "evidence-pending",
     diagnosticCount: diagnostics.length,
     redaction: { class: "internal" }
   }));
@@ -2961,6 +3341,13 @@ function runnerStageRefs(input: {
     runnerRef("ref:runner:source-inspection-evidence", "evidence", "understand", input.childTrace?.tracePath, {
       sourceInspectionToolCount: input.childTrace?.sourceInspectionToolCount ?? 0
     }),
+    runnerRef(
+      "ref:runner:problem-behavior-contract",
+      "diagnostic",
+      "understand",
+      runRoot ? `${runRoot}/instance.json` : undefined,
+      { source: "problem-statement", reproductionRequired: true }
+    ),
     runnerRef("ref:runner:patch", "artifact", "change", runRoot ? `${runRoot}/prediction.jsonl` : undefined, {
       patchBytes: input.patchBytes ?? 0
     }),
@@ -2978,7 +3365,7 @@ function runnerStageRefs(input: {
       terminalReason: input.childTrace?.terminalReason ?? "unknown"
     }),
     ...(input.repairContext ? [
-      runnerRef("ref:runner:official-repair-feedback", "diagnostic", "understand", runRoot ? `${runRoot}/swe-bench-repair-context.md` : undefined, {
+      runnerRef("ref:runner:official-repair-feedback", "diagnostic", "understand", runRoot ? `${runRoot}/repo/.deepseek/swe-bench-repair-context.md` : undefined, {
         attemptNumber: input.repairContext.attemptNumber,
         previousRunId: input.repairContext.previousRunId,
         previousPatchBytes: input.repairContext.previousPatchBytes ?? 0,
@@ -3030,13 +3417,14 @@ function runnerStageInputRefIds(stageId: string, repairContext?: SweBenchRepairC
     prepare: [],
     understand: [
       "ref:runner:tool-matrix",
-      "ref:runner:environment"
+      "ref:runner:environment",
+      ...(repairContext ? ["ref:runner:official-repair-feedback"] : [])
     ],
     change: [
       "ref:runner:source-inspection-evidence",
       ...(repairContext ? ["ref:runner:official-repair-feedback"] : [])
     ],
-    verify: ["ref:runner:patch"],
+    verify: ["ref:runner:patch", "ref:runner:problem-behavior-contract"],
     score: ["ref:runner:test-evidence", "ref:runner:prediction"],
     package: ["ref:runner:harness"],
     return: ["ref:runner:prediction", "ref:runner:child-trace", "ref:runner:progress-ledger", "ref:runner:terminal-status"]
@@ -3125,6 +3513,9 @@ function runnerReadinessAttribution(summary: SweBenchRunSummary): Partial<SweBen
     code.startsWith("SWE_BENCH_ENV_") ||
     code.startsWith("SWE_BENCH_HARNESS") ||
     code.startsWith("SWE_BENCH_REPORT") ||
+    code === "SWE_BENCH_CANDIDATE_RESTORE_FAILED" ||
+    code === "SWE_BENCH_ATTEMPT_ARTIFACT_PERSIST_FAILED" ||
+    code === "SWE_BENCH_BEST_PREDICTION_PROJECT_FAILED" ||
     code === "REPAIR_FEEDBACK_LOW_FIDELITY"
   );
   const effectiveBlockingCodes = summary.evaluationResolved === true
@@ -3141,8 +3532,10 @@ function runnerFailureAttribution(summary: SweBenchRunSummary, primaryReasonCode
   if (!primaryReasonCode) return readiness;
   if (readiness.primaryFailureCategory === "missing-tools") return readiness;
   const primaryFailureCategory = runnerFailureCategoryForReasonCode(primaryReasonCode, readiness.primaryFailureCategory);
-  const modelAttributionAllowed = primaryReasonCode === "MODEL_PATCH_INSUFFICIENT_AFTER_GOVERNED_REPAIR" &&
-    summary.toolMatrix?.status === "complete";
+  const modelAttributionAllowed = (
+    primaryReasonCode === "MODEL_PATCH_INSUFFICIENT_AFTER_GOVERNED_REPAIR" ||
+    primaryReasonCode === "OFFICIAL_UNRESOLVED_AFTER_REPAIR"
+  ) && summary.toolMatrix?.status === "complete" && summary.evaluationResolved === false;
   return {
     primaryFailureCategory,
     modelAttributionAllowed
@@ -3159,6 +3552,8 @@ function runnerFailureCategoryForReasonCode(code: string, fallback: string | und
   if (code.startsWith("ENV_")) return "environment";
   if (code.startsWith("HARNESS_")) return "harness";
   if (code === "PREDICTION_EMPTY_PATCH") return "packaging";
+  if (code === "RUNNER_ATTEMPT_ARTIFACT_PERSIST_FAILED") return "packaging";
+  if (code === "RUNNER_CANDIDATE_RESTORE_FAILED") return "runner-readiness";
   if (code === "FLOW_REQUEST_BUDGET_EXCEEDED" || code === "FLOW_MODEL_ITERATION_LIMIT" || code === "FLOW_TOOL_CALL_LIMIT") return "timeout-budget";
   if (code === "GATE_INVALID_MUTATION_CHANNEL") return "runner-readiness";
   if (code.startsWith("FLOW_") || code.startsWith("GATE_")) return "flow-control";
@@ -3630,16 +4025,136 @@ function pushEnvironmentDiagnostics(diagnostics: JsonObject[], environment: Diag
   }
 }
 
-function repairContextFromEvaluation(evaluation: SweBenchPredictionSummary, attemptNumber: number, previousPatchBytes: number | undefined): SweBenchRepairContext {
-  const failureExcerpts = failureExcerptsFromEvaluation(evaluation).slice(0, 6);
+function repairContextFromEvaluation(input: {
+  readonly evaluation: SweBenchPredictionSummary;
+  readonly attemptNumber: number;
+  readonly previousPatch?: string;
+  readonly problemStatement?: string;
+  readonly localTestSourceExcerpts?: readonly SweBenchLocalTestSourceExcerpt[];
+  readonly restoredFromAttempt?: number;
+  readonly discardedRegressedAttempt?: number;
+}): SweBenchRepairContext {
+  const failureExcerpts = failureExcerptsFromEvaluation(input.evaluation).slice(0, 6);
+  const previousPatch = input.previousPatch ?? "";
+  const localTestSourceExcerpts = input.localTestSourceExcerpts ?? [];
   return {
-    attemptNumber,
-    previousRunId: evaluation.evaluation?.runId ?? "unknown",
-    failingTests: failingTestsFromEvaluation(evaluation).slice(0, 12),
+    attemptNumber: input.attemptNumber,
+    previousRunId: input.evaluation.evaluation?.runId ?? "unknown",
+    failureKind: "official-harness-unresolved",
+    failingTests: failingTestsFromEvaluation(input.evaluation).slice(0, 12),
     ...(failureExcerpts.length > 0 ? { failureExcerpts } : {}),
-    ...(previousPatchBytes !== undefined ? { previousPatchBytes } : {}),
-    redaction: { class: "internal", fields: ["failingTests", "failureExcerpts"] }
+    ...(localTestSourceExcerpts.length > 0 ? { localTestSourceExcerpts } : {}),
+    ...(previousPatch.length > 0 ? {
+      previousPatchBytes: Buffer.byteLength(previousPatch, "utf8"),
+      previousPatchExcerpt: previousPatch.slice(0, 12_000)
+    } : {}),
+    ...(input.problemStatement ? { problemStatement: input.problemStatement.slice(0, 12_000) } : {}),
+    ...(input.restoredFromAttempt !== undefined ? { restoredFromAttempt: input.restoredFromAttempt } : {}),
+    ...(input.discardedRegressedAttempt !== undefined ? { discardedRegressedAttempt: input.discardedRegressedAttempt } : {}),
+    redaction: { class: "internal", fields: ["failingTests", "failureExcerpts", "localTestSourceExcerpts", "problemStatement", "previousPatchExcerpt"] }
   };
+}
+
+function repairContextFromPreHarnessFailure(input: {
+  readonly prediction: SweBenchPredictionSummary;
+  readonly attemptNumber: number;
+  readonly previousRunId: string;
+  readonly problemStatement?: string;
+  readonly previousRepairContext?: SweBenchRepairContext;
+}): SweBenchRepairContext {
+  const childTrace = input.prediction.childTrace;
+  const previousPatch = input.prediction.predictions[0]?.model_patch ?? "";
+  const authoritativeFeedback = input.previousRepairContext;
+  const failingTests = authoritativeFeedback?.failingTests.slice(0, 12) ?? [];
+  const failureExcerpts = authoritativeFeedback?.failureExcerpts?.slice(0, 6) ?? [];
+  const localTestSourceExcerpts = authoritativeFeedback?.localTestSourceExcerpts?.slice(0, 6) ?? [];
+  return {
+    attemptNumber: input.attemptNumber,
+    previousRunId: input.previousRunId,
+    failureKind: "pre-harness-generation",
+    failingTests,
+    ...(failureExcerpts.length > 0 ? { failureExcerpts } : {}),
+    ...(localTestSourceExcerpts.length > 0 ? { localTestSourceExcerpts } : {}),
+    previousPatchBytes: Buffer.byteLength(previousPatch, "utf8"),
+    ...(input.problemStatement ? { problemStatement: input.problemStatement.slice(0, 12_000) } : {}),
+    ...(childTrace?.lastStageId ? { previousStageId: childTrace.lastStageId } : {}),
+    ...(childTrace?.terminalKind ? { previousTerminalKind: childTrace.terminalKind } : {}),
+    ...(childTrace?.terminalReason ? { previousTerminalReason: childTrace.terminalReason } : {}),
+    previousSourceMutationCount: childTrace?.sourceMutationCount ?? 0,
+    previousTestCommandCount: childTrace?.testCommandCount ?? 0,
+    requiredNextAction: "source mutation and standard test",
+    redaction: {
+      class: "internal",
+      fields: ["failingTests", "failureExcerpts", "localTestSourceExcerpts", "problemStatement", "previousTerminalReason"]
+    }
+  };
+}
+
+async function localFailingTestSourceExcerpts(
+  platform: PlatformRuntime,
+  repoDir: string,
+  failingTests: readonly string[],
+  diagnostics: JsonObject[]
+): Promise<readonly SweBenchLocalTestSourceExcerpt[]> {
+  const excerpts: SweBenchLocalTestSourceExcerpt[] = [];
+  const seen = new Set<string>();
+  for (const testId of failingTests.slice(0, 6)) {
+    const parsed = parsePytestTestId(testId);
+    if (!parsed || seen.has(`${parsed.filePath}::${parsed.symbol}`)) continue;
+    seen.add(`${parsed.filePath}::${parsed.symbol}`);
+    const content = await platform.readFile(platform.resolvePath(repoDir, parsed.filePath)).catch((error: unknown) => {
+      diagnostics.push({
+        code: "SWE_BENCH_LOCAL_TEST_SOURCE_UNAVAILABLE",
+        severity: "info",
+        message: "Unable to read local failing test source excerpt for repair context.",
+        metadata: { testId, filePath: parsed.filePath, error: error instanceof Error ? error.message : String(error) },
+        redaction: { class: "internal", fields: ["metadata"] }
+      });
+      return "";
+    });
+    if (!content.trim()) continue;
+    const excerpt = focusedTestSourceExcerpt(content, parsed.symbol);
+    if (!excerpt) {
+      diagnostics.push({
+        code: "SWE_BENCH_LOCAL_TEST_SYMBOL_UNAVAILABLE",
+        severity: "info",
+        message: "The failing test symbol is not present in the local checkout; no local test source excerpt was projected.",
+        metadata: { testId, filePath: parsed.filePath, symbol: parsed.symbol },
+        redaction: { class: "internal", fields: ["metadata"] }
+      });
+      continue;
+    }
+    excerpts.push({
+      testId,
+      filePath: parsed.filePath,
+      excerpt,
+      redaction: { class: "internal", fields: ["excerpt"] }
+    });
+  }
+  return excerpts;
+}
+
+function parsePytestTestId(testId: string): { readonly filePath: string; readonly symbol: string } | undefined {
+  const [filePathRaw, ...parts] = testId.split("::");
+  const filePath = (filePathRaw ?? "").trim();
+  if (!filePath || isAbsolute(filePath) || filePath.split(/[\\/]+/).includes("..")) return undefined;
+  const symbol = (parts.at(-1) ?? "").replace(/\[.*$/, "").trim();
+  if (!symbol || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(symbol)) return undefined;
+  return { filePath, symbol };
+}
+
+function focusedTestSourceExcerpt(content: string, symbol: string): string | undefined {
+  const lines = content.split(/\r?\n/);
+  const pattern = new RegExp(`^\\s*(?:async\\s+)?def\\s+${escapeRegExp(symbol)}\\s*\\(`);
+  const index = lines.findIndex((line) => pattern.test(line));
+  if (index < 0) return undefined;
+  const start = Math.max(0, index - 8);
+  const end = Math.min(lines.length, index + 72);
+  return lines.slice(start, end).join("\n");
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function failingTestsFromEvaluation(evaluation: SweBenchPredictionSummary): readonly string[] {

@@ -69,11 +69,11 @@ function schedulingActionShapeLines(nextAction: PromptSchedulingNextAction): rea
       "Use core.file.edit or core.patch.apply now, based on the accepted evidence refs."
     ];
   }
-  if (nextAction.requiredNextAction === "core.test.run") {
+  if (requiresStandardTestProgress(nextAction)) {
     return [
       "Required next action overrides broader allowed capability lists.",
-      "Verification-only stage: call core.test.run with a standard repository test command now.",
-      "Do not call read, search, list, glob, shell, git diff, or mutation tools for this verification action."
+      "Verification-only stage: call core_test_run (capability core.test.run) with a standard repository test command now.",
+      "Do not call core_shell_run, read, search, list, glob, git diff, or mutation tools for this verification action."
     ];
   }
   if (nextAction.actionClass === "focused-evidence" && nextAction.allowedCapabilityIds.includes("core.file.read")) {
@@ -83,6 +83,11 @@ function schedulingActionShapeLines(nextAction: PromptSchedulingNextAction): rea
     ];
   }
   return [];
+}
+
+function requiresStandardTestProgress(nextAction: PromptSchedulingNextAction): boolean {
+  return nextAction.requiredNextAction === "core.test.run" ||
+    (nextAction.requiredNextAction === "standard-test-command" && nextAction.allowedCapabilityIds.includes("core.test.run"));
 }
 
 function requiresOnlyMutationProgress(requiredNextAction: string): boolean {

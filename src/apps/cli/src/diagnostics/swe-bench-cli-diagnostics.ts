@@ -91,10 +91,11 @@ async function collectSweBenchRunDiagnostics(options: CliOptions, runOptions: Cl
       diagnostics.push(runDiagnostic(run.error?.code ?? "SWE_BENCH_RUN_FAILED", "error", run.error?.message ?? "SWE-bench run capability failed.", run.error?.details));
     }
   }
+  const outcomeStatus = sweBenchRunOutcomeStatus(run, diagnostics);
   const sweBench: SweBenchPredictionSummary = {
     schemaVersion: "1.0.0",
     kind: "diagnostics.swe-bench.run.summary",
-    status: diagnostics.some((entry) => entry.severity === "error") ? "fail" : "pass",
+    status: outcomeStatus,
     action: "run",
     dryRun: input.dryRun,
     live: options.live === true,
@@ -115,6 +116,20 @@ async function collectSweBenchRunDiagnostics(options: CliOptions, runOptions: Cl
     referencePitFixtureIds: [...diagnosticPitIds],
     redaction: { class: "internal", fields: ["sweBench.invocation", "sweBench.run.value.evidence.metadata", "sweBench.run.value.evidence.replay", "sweBench.diagnostics.metadata"] }
   };
+}
+
+function sweBenchRunOutcomeStatus(
+  run: SerializableResult | undefined,
+  diagnostics: readonly SweBenchPredictionDiagnostic[]
+): "pass" | "warn" | "fail" {
+  if (diagnostics.some((entry) => entry.severity === "error")) return "fail";
+  if (!run?.ok) return "fail";
+  const value = isJsonObject(run.value) ? run.value : undefined;
+  const evidence = isJsonObject(value?.evidence) ? value.evidence : undefined;
+  const metadata = isJsonObject(evidence?.metadata) ? evidence.metadata : undefined;
+  if (metadata?.status === "fail" || metadata?.evaluationResolved === false) return "fail";
+  if (metadata?.status === "warn" || evidence?.status === "failed") return "warn";
+  return "pass";
 }
 
 function taskNumberFromInput(input: CliOptions["diagnosticsInput"]): number | undefined {

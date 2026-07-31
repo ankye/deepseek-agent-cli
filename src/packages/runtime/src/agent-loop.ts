@@ -82,11 +82,14 @@ import {
 } from "./ready-stage-budget.js";
 import {
   READY_STAGE_REQUIRED_ACTION_CORRECTION_LIMIT,
+  mutationExactRefreshCorrectionMessage,
+  officialRepairRequiredActionCorrectionMessage,
   readyStageAntiLoopInstruction,
   readyStageNonProgressCapabilityMiss,
   readyStageProgressCapabilitySatisfied,
   readyStageRequiredActionCorrectionMessage,
-  readyStageRequiredActionMissKey
+  readyStageRequiredActionMissKey,
+  standardTestRepairRequiredActionCorrectionMessage
 } from "./ready-stage-control.js";
 import { recordLosslessAssistantMessage, recordLosslessToolResult, recordLosslessUserMessage } from "./lossless-context.js";
 import { proposePermanentMemoryCandidates } from "./permanent-memory.js";
@@ -101,6 +104,7 @@ import {
 import { runFinalVerification } from "./agent-loop-verification.js";
 import { isStandardTestCommand } from "@deepseek/core-coding-tools";
 import { projectReasoningForOutput, recordVisibleReasoning, recordVisibleReasoningProjection, visibleReasoningEvidence } from "./visible-reasoning.js";
+import { terminalSearchEvidenceHasContent } from "./agent-loop-tool-evidence.js";
 import {
   createTaskDeliveryFlowSummary,
   parseTaskDecisionEnvelopeText,
@@ -139,7 +143,17 @@ import {
   terminalToolConvergence
 } from "./agent-loop-convergence.js";
 import { planToolDispatchBatch } from "./agent-loop-tool-batches.js";
-import { isMutationCapabilityId, isTestCapabilityId, progressCapabilityIdsForWorkflowStage } from "./workflow-capability-policy.js";
+import { isMutationCapabilityId, isStandardTestExecutionCapabilityId, isTestCapabilityId, progressCapabilityIdsForWorkflowStage } from "./workflow-capability-policy.js";
+import {
+  acceptStageEvidenceRead,
+  acceptStageEvidenceSearch,
+  createStageEvidenceWindow,
+  focusedStageEvidenceSearchGlob,
+  nextStageEvidenceReadOffset,
+  stageEvidenceRequestDecision,
+  stageEvidenceWindowShouldClose,
+  type StageEvidenceWindowState
+} from "./stage-evidence-convergence.js";
 
 export const defaultAgentLoopLimits: AgentLoopLimits = {
   maxModelIterations: 4,
@@ -153,6 +167,16 @@ export const defaultAgentLoopLimits: AgentLoopLimits = {
 
 const RESTORED_HISTORY_MESSAGE_LIMIT = 12;
 const RESTORED_HISTORY_CONTENT_LIMIT = 4_000;
+const FAILED_STANDARD_TEST_REPAIR_FOCUSED_REFRESH_LIMIT = 4;
+const OFFICIAL_DIAGNOSTIC_REPAIR_FOCUSED_REFRESH_LIMIT = 4;
+const STANDARD_TEST_REQUIRED_CLOSURE_MODEL_ITERATION_RESERVE = 2;
+
+interface MutationExactRefreshState {
+  readonly targetPath: string;
+  readonly failedToolCallId: string;
+  readonly consumed: boolean;
+}
+
 export async function* runAgentLoop(
   deps: RuntimeDependencies,
   kernel: RuntimeKernel,
@@ -209,6 +233,12 @@ export async function* runAgentLoop(
   const readyStagePatchRepairFailures = new Set<string>();
   const readyStageMutationInputStalls = new Map<string, number>();
   const readyStageMutationRepairHadFocusedRefresh = new Set<string>();
+  const failedStandardTestRepairFocusedRefreshCounts = new Map<string, number>();
+  const officialDiagnosticRepairFocusedRefreshCounts = new Map<string, number>();
+  const openedStageEvidenceWindows = new Set<string>();
+  const stageEvidenceWindows = new Map<string, StageEvidenceWindowState>();
+  const evaluationBehaviorReproductionSatisfied = new Set<string>();
+  const mutationExactRefreshByStage = new Map<string, MutationExactRefreshState>();
   const readyStageProgressEvidenceCounts = new Map<string, number>();
   const readyStageBudgetUsage = new Map<string, ReturnType<typeof createReadyStageBudgetUsage>>();
   const toolDecisionBoard = createToolDecisionBoardState({ sessionId, turnId });
@@ -682,7 +712,7 @@ export async function* runAgentLoop(
     yield contextReasoning;
   }
 
-  while (iterations < limits.maxModelIterations) {
+  while (iterations < effectiveMaxModelIterationsForWorkflowGate(limits.maxModelIterations, activeWorkflowGateOverride)) {
     repairContinuationRequested = false;
     if (signal?.aborted) {
       yield* emitCancelled();
@@ -693,11 +723,25 @@ export async function* runAgentLoop(
     let iterationReasoning = "";
     let reasoningPersistedForIteration = false;
     let iterationProgressCapabilitySatisfied = false;
-    const iterationProfilePolicy = profilePolicyWithRuntimeWorkflowGateOverride(activeProfilePolicy, activeWorkflowGateOverride);
-    const iterationRequest = iterationProfilePolicy
+    let iterationProfilePolicy = profilePolicyWithRuntimeWorkflowGateOverride(activeProfilePolicy, activeWorkflowGateOverride);
+    let iterationRequest = iterationProfilePolicy
       ? { ...request, profilePolicy: iterationProfilePolicy }
       : request;
     currentReadyStageControl = readyStageControlForProfilePolicy(iterationRequest.profilePolicy);
+    if (
+      workflowGateOverrideStaleForReadyStage(
+        iterationRequest.profilePolicy?.workflowGateOverride,
+        currentReadyStageControl
+      )
+    ) {
+      activeWorkflowGateOverride = undefined;
+      activeProfilePolicy = activeProfilePolicy ? clearWorkflowGateOverride(activeProfilePolicy) : activeProfilePolicy;
+      iterationProfilePolicy = activeProfilePolicy;
+      iterationRequest = iterationProfilePolicy
+        ? { ...request, profilePolicy: iterationProfilePolicy }
+        : request;
+      currentReadyStageControl = readyStageControlForProfilePolicy(iterationRequest.profilePolicy);
+    }
     const stalledWorkflowError = currentReadyStageControl
       ? undefined
       : stalledPrimaryWorkflowError(iterationRequest.profilePolicy);
@@ -1143,8 +1187,97 @@ export async function* runAgentLoop(
         });
 
         const activePreflightWorkflowGate = iterationRequest.profilePolicy?.workflowGateOverride;
+        const allowedDiagnosticRepairRefresh = allowsDiagnosticRepairFocusedRefresh(
+          toolName,
+          currentReadyStageControl,
+          iterationRequest.profilePolicy
+        );
+        const mutationExactRefreshKey = currentReadyStageControl
+          ? readyStageRequiredActionMissKey(currentReadyStageControl)
+          : undefined;
+        const mutationExactRefresh = mutationExactRefreshKey
+          ? mutationExactRefreshByStage.get(mutationExactRefreshKey)
+          : undefined;
+        const modelToolInput = mutationExactRefresh && toolName === "core.file.read"
+          ? {
+              ...modelEvent.input,
+              offset: typeof modelEvent.input.offset === "number" ? modelEvent.input.offset : 0,
+              limit: typeof modelEvent.input.limit === "number" ? modelEvent.input.limit : 200
+            }
+          : modelEvent.input;
+        if (
+          mutationExactRefresh &&
+          toolName === "core.file.read" &&
+          !mutationExactRefreshInputAllowed(mutationExactRefresh, modelToolInput)
+        ) {
+          const requestedPath = typeof modelToolInput.path === "string"
+            ? normalizeEvidencePath(modelToolInput.path)
+            : "";
+          const wrongTarget = requestedPath !== mutationExactRefresh.targetPath;
+          const terminalKind = wrongTarget
+            ? "workflow-mutation-recovery-target.rejected"
+            : "workflow-mutation-recovery-exhausted";
+          const error = kernelError(
+            "KERNEL_POLICY_DENIED",
+            wrongTarget
+              ? `WORKFLOW_MUTATION_RECOVERY_TARGET_REJECTED: the one-shot refresh must read ${mutationExactRefresh.targetPath}, not ${requestedPath || "an unspecified path"}.`
+              : `WORKFLOW_MUTATION_RECOVERY_EXHAUSTED: the one-shot bounded refresh for ${mutationExactRefresh.targetPath} is no longer available.`,
+            {
+              targetPath: mutationExactRefresh.targetPath,
+              requestedPath,
+              failedToolCallId: mutationExactRefresh.failedToolCallId,
+              consumed: mutationExactRefresh.consumed,
+              requestedCapabilityId: toolName
+            }
+          );
+          diagnostics.push(error);
+          const feedback = buildRejectedDispatchFeedback({
+            toolCallId,
+            toolName,
+            capabilityId: toolName,
+            text: error.message,
+            diagnostics: [error],
+            correctiveAction: "Apply a corrected source edit or report a bounded blocker.",
+            recommendedNextAction: "corrected source edit or bounded blocker",
+            trace,
+            limitBytes: limits.maxOutputBytes,
+            continuation: "terminate"
+          });
+          recordRejectedToolFeedback(toolDecisionBoard, {
+            toolCallId,
+            toolName,
+            capabilityId: toolName,
+            normalizedInputHash,
+            terminalKind,
+            correctiveAction: feedback.correctiveAction,
+            recommendedNextAction: feedback.recommendedNextAction,
+            iteration: iterations,
+            metadata: { targetPath: mutationExactRefresh.targetPath, requestedPath }
+          });
+          const rejected = agentLoopEvent("model.tool.result", sessionId, turnId, trace, {
+            toolCallId,
+            toolName,
+            result: feedback.preview.text,
+            terminalKind,
+            feedback,
+            evidence: await recordToolResultEvidence(deps, {
+              toolCallId,
+              toolName,
+              capabilityId: toolName,
+              terminalKind,
+              feedback
+            })
+          }, request.agentId, error);
+          await recordRuntimeAdapterEvent(deps, rejected);
+          yield rejected;
+          messages.push({ role: "tool", content: feedback.preview.text, toolCallId, toolName });
+          yield* emitFailureWithRepair("rejected", "flow-mutation-recovery-exhausted", error, rejected);
+          terminalEmitted = true;
+          return;
+        }
         const preflightWorkflowGateMiss = activePreflightWorkflowGate !== undefined
           && !workflowGateOverrideAllowsCapability(activePreflightWorkflowGate, toolName)
+          && !allowedDiagnosticRepairRefresh
           && currentReadyStageControl?.stageKind !== undefined
           && ["produce", "materialize", "repair"].includes(String(currentReadyStageControl.stageKind))
           && (
@@ -1160,7 +1293,10 @@ export async function* runAgentLoop(
             missCount,
             correctionLimit: READY_STAGE_REQUIRED_ACTION_CORRECTION_LIMIT,
             iteration: iterations,
-            maxModelIterations: limits.maxModelIterations,
+            maxModelIterations: effectiveMaxModelIterationsForWorkflowGate(
+              limits.maxModelIterations,
+              activePreflightWorkflowGate
+            ),
             workflowReadyStageControl: readyStageControl,
             requestedCapabilityId: toolName,
             rejectedBeforeExecution: true
@@ -1234,7 +1370,18 @@ export async function* runAgentLoop(
           messages.push({ role: "tool", content: stageFeedback.preview.text, toolCallId, toolName });
           readyStageRequiredActionMisses.set(missKey, missCount + 1);
           if (canCorrect) {
-            messages.push(readyStageRequiredActionCorrectionMessage(readyStageControl, missCount + 1, error));
+            messages.push(
+              activePreflightWorkflowGate.terminalKind === "workflow-official-repair.refreshed"
+                ? officialRepairRequiredActionCorrectionMessage(readyStageControl, missCount + 1, error)
+                : activePreflightWorkflowGate.terminalKind === "workflow-standard-test-repair.refreshed"
+                  ? standardTestRepairRequiredActionCorrectionMessage(
+                      readyStageControl,
+                      missCount + 1,
+                      error,
+                      activePreflightWorkflowGate.requiredNextAction
+                    )
+                : readyStageRequiredActionCorrectionMessage(readyStageControl, missCount + 1, error)
+            );
             restartModelAfterWorkflowCorrection = true;
             break;
           }
@@ -1409,12 +1556,12 @@ export async function* runAgentLoop(
           ? visibleCapabilityIds
           : [...visibleCapabilityIds, resolvedCapabilityId];
         const preflightManifest = visibleCapabilities.find((capability) => capability.id === resolvedCapabilityId);
-        const preflightToolTimeoutMs = toolTimeoutFor(modelEvent.input, limits.toolTimeoutMs, preflightManifest?.timeoutMs, request.timeoutMs);
+        const preflightToolTimeoutMs = toolTimeoutFor(modelToolInput, limits.toolTimeoutMs, preflightManifest?.timeoutMs, request.timeoutMs);
         const preflight = await deps.toolIntentPreflight.check({
           intent: {
             toolCallId,
             name: toolName,
-            input: modelEvent.input,
+            input: modelToolInput,
             source: "model"
           },
           workspaceRoot: request.workspaceRoot,
@@ -1469,7 +1616,110 @@ export async function* runAgentLoop(
           continue;
         }
 
-        const toolInput = preflight.repaired?.input ?? modelEvent.input;
+        let toolInput = preflight.repaired?.input ?? modelToolInput;
+        const activeStageEvidenceWindowKey = currentReadyStageControl &&
+          iterationRequest.profilePolicy?.workflowGateOverride?.terminalKind === "workflow-stage-evidence-window.opened"
+          ? readyStageRequiredActionMissKey(currentReadyStageControl)
+          : undefined;
+        const activeStageEvidenceWindow = activeStageEvidenceWindowKey
+          ? stageEvidenceWindows.get(activeStageEvidenceWindowKey)
+          : undefined;
+        if (
+          String(preflight.capabilityId) === "core.search.text" &&
+          iterationRequest.profilePolicy?.workflowGateOverride?.terminalKind === "workflow-stage-evidence-window.opened"
+        ) {
+          const focusedGlob = focusedStageEvidenceSearchGlob(activeStageEvidenceWindow, toolInput);
+          toolInput = {
+            ...toolInput,
+            outputMode: "content",
+            ...(focusedGlob ? { glob: focusedGlob } : {})
+          };
+        }
+        if (
+          String(preflight.capabilityId) === "core.file.read" &&
+          iterationRequest.profilePolicy?.workflowGateOverride?.terminalKind === "workflow-stage-evidence-window.opened"
+        ) {
+          const path = typeof toolInput.path === "string" ? toolInput.path : undefined;
+          toolInput = {
+            ...toolInput,
+            offset: typeof toolInput.offset === "number"
+              ? toolInput.offset
+              : activeStageEvidenceWindow && path
+                ? nextStageEvidenceReadOffset(activeStageEvidenceWindow, path)
+                : 0,
+            limit: typeof toolInput.limit === "number" ? toolInput.limit : 200
+          };
+        }
+        if (activeStageEvidenceWindow && isFocusedEvidenceRefreshCapabilityId(String(preflight.capabilityId))) {
+          const evidenceDecision = stageEvidenceRequestDecision(
+            activeStageEvidenceWindow,
+            String(preflight.capabilityId),
+            toolInput
+          );
+          if (evidenceDecision !== "allow") {
+            const terminalKind = `workflow-stage-evidence-${evidenceDecision}.rejected`;
+            const error = kernelError(
+              "KERNEL_POLICY_DENIED",
+              `WORKFLOW_STAGE_EVIDENCE_${evidenceDecision.toUpperCase().replaceAll("-", "_")}: focused evidence request cannot execute because it is ${evidenceDecision}. Apply the source mutation or report a bounded blocker.`,
+              {
+                stageKey: activeStageEvidenceWindow.stageKey,
+                targetPath: activeStageEvidenceWindow.targetPath,
+                acceptedOperations: activeStageEvidenceWindow.acceptedOperations,
+                maxAcceptedOperations: activeStageEvidenceWindow.maxAcceptedOperations,
+                requestedCapabilityId: String(preflight.capabilityId),
+                toolInput
+              }
+            );
+            diagnostics.push(error);
+            const rejectedDispatch = buildRejectedDispatchResult({
+              toolCallId,
+              toolName,
+              capabilityId: String(preflight.capabilityId),
+              normalizedInputHash,
+              terminalKind,
+              text: error.message,
+              diagnostics: [error],
+              correctiveAction: "Apply a source mutation or report a bounded blocker.",
+              recommendedNextAction: "source mutation or bounded blocker",
+              trace,
+              limitBytes: limits.maxOutputBytes,
+              continuation: "continue",
+              iteration: iterations
+            });
+            recordRejectedToolFeedback(toolDecisionBoard, rejectedDispatch.decisionRecord);
+            const rejectedEvent = agentLoopEvent("model.tool.result", sessionId, turnId, trace, {
+              ...rejectedDispatch.eventData,
+              evidence: await recordToolResultEvidence(deps, {
+                ...rejectedDispatch.evidenceInput,
+                terminalKind
+              })
+            }, request.agentId, error);
+            await recordRuntimeAdapterEvent(deps, rejectedEvent);
+            yield rejectedEvent;
+            messages.push({ role: "tool", content: rejectedDispatch.feedback.preview.text, toolCallId, toolName });
+            const explicitMutationAction = String(currentReadyStageControl?.requiredNextAction ?? "core.file.edit|core.patch.apply");
+            const gateOverride = convergenceWorkflowGateOverride({
+              requiredNextAction: explicitMutationAction,
+              rejectedCapabilityId: String(preflight.capabilityId),
+              rejectedToolName: toolName,
+              terminalKind,
+              toolCallId
+            });
+            activeWorkflowGateOverride = gateOverride;
+            activeProfilePolicy = profilePolicyWithRuntimeWorkflowGateOverride(iterationRequest.profilePolicy, gateOverride);
+            const closedEvent = agentLoopEvent("workflow.stage-evidence.window.closed", sessionId, turnId, trace, {
+              stageId: currentReadyStageControl?.stageId ?? "unknown",
+              stageKey: activeStageEvidenceWindow.stageKey,
+              reason: evidenceDecision,
+              acceptedOperations: activeStageEvidenceWindow.acceptedOperations,
+              requiredNextAction: explicitMutationAction,
+              rejectedToolCallId: toolCallId
+            }, request.agentId);
+            await recordRuntimeAdapterEvent(deps, closedEvent);
+            yield closedEvent;
+            continue;
+          }
+        }
         const workflowBoundaryError = workflowCapabilityBoundaryGuard({
           ...(iterationRequest.profilePolicy ? { profilePolicy: iterationRequest.profilePolicy } : {}),
           ...(currentReadyStageControl ? { workflowReadyStageControl: currentReadyStageControl } : {}),
@@ -1487,7 +1737,10 @@ export async function* runAgentLoop(
               missCount,
               correctionLimit: READY_STAGE_REQUIRED_ACTION_CORRECTION_LIMIT,
               iteration: iterations,
-              maxModelIterations: limits.maxModelIterations,
+              maxModelIterations: effectiveMaxModelIterationsForWorkflowGate(
+                limits.maxModelIterations,
+                iterationRequest.profilePolicy?.workflowGateOverride
+              ),
               workflowReadyStageControl: readyStageControl,
               requestedCapabilityId: String(preflight.capabilityId),
               rejectedBeforeExecution: true
@@ -1556,7 +1809,73 @@ export async function* runAgentLoop(
               activeProfilePolicy = profilePolicyWithRuntimeWorkflowGateOverride(iterationRequest.profilePolicy, gateOverride);
               restartModelAfterWorkflowCorrection = true;
             }
-            messages.push(readyStageRequiredActionCorrectionMessage(readyStageControl, missCount + 1, workflowBoundaryError));
+            const openFocusedEvidenceWindow =
+              isFocusedEvidenceRefreshCapabilityId(String(preflight.capabilityId)) &&
+              readyStageControlProjectedFromReviewedEvidence(readyStageControl) &&
+              readyStageKindMatches(readyStageControl, ["produce", "materialize", "repair"]) &&
+              iterationRequest.profilePolicy?.workflowPriority === "primary" &&
+              iterationRequest.profilePolicy.orchestrationMode === "staged-capability-workflow" &&
+              !openedStageEvidenceWindows.has(missKey);
+            if (openFocusedEvidenceWindow) {
+              const gateOverride = convergenceWorkflowGateOverride({
+                requiredNextAction: "focused-read-or-source-edit-or-bounded-blocker",
+                rejectedCapabilityId: String(preflight.capabilityId),
+                rejectedToolName: toolName,
+                terminalKind: "workflow-stage-evidence-window.opened",
+                toolCallId
+              });
+              openedStageEvidenceWindows.add(missKey);
+              const stageBudget = readyStageBudgetForControl(limits, readyStageControl);
+              const stageBudgetUsage = stageBudget
+                ? readyStageBudgetUsage.get(readyStageBudgetKey(readyStageControl, stageBudget))
+                : undefined;
+              const remainingStageToolCalls = stageBudget?.maxToolCalls !== undefined
+                ? stageBudget.maxToolCalls - (stageBudgetUsage?.toolCalls ?? 0)
+                : limits.maxToolCalls - toolCalls;
+              const evidenceWindow = createStageEvidenceWindow({
+                stageKey: missKey,
+                capabilityId: String(preflight.capabilityId),
+                toolInput,
+                relatedTargetPaths: [...acceptedSourceEvidencePaths],
+                maxAcceptedOperations: Math.max(1, remainingStageToolCalls)
+              });
+              stageEvidenceWindows.set(missKey, evidenceWindow);
+              const openedEvent = agentLoopEvent("workflow.stage-evidence.window.opened", sessionId, turnId, trace, {
+                stageId: readyStageControl.stageId,
+                stageKey: missKey,
+                targetPath: evidenceWindow.targetPath ?? "unknown",
+                maxAcceptedOperations: evidenceWindow.maxAcceptedOperations,
+                requestedCapabilityId: String(preflight.capabilityId),
+                rejectedToolCallId: toolCallId
+              }, request.agentId);
+              await recordRuntimeAdapterEvent(deps, openedEvent);
+              yield openedEvent;
+              messages.push({
+                role: "user",
+                content: [
+                  "WORKFLOW_FOCUSED_EVIDENCE_WINDOW_OPENED.",
+                  "The rejected source-inspection request did not execute.",
+                  `Target scope: ${evidenceWindow.targetPath ?? "the rejected source target"}.`,
+                  `Evidence operations available: ${evidenceWindow.maxAcceptedOperations}.`,
+                  "Reissue the rejected focused request with a bounded read or search. Focused search returns matching source content automatically.",
+                  "Use only the same target scope or a direct relative dependency proven by accepted source content, then apply a source mutation."
+                ].join("\n")
+              });
+              activeWorkflowGateOverride = gateOverride;
+              activeProfilePolicy = profilePolicyWithRuntimeWorkflowGateOverride(iterationRequest.profilePolicy, gateOverride);
+              restartModelAfterWorkflowCorrection = true;
+            }
+            const activeBoundaryGate = iterationRequest.profilePolicy?.workflowGateOverride;
+            messages.push(
+              activeBoundaryGate?.terminalKind === "workflow-standard-test-repair.refreshed"
+                ? standardTestRepairRequiredActionCorrectionMessage(
+                    readyStageControl,
+                    missCount + 1,
+                    workflowBoundaryError,
+                    activeBoundaryGate.requiredNextAction
+                  )
+                : readyStageRequiredActionCorrectionMessage(readyStageControl, missCount + 1, workflowBoundaryError)
+            );
           }
           if (restartModelAfterWorkflowCorrection) break;
           continue;
@@ -1701,7 +2020,10 @@ export async function* runAgentLoop(
             missCount,
             correctionLimit: READY_STAGE_REQUIRED_ACTION_CORRECTION_LIMIT,
             iteration: iterations,
-            maxModelIterations: limits.maxModelIterations,
+            maxModelIterations: effectiveMaxModelIterationsForWorkflowGate(
+              limits.maxModelIterations,
+              activeWorkflowGate
+            ),
             workflowReadyStageControl: readyStageControl,
             requestedCapabilityId: String(preflight.capabilityId),
             rejectedBeforeExecution: true
@@ -2136,6 +2458,36 @@ export async function* runAgentLoop(
         }, request.agentId, recoverableToolFailure ? undefined : terminal?.error);
         await recordRuntimeAdapterEvent(deps, resultEvent);
         yield resultEvent;
+        const completedMutationRefreshKey = currentReadyStageControl
+          ? readyStageRequiredActionMissKey(currentReadyStageControl)
+          : undefined;
+        const completedMutationRefresh = completedMutationRefreshKey
+          ? mutationExactRefreshByStage.get(completedMutationRefreshKey)
+          : undefined;
+        if (
+          completedMutationRefreshKey &&
+          completedMutationRefresh &&
+          String(preflight.capabilityId) === "core.file.read" &&
+          terminal?.kind === "capability.completed" &&
+          mutationExactRefreshInputAllowed(completedMutationRefresh, toolInput)
+        ) {
+          mutationExactRefreshByStage.set(completedMutationRefreshKey, {
+            ...completedMutationRefresh,
+            consumed: true
+          });
+          readyStageMutationRepairHadFocusedRefresh.add(completedMutationRefreshKey);
+          const gateOverride = convergenceWorkflowGateOverride({
+            requiredNextAction: "core.file.edit|core.patch.apply",
+            rejectedCapabilityId: "core.file.read",
+            rejectedToolName: toolName,
+            terminalKind: "workflow-mutation-exact-refresh.completed",
+            toolCallId
+          });
+          activeWorkflowGateOverride = gateOverride;
+          activeProfilePolicy = activeProfilePolicy
+            ? { ...clearWorkflowGateOverride(activeProfilePolicy), workflowGateOverride: gateOverride }
+            : activeProfilePolicy;
+        }
         const currentProfilePolicy = activeProfilePolicy ?? iterationRequest.profilePolicy;
         const activeGateOverride = currentProfilePolicy?.workflowGateOverride ?? activeWorkflowGateOverride;
         const workflowProgress = advanceWorkflowStageFromToolEvidence({
@@ -2321,8 +2673,13 @@ export async function* runAgentLoop(
           terminal?.kind === "capability.completed" &&
           terminalEvidenceStatusCompleted(terminal)
         ) {
+          const evaluationWorkflow = activeProfilePolicy?.workflowGovernanceMode === "evaluation" ||
+            String(activeProfilePolicy?.role ?? "").includes("evaluation");
+          const requiredNextAction = evaluationWorkflow
+            ? "standard-test-command-or-bounded-blocker"
+            : "standard-test-command";
           const gateOverride = convergenceWorkflowGateOverride({
-            requiredNextAction: "standard-test-command",
+            requiredNextAction,
             rejectedCapabilityId: String(preflight.capabilityId),
             rejectedToolName: toolName,
             terminalKind: "workflow-standard-test-required",
@@ -2336,8 +2693,10 @@ export async function* runAgentLoop(
             role: "system",
             content: [
               "WORKFLOW_STANDARD_TEST_REQUIRED: a source mutation completed during failed-test repair.",
-              "Required next action: standard-test-command.",
-              "Run the narrowest applicable standard repository test command before making more source edits."
+              `Required next action: ${requiredNextAction}.`,
+              evaluationWorkflow
+                ? "Run the narrowest problem reproduction with a safe python -c command when it can falsify the fix, or run the narrowest applicable standard repository test command before making more source edits."
+                : "Run the narrowest applicable standard repository test command before making more source edits."
             ].join("\n")
           });
           restartModelAfterWorkflowCorrection = true;
@@ -2392,12 +2751,136 @@ export async function* runAgentLoop(
           feedbackStatus: executionFeedback.status
         });
         if (
+          activeGateOverride?.terminalKind === "workflow-stage-evidence-window.opened" &&
+          isFocusedEvidenceRefreshCapabilityId(String(preflight.capabilityId)) &&
+          terminal?.kind === "capability.completed"
+        ) {
+          const windowKey = readyStageRequiredActionMissKey(currentReadyStageControl);
+          const currentWindow = stageEvidenceWindows.get(windowKey);
+          const evidenceCompleted = focusedEvidenceRefreshCompleted(String(preflight.capabilityId), terminal, toolInput);
+          const searchAcceptance = evidenceCompleted && currentWindow && String(preflight.capabilityId) === "core.search.text"
+            ? acceptStageEvidenceSearch(currentWindow, toolInput, toolResultText)
+            : undefined;
+          const duplicateSearchEvidence = searchAcceptance?.duplicate === true;
+          const updatedWindow = evidenceCompleted && currentWindow && String(preflight.capabilityId) === "core.file.read"
+            ? acceptStageEvidenceRead(currentWindow, toolInput, toolResultText)
+            : searchAcceptance?.state ?? (evidenceCompleted && currentWindow
+              ? { ...currentWindow, acceptedOperations: currentWindow.acceptedOperations + 1 }
+              : currentWindow);
+          if (updatedWindow) stageEvidenceWindows.set(windowKey, updatedWindow);
+          if (evidenceCompleted && updatedWindow && !duplicateSearchEvidence) {
+            const acceptedEvent = agentLoopEvent("workflow.stage-evidence.accepted", sessionId, turnId, trace, {
+              stageId: currentReadyStageControl?.stageId ?? "unknown",
+              stageKey: windowKey,
+              capabilityId: String(preflight.capabilityId),
+              acceptedOperations: updatedWindow.acceptedOperations,
+              maxAcceptedOperations: updatedWindow.maxAcceptedOperations,
+              coveredReadRanges: updatedWindow.coveredReadRanges,
+              relatedTargetPaths: updatedWindow.relatedTargetPaths,
+              ...(searchAcceptance ? { evidenceFingerprint: searchAcceptance.fingerprint } : {}),
+              toolCallId
+            }, request.agentId);
+            await recordRuntimeAdapterEvent(deps, acceptedEvent);
+            yield acceptedEvent;
+          }
+          if (evidenceCompleted && !duplicateSearchEvidence && updatedWindow && !stageEvidenceWindowShouldClose(updatedWindow, String(preflight.capabilityId))) {
+            continue;
+          }
+          const explicitMutationAction = String(currentReadyStageControl?.requiredNextAction ?? "core.file.edit|core.patch.apply");
+          const gateOverride = convergenceWorkflowGateOverride({
+            requiredNextAction: explicitMutationAction,
+            rejectedCapabilityId: String(preflight.capabilityId),
+            rejectedToolName: toolName,
+            terminalKind: "workflow-stage-evidence-window.closed",
+            toolCallId
+          });
+          activeWorkflowGateOverride = gateOverride;
+          activeProfilePolicy = profilePolicyWithRuntimeWorkflowGateOverride(iterationRequest.profilePolicy, gateOverride);
+          const closedEvent = agentLoopEvent("workflow.stage-evidence.window.closed", sessionId, turnId, trace, {
+            stageId: currentReadyStageControl?.stageId ?? "unknown",
+            stageKey: windowKey,
+            reason: duplicateSearchEvidence
+              ? "duplicate"
+              : String(preflight.capabilityId) === "core.search.text"
+              ? "search-completed"
+              : evidenceCompleted
+                ? "window-exhausted"
+                : "evidence-empty",
+            acceptedOperations: updatedWindow?.acceptedOperations ?? 0,
+            requiredNextAction: explicitMutationAction,
+            toolCallId
+          }, request.agentId);
+          await recordRuntimeAdapterEvent(deps, closedEvent);
+          yield closedEvent;
+          messages.push({
+            role: "user",
+            content: [
+              "WORKFLOW_FOCUSED_EVIDENCE_WINDOW_CLOSED.",
+              "Focused source evidence is now available for the reviewed mutation stage.",
+              `Required next action: ${explicitMutationAction}.`,
+              "Apply a source mutation or report a bounded blocker; do not continue source inspection."
+            ].join("\n")
+          });
+        }
+        if (
+          allowedDiagnosticRepairRefresh &&
+          (
+            activeGateOverride === undefined ||
+            activeGateOverride.terminalKind === "workflow-official-repair.refreshed"
+          ) &&
+          isFocusedEvidenceRefreshCapabilityId(String(preflight.capabilityId)) &&
+          terminal?.kind === "capability.completed" &&
+          focusedEvidenceRefreshCompleted(String(preflight.capabilityId), terminal, toolInput) &&
+          (
+            readyStageKindMatches(currentReadyStageControl, ["produce", "materialize", "repair"]) ||
+            (
+              activeGateOverride?.terminalKind === "workflow-mutation-repair.required" &&
+              readyStageKindMatches(currentReadyStageControl, ["verify", "score"])
+            )
+          )
+        ) {
+          const refreshKey = readyStageRequiredActionMissKey(currentReadyStageControl);
+          const refreshCount = (officialDiagnosticRepairFocusedRefreshCounts.get(refreshKey) ?? 0) + 1;
+          officialDiagnosticRepairFocusedRefreshCounts.set(refreshKey, refreshCount);
+          const explicitMutationAction = String(currentReadyStageControl?.requiredNextAction ?? "core.file.edit|core.patch.apply");
+          const requiredNextAction = refreshCount >= OFFICIAL_DIAGNOSTIC_REPAIR_FOCUSED_REFRESH_LIMIT
+            ? explicitMutationAction
+            : "focused-read-or-source-edit-or-bounded-blocker";
+          const gateOverride = convergenceWorkflowGateOverride({
+            requiredNextAction,
+            rejectedCapabilityId: String(preflight.capabilityId),
+            rejectedToolName: toolName,
+            terminalKind: "workflow-official-repair.refreshed",
+            toolCallId
+          });
+          activeWorkflowGateOverride = gateOverride;
+          activeProfilePolicy = activeProfilePolicy ? { ...activeProfilePolicy, workflowGateOverride: gateOverride } : activeProfilePolicy;
+          messages.push({
+            role: "user",
+            content: [
+              "WORKFLOW_OFFICIAL_REPAIR_EVIDENCE_REFRESHED.",
+              "A focused read/search refreshed evidence for an official evaluation repair stage.",
+              `Focused evidence refresh count: ${refreshCount}/${OFFICIAL_DIAGNOSTIC_REPAIR_FOCUSED_REFRESH_LIMIT}.`,
+              `Required next action: ${requiredNextAction}.`,
+              refreshCount >= OFFICIAL_DIAGNOSTIC_REPAIR_FOCUSED_REFRESH_LIMIT
+                ? "Apply a source mutation, run a standard test, or report a bounded blocker. Do not continue source inspection without acting on the collected diagnostic evidence."
+                : "Continue bounded focused inspection only when needed, then apply a source mutation, run a standard test, or report a bounded blocker."
+            ].join("\n")
+          });
+        }
+        if (
           (
             activeGateOverride?.terminalKind === "workflow-mutation-repair.required" ||
             activeGateOverride?.terminalKind === "workflow-invalid-mutation-intent.rejected" ||
             activeGateOverride?.terminalKind === "workflow-mutation-repair.refreshed"
           ) &&
-          workflowGateRequiredActionAllowsCapability(activeGateOverride.requiredNextAction, String(preflight.capabilityId)) &&
+          (
+            workflowGateRequiredActionAllowsCapability(activeGateOverride.requiredNextAction, String(preflight.capabilityId)) ||
+            (
+              activeGateOverride.terminalKind === "workflow-mutation-repair.required" &&
+              isFocusedEvidenceRefreshCapabilityId(String(preflight.capabilityId))
+            )
+          ) &&
           isFocusedEvidenceRefreshCapabilityId(String(preflight.capabilityId)) &&
           terminal?.kind === "capability.completed" &&
           focusedEvidenceRefreshCompleted(String(preflight.capabilityId), terminal, toolInput) &&
@@ -2409,7 +2892,13 @@ export async function* runAgentLoop(
           ) {
             readyStageMutationRepairHadFocusedRefresh.add(readyStageRequiredActionMissKey(currentReadyStageControl));
           }
-          const requiredNextAction = String(preflight.capabilityId) === "core.search.text" ||
+          const supportingContextRefresh = !workflowGateRequiredActionAllowsCapability(
+            activeGateOverride.requiredNextAction,
+            String(preflight.capabilityId)
+          );
+          const requiredNextAction = supportingContextRefresh
+            ? activeGateOverride.requiredNextAction
+            : String(preflight.capabilityId) === "core.search.text" ||
             (
               activeGateOverride?.terminalKind === "workflow-invalid-mutation-intent.rejected" &&
               readyStageControlProjectedFromReviewedEvidence(currentReadyStageControl)
@@ -2427,18 +2916,34 @@ export async function* runAgentLoop(
           activeProfilePolicy = activeProfilePolicy ? { ...activeProfilePolicy, workflowGateOverride: gateOverride } : activeProfilePolicy;
         }
         if (
-          activeGateOverride?.terminalKind === "workflow-standard-test-failed" &&
+          (
+            activeGateOverride?.terminalKind === "workflow-standard-test-failed" ||
+            activeGateOverride?.terminalKind === "workflow-standard-test-repair.refreshed"
+          ) &&
           workflowGateRequiredActionAllowsCapability(activeGateOverride.requiredNextAction, String(preflight.capabilityId)) &&
           isFocusedEvidenceRefreshCapabilityId(String(preflight.capabilityId)) &&
           terminal?.kind === "capability.completed" &&
           focusedEvidenceRefreshCompleted(String(preflight.capabilityId), terminal, toolInput)
         ) {
+          const standardTestFailureToolCallId = String(
+            activeGateOverride.standardTestFailureToolCallId ?? activeGateOverride.toolCallId
+          );
+          const refreshKey = [
+            readyStageRequiredActionMissKey(currentReadyStageControl),
+            standardTestFailureToolCallId
+          ].join(":");
+          const refreshCount = (failedStandardTestRepairFocusedRefreshCounts.get(refreshKey) ?? 0) + 1;
+          failedStandardTestRepairFocusedRefreshCounts.set(refreshKey, refreshCount);
+          const requiredNextAction = refreshCount >= FAILED_STANDARD_TEST_REPAIR_FOCUSED_REFRESH_LIMIT
+            ? "core.file.edit|core.patch.apply|core.test.run"
+            : "focused-read-or-source-edit-or-test-or-return-control";
           const gateOverride = convergenceWorkflowGateOverride({
-            requiredNextAction: "source-edit-or-test-or-bounded-blocker",
+            requiredNextAction,
             rejectedCapabilityId: String(preflight.capabilityId),
             rejectedToolName: toolName,
             terminalKind: "workflow-standard-test-repair.refreshed",
-            toolCallId
+            toolCallId,
+            standardTestFailureToolCallId
           });
           activeWorkflowGateOverride = gateOverride;
           activeProfilePolicy = activeProfilePolicy ? { ...activeProfilePolicy, workflowGateOverride: gateOverride } : activeProfilePolicy;
@@ -2447,8 +2952,11 @@ export async function* runAgentLoop(
             content: [
               "WORKFLOW_STANDARD_TEST_REPAIR_EVIDENCE_REFRESHED.",
               "A focused read/search refreshed evidence after a failed standard test.",
-              "Required next action: source-edit-or-test-or-bounded-blocker.",
-              "Apply a source mutation, rerun a standard test, or report a bounded blocker. Do not keep inspecting without a new proof obligation."
+              `Focused evidence refresh count: ${refreshCount}/${FAILED_STANDARD_TEST_REPAIR_FOCUSED_REFRESH_LIMIT}.`,
+              `Required next action: ${requiredNextAction}.`,
+              refreshCount >= FAILED_STANDARD_TEST_REPAIR_FOCUSED_REFRESH_LIMIT
+                ? "Apply a source mutation, rerun a standard test, or report a bounded blocker. Do not keep inspecting without a new failed-test proof obligation."
+                : "Continue with bounded focused reads only when needed, apply a source mutation, rerun a standard test, or report a bounded blocker."
             ].join("\n")
           });
         }
@@ -2460,6 +2968,9 @@ export async function* runAgentLoop(
             toolInput
           });
         if (evaluationReproductionCompleted) {
+          if (evaluationBehaviorReproductionActive(iterationRequest.profilePolicy, currentReadyStageControl)) {
+            evaluationBehaviorReproductionSatisfied.add(readyStageRequiredActionMissKey(currentReadyStageControl));
+          }
           const gateOverride = convergenceWorkflowGateOverride({
             requiredNextAction: "focused-read-or-source-edit-or-test-or-return-control",
             rejectedCapabilityId: String(preflight.capabilityId),
@@ -2491,14 +3002,86 @@ export async function* runAgentLoop(
           currentReadyStageControl,
           toolInput
         );
+        const evaluationBehaviorReproductionMissing = requiresEvaluationBehaviorReproductionBeforePublicTest({
+          profilePolicy: iterationRequest.profilePolicy,
+          readyStageControl: currentReadyStageControl,
+          capabilityId: String(preflight.capabilityId),
+          toolInput,
+          reproductionSatisfied: evaluationBehaviorReproductionSatisfied.has(readyStageRequiredActionMissKey(currentReadyStageControl))
+        });
+        const publicTestSelectedNoTests = evaluationBehaviorReproductionMissing && testResultSelectedNoTests(toolResultText);
+        if (
+          evaluationBehaviorReproductionMissing &&
+          terminal !== undefined &&
+          (
+            (terminal.kind === "capability.completed" && terminalEvidenceStatusCompleted(terminal)) ||
+            publicTestSelectedNoTests
+          )
+        ) {
+          const readyStageControl = currentReadyStageControl;
+          if (!readyStageControl) continue;
+          const error = kernelError(
+            "KERNEL_POLICY_DENIED",
+            "WORKFLOW_BEHAVIOR_REPRODUCTION_REQUIRED: evaluation cannot close from a public repository test file alone because the required behavior may be hidden or harness-injected; run a safe python -c reproduction from the problem statement or official failure evidence first.",
+            {
+              workflowReadyStageControl: readyStageControl,
+              requestedCapabilityId: String(preflight.capabilityId),
+              iteration: iterations,
+              terminalKind: terminal.kind,
+              command: toolCommandText(toolInput)
+            }
+          );
+          diagnostics.push(error);
+          const missed = agentLoopEvent("workflow.required-action.missed", sessionId, turnId, trace, {
+            ...readyStageControl,
+            requestedCapabilityId: String(preflight.capabilityId),
+            iteration: iterations,
+            modelRequestCount: iterations,
+            toolCallCount: toolCalls,
+            correctionAttempt: 1,
+            retryPolicy: "retry-with-feedback",
+            behaviorReproductionMissing: true,
+            feedbackStatus: executionFeedback.status,
+            terminalKind: terminal.kind
+          }, request.agentId, error);
+          await recordRuntimeAdapterEvent(deps, missed);
+          yield missed;
+          const gateOverride = convergenceWorkflowGateOverride({
+            requiredNextAction: "standard-test-command-or-bounded-blocker",
+            rejectedCapabilityId: String(preflight.capabilityId),
+            rejectedToolName: toolName,
+            terminalKind: "workflow-behavior-reproduction.required",
+            toolCallId
+          });
+          activeWorkflowGateOverride = gateOverride;
+          activeProfilePolicy = activeProfilePolicy
+            ? { ...clearWorkflowGateOverride(activeProfilePolicy), workflowGateOverride: gateOverride }
+            : activeProfilePolicy;
+          messages.push({
+            role: "system",
+            content: [
+              "WORKFLOW_OFFICIAL_REPAIR_REPRODUCTION_REQUIRED.",
+              "Official fail-to-pass tests may be hidden or injected by the harness; passing the existing public test file alone is not sufficient repair evidence.",
+              "Required next action: standard-test-command-or-bounded-blocker.",
+              `Current governed checkout root: ${request.workspaceRoot}.`,
+              "Run the reproduction directly from that checkout root: omit cwd and do not prepend cd or another absolute workspace path.",
+              "Run a safe python -c reproduction constructed from the official failure excerpt or original problem statement. After that reproduction runs, you may run the narrowest public pytest/unittest command as a closure check.",
+              "Do not inspect more source or make another source edit until the hidden-case reproduction has been attempted or you report a bounded blocker."
+            ].join("\n")
+          });
+          restartModelAfterWorkflowCorrection = true;
+          break;
+        }
+        const terminalToolCompleted = isTerminalToolCompletion(String(preflight.capabilityId), terminal, currentReadyStageControl, toolInput);
         const progressCapabilitySucceeded = progressCapabilityRequested
           && terminal?.kind === "capability.completed"
-          && terminalEvidenceStatusCompleted(terminal)
+          && (terminalEvidenceStatusCompleted(terminal) || terminalToolCompleted)
           && !standardVerifyCommandMissing;
         const terminalToolFailed = isTerminalToolFailure(String(preflight.capabilityId), terminal, currentReadyStageControl);
         const failedProgressCapability = progressCapabilityRequested
           && terminal !== undefined
           && !terminalToolFailed
+          && !terminalToolCompleted
           && (
             readyStageKindMatches(currentReadyStageControl, ["verify", "score"]) ||
             (readyStageKindMatches(currentReadyStageControl, ["produce", "materialize", "repair"]) && recoverableToolFailure)
@@ -2506,7 +3089,7 @@ export async function* runAgentLoop(
           && !progressCapabilitySucceeded;
         const failedStandardVerifyCommand = failedProgressCapability
           && readyStageKindMatches(currentReadyStageControl, ["verify"])
-          && terminal?.kind === "capability.completed"
+          && (terminal?.kind === "capability.completed" || terminal?.kind === "capability.failed")
           && !standardVerifyCommandMissing;
         const repeatedProgressEvidence = progressCapabilitySucceeded
           && repeatedReadyStageProgressEvidence(readyStageProgressEvidenceCounts, {
@@ -2530,6 +3113,11 @@ export async function* runAgentLoop(
         const nonProgressStageMiss = (
           !workflowAdvanced &&
           !gateOverrideSatisfied &&
+          !allowsDiagnosticRepairFocusedRefresh(
+            String(preflight.capabilityId),
+            currentReadyStageControl,
+            iterationRequest.profilePolicy
+          ) &&
           (
             (!iterationProgressCapabilitySatisfied && readyStageNonProgressCapabilityMiss(String(preflight.capabilityId), currentReadyStageControl))
             || repeatedProgressEvidence
@@ -2570,7 +3158,10 @@ export async function* runAgentLoop(
             missCount,
             correctionLimit: READY_STAGE_REQUIRED_ACTION_CORRECTION_LIMIT,
             iteration: iterations,
-            maxModelIterations: limits.maxModelIterations,
+            maxModelIterations: effectiveMaxModelIterationsForWorkflowGate(
+              limits.maxModelIterations,
+              iterationRequest.profilePolicy?.workflowGateOverride
+            ),
             workflowReadyStageControl: effectiveReadyStageControl,
             requestedCapabilityId: String(preflight.capabilityId)
           });
@@ -2613,7 +3204,22 @@ export async function* runAgentLoop(
           }, request.agentId, error);
           await recordRuntimeAdapterEvent(deps, missed);
           yield missed;
+          const exactRefreshTargetPath = recoverableMutationFailure
+            ? editPreconditionFailureTargetPath(
+                String(preflight.capabilityId),
+                toolInput,
+                terminal?.error
+              )
+            : undefined;
           if (recoverableMutationFailure) {
+            const mutationStageKey = readyStageRequiredActionMissKey(readyStageControl);
+            if (exactRefreshTargetPath) {
+              mutationExactRefreshByStage.set(mutationStageKey, {
+                targetPath: exactRefreshTargetPath,
+                failedToolCallId: toolCallId,
+                consumed: false
+              });
+            }
             if (String(preflight.capabilityId) === "core.file.edit") {
               readyStageEditRepairFailures.add(missKey);
             }
@@ -2675,7 +3281,7 @@ export async function* runAgentLoop(
               const effectiveMutationMissCount = gateMutationFailure && String(preflight.capabilityId) !== "core.patch.apply"
                 ? Math.max(missCount, 1)
                 : missCount;
-              const mutationRepairRequiredNextAction = exactEditRecoveryAvailable && patchRecoveryAvailable
+              const defaultMutationRepairRequiredNextAction = exactEditRecoveryAvailable && patchRecoveryAvailable
                 ? "core.patch.apply|core.file.edit"
                 : exactEditRecoveryAvailable
                   ? "core.file.edit"
@@ -2694,6 +3300,9 @@ export async function* runAgentLoop(
                   : reviewedEvidenceAlreadyProjected && (String(preflight.capabilityId) === "core.patch.apply" || patchAlreadyFailedForStage || (editAlreadyFailedForStage && effectiveMutationMissCount >= 1))
                     ? patchRecoveryAvailable ? "core.patch.apply|core.file.edit" : "core.file.edit"
                     : "focused-read-or-source-edit-or-bounded-blocker";
+              const mutationRepairRequiredNextAction = exactRefreshTargetPath
+                ? "exact-target-refresh-or-source-edit-or-bounded-blocker"
+                : defaultMutationRepairRequiredNextAction;
               const gateOverride = convergenceWorkflowGateOverride({
                 requiredNextAction: mutationRepairRequiredNextAction,
                 rejectedCapabilityId: String(preflight.capabilityId),
@@ -2703,7 +3312,11 @@ export async function* runAgentLoop(
               });
               activeWorkflowGateOverride = gateOverride;
               activeProfilePolicy = activeProfilePolicy ? { ...activeProfilePolicy, workflowGateOverride: gateOverride } : activeProfilePolicy;
-              messages.push(mutationRepairCorrectionMessage(readyStageControl, error, executionFeedback.diagnostics));
+              messages.push(
+                exactRefreshTargetPath
+                  ? mutationExactRefreshCorrectionMessage(readyStageControl, exactRefreshTargetPath, error)
+                  : mutationRepairCorrectionMessage(readyStageControl, error, executionFeedback.diagnostics)
+              );
             } else if (
               repeatedProgressEvidence ||
               readyStageKindMatches(readyStageControl, ["produce", "materialize", "repair"]) ||
@@ -2733,7 +3346,18 @@ export async function* runAgentLoop(
               activeProfilePolicy = activeProfilePolicy ? { ...activeProfilePolicy, workflowGateOverride: gateOverride } : activeProfilePolicy;
             }
             if (!recoverableMutationFailure) {
-              messages.push(readyStageRequiredActionCorrectionMessage(readyStageControl, missCount + 1, error));
+              messages.push(
+                activeGateForMiss?.terminalKind === "workflow-official-repair.refreshed"
+                  ? officialRepairRequiredActionCorrectionMessage(readyStageControl, missCount + 1, error)
+                  : activeGateForMiss?.terminalKind === "workflow-standard-test-repair.refreshed"
+                    ? standardTestRepairRequiredActionCorrectionMessage(
+                        readyStageControl,
+                        missCount + 1,
+                        error,
+                        activeGateForMiss.requiredNextAction
+                      )
+                  : readyStageRequiredActionCorrectionMessage(readyStageControl, missCount + 1, error)
+              );
             }
             restartModelAfterWorkflowCorrection = true;
             break;
@@ -2748,7 +3372,8 @@ export async function* runAgentLoop(
             rejectedCapabilityId: String(preflight.capabilityId),
             rejectedToolName: toolName,
             terminalKind: "workflow-standard-test-failed",
-            toolCallId
+            toolCallId,
+            standardTestFailureToolCallId: toolCallId
           });
           activeWorkflowGateOverride = gateOverride;
           activeProfilePolicy = activeProfilePolicy
@@ -2788,7 +3413,7 @@ export async function* runAgentLoop(
           restartModelAfterWorkflowCorrection = true;
           break;
         }
-        if (isTerminalToolCompletion(String(preflight.capabilityId), terminal, currentReadyStageControl, toolInput)) {
+        if (terminalToolCompleted) {
           const convergence = terminalToolConvergence({
             capabilityId: String(preflight.capabilityId),
             toolName,
@@ -2972,7 +3597,10 @@ export async function* runAgentLoop(
         missCount,
         correctionLimit: READY_STAGE_REQUIRED_ACTION_CORRECTION_LIMIT,
         iteration: iterations,
-        maxModelIterations: limits.maxModelIterations,
+        maxModelIterations: effectiveMaxModelIterationsForWorkflowGate(
+          limits.maxModelIterations,
+          iterationRequest.profilePolicy?.workflowGateOverride
+        ),
         workflowReadyStageControl: currentReadyStageControl
       });
       const correctionAttempt = Number(convergence.metadata?.correctionAttempt ?? missCount + 1);
@@ -3181,12 +3809,12 @@ function isTerminalToolCompletion(
   toolInput: JsonObject
 ): boolean {
   if (terminal?.kind !== "capability.completed" || terminal.error) return false;
-  if (!terminalEvidenceStatusCompleted(terminal)) return false;
   if (!readyStageControl) return false;
   const terminalClosePolicy = typeof readyStageControl.terminalClosePolicy === "string"
     ? readyStageControl.terminalClosePolicy
     : "";
   if (!terminalClosePolicy.startsWith("close-")) return false;
+  if (!terminalEvidenceStatusCompleted(terminal) && readyStageKindMatches(readyStageControl, ["verify"])) return false;
   const progressCapabilityIds = Array.isArray(readyStageControl.progressCapabilityIds)
     ? readyStageControl.progressCapabilityIds.map(String)
     : [];
@@ -3244,9 +3872,14 @@ function terminalEvidenceStatusCompleted(terminal: RuntimeEvent): boolean {
   return evidence?.status === "completed";
 }
 
+function testResultSelectedNoTests(result: string): boolean {
+  const plainResult = result.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "");
+  return /(?:^|\n)\s*(?:no tests (?:ran|were found)|collected 0 items|\d+ deselected(?:\s+in\s+[^\n]+)?)\s*(?:\n|$)/i.test(plainResult);
+}
+
 function focusedEvidenceRefreshCompleted(capabilityId: string, terminal: RuntimeEvent, toolInput: JsonObject): boolean {
   if (!terminalEvidenceStatusCompleted(terminal)) return false;
-  if (capabilityId === "core.search.text") return !terminalEvidenceEmpty(terminal);
+  if (capabilityId === "core.search.text") return terminalSearchEvidenceHasContent(terminal);
   if (capabilityId === "core.file.read") return !terminalEvidenceEmpty(terminal) && !terminalEvidenceTruncatedForRead(toolInput, terminal);
   return true;
 }
@@ -3747,6 +4380,7 @@ function convergenceWorkflowGateOverride(input: {
   readonly rejectedCapabilityId: string;
   readonly terminalKind: string;
   readonly toolCallId: string;
+  readonly standardTestFailureToolCallId?: string;
 }): AgentLoopProfileWorkflowGateOverride {
   return {
     gate: "runtime-convergence",
@@ -3754,7 +4388,8 @@ function convergenceWorkflowGateOverride(input: {
     rejectedToolName: input.rejectedToolName,
     rejectedCapabilityId: input.rejectedCapabilityId,
     terminalKind: input.terminalKind,
-    toolCallId: input.toolCallId
+    toolCallId: input.toolCallId,
+    ...(input.standardTestFailureToolCallId ? { standardTestFailureToolCallId: input.standardTestFailureToolCallId } : {})
   };
 }
 
@@ -3764,6 +4399,36 @@ function workflowGateOverrideAllowsCapability(
 ): boolean {
   if (!override) return false;
   return workflowGateRequiredActionAllowsCapability(override.requiredNextAction, capabilityId);
+}
+
+function workflowGateOverrideStaleForReadyStage(
+  override: AgentLoopProfileWorkflowGateOverride | undefined,
+  readyStageControl: JsonObject | undefined
+): boolean {
+  if (!override) return false;
+  if (!readyStageKindMatches(readyStageControl, ["produce", "materialize", "repair"])) return false;
+  const progressCapabilityIds = Array.isArray(readyStageControl?.progressCapabilityIds)
+    ? readyStageControl.progressCapabilityIds.map(String)
+    : [];
+  if (!progressCapabilityIds.some((capabilityId) => isMutationCapabilityId(capabilityId))) return false;
+  const requiredCapabilityIds = workflowGateOverrideRequiredCapabilityIds(override.requiredNextAction);
+  if (requiredCapabilityIds.length === 0) return false;
+  return requiredCapabilityIds.every(isSourceInspectionCapabilityId);
+}
+
+function isSourceInspectionCapabilityId(capabilityId: string): boolean {
+  return capabilityId === "core.file.read" ||
+    capabilityId === "core.file.list" ||
+    capabilityId === "core.search.text" ||
+    capabilityId === "core.workspace.glob";
+}
+
+function effectiveMaxModelIterationsForWorkflowGate(
+  maxModelIterations: number,
+  override: AgentLoopProfileWorkflowGateOverride | undefined
+): number {
+  if (override?.terminalKind !== "workflow-standard-test-required") return maxModelIterations;
+  return maxModelIterations + STANDARD_TEST_REQUIRED_CLOSURE_MODEL_ITERATION_RESERVE;
 }
 
 function readyStageAllowsCapability(control: JsonObject | undefined, capabilityId: string): boolean {
@@ -3780,6 +4445,74 @@ function readyStageControlProjectedFromReviewedEvidence(control: JsonObject | un
   return control?.projectedFromReviewedStage === true;
 }
 
+function allowsDiagnosticRepairFocusedRefresh(
+  capabilityId: string,
+  control: JsonObject | undefined,
+  profilePolicy: AgentLoopProfilePolicyMetadata | undefined
+): boolean {
+  if (!isFocusedEvidenceRefreshCapabilityId(capabilityId)) return false;
+  if (profilePolicy?.workflowGovernanceMode !== "evaluation") return false;
+  if (!profilePolicy.workflowGateOverride) return false;
+  if (!workflowGateOverrideAllowsCapability(profilePolicy.workflowGateOverride, capabilityId)) return false;
+  if (!readyStageKindMatches(control, ["produce", "materialize", "repair"])) return false;
+  const stageId = typeof control?.stageId === "string" ? control.stageId : "";
+  if (!stageId) return false;
+  const workflow = profilePolicy.stagedTaskWorkflow;
+  const stageState = workflow?.runState.stageStates.find((stage) => stage.stageId === stageId);
+  const refs = workflow?.runState.refs ?? [];
+  const refsById = new Map(refs.map((ref) => [ref.refId, ref]));
+  return refs.some((ref) => ref.type === "diagnostic") ||
+    (stageState?.inputRefs ?? []).some((refId) => refsById.get(refId)?.type === "diagnostic");
+}
+
+function requiresEvaluationBehaviorReproductionBeforePublicTest(input: {
+  readonly profilePolicy: AgentLoopProfilePolicyMetadata | undefined;
+  readonly readyStageControl: JsonObject | undefined;
+  readonly capabilityId: string;
+  readonly toolInput: JsonObject;
+  readonly reproductionSatisfied: boolean;
+}): boolean {
+  if (input.reproductionSatisfied) return false;
+  if (!evaluationBehaviorReproductionActive(input.profilePolicy, input.readyStageControl)) return false;
+  if (!readyStageKindMatches(input.readyStageControl, ["verify", "score"])) return false;
+  if (!isStandardTestExecutionCapabilityId(input.capabilityId)) return false;
+  const command = toolCommandText(input.toolInput);
+  if (!isStandardTestCommand(command)) return false;
+  if (isSafePythonReproductionCommand(command)) return false;
+  return isPublicRepositoryTestCommand(command);
+}
+
+function evaluationBehaviorReproductionActive(
+  profilePolicy: AgentLoopProfilePolicyMetadata | undefined,
+  control: JsonObject | undefined
+): boolean {
+  if (profilePolicy?.workflowGovernanceMode !== "evaluation") return false;
+  const workflow = profilePolicy.stagedTaskWorkflow;
+  if (!workflow) return false;
+  const refs = workflow.runState.refs ?? [];
+  const activatingRefIds = new Set([
+    "ref:runner:problem-behavior-contract",
+    "ref:runner:official-repair-feedback"
+  ]);
+  if (refs.some((ref) => activatingRefIds.has(ref.refId))) return true;
+  const stageId = typeof control?.stageId === "string" ? control.stageId : "";
+  const stageState = stageId
+    ? workflow.runState.stageStates.find((stage) => stage.stageId === stageId)
+    : workflow.runState.stageStates.find((stage) => stage.status === "ready");
+  return (stageState?.inputRefs ?? []).some((refId) => {
+    return activatingRefIds.has(refId);
+  });
+}
+
+function isSafePythonReproductionCommand(command: string): boolean {
+  const normalized = command.trim().replace(/^cd\s+(?:"\/workspace"|'\/workspace'|\/workspace)\s*&&\s*/i, "").trim();
+  return /^(?:python(?:3(?:\.\d+)?)?|py)\s+-c(?:\s|$)/i.test(normalized);
+}
+
+function isPublicRepositoryTestCommand(command: string): boolean {
+  return /\b(?:pytest|unittest|tox|nox)\b/i.test(command);
+}
+
 function workflowGateRequiredActionAllowsCapability(requiredNextAction: string, capabilityId: string): boolean {
   const alternatives = requiredNextAction.split("|").map((part) => part.trim()).filter(Boolean);
   if (alternatives.length > 1) return alternatives.some((alternative) => workflowGateRequiredActionAllowsCapability(alternative, capabilityId));
@@ -3787,7 +4520,7 @@ function workflowGateRequiredActionAllowsCapability(requiredNextAction: string, 
     return isFocusedEvidenceRefreshCapabilityId(capabilityId) || isMutationCapabilityId(capabilityId);
   }
   if (requiredNextAction === "focused-read-or-source-edit-or-test-or-return-control") {
-    return isFocusedEvidenceRefreshCapabilityId(capabilityId) || isMutationCapabilityId(capabilityId) || isTestCapabilityId(capabilityId);
+    return isFocusedEvidenceRefreshCapabilityId(capabilityId) || isMutationCapabilityId(capabilityId) || isStandardTestExecutionCapabilityId(capabilityId);
   }
   if (requiredNextAction === "source-edit-or-test-or-bounded-blocker" || requiredNextAction === "source-edit-or-test-or-blocker") {
     return isMutationCapabilityId(capabilityId) || isTestCapabilityId(capabilityId);
@@ -3797,6 +4530,9 @@ function workflowGateRequiredActionAllowsCapability(requiredNextAction: string, 
   }
   if (requiredNextAction === "standard-test-command-or-bounded-blocker") {
     return capabilityId === "core.test.run" || capabilityId === "core.shell.run";
+  }
+  if (requiredNextAction === "exact-target-refresh-or-source-edit-or-bounded-blocker") {
+    return capabilityId === "core.file.read" || isMutationCapabilityId(capabilityId);
   }
   if (requiredNextAction.startsWith("core.")) return capabilityId === requiredNextAction;
   return false;
@@ -3906,6 +4642,30 @@ function normalizePatchTargetPath(path: string): string {
 
 function normalizeEvidencePath(path: string): string {
   return path.replace(/\\/g, "/").replace(/^\.\//, "").replace(/^\/+/, "");
+}
+
+function editPreconditionFailureTargetPath(
+  capabilityId: string,
+  toolInput: JsonObject,
+  error: RedactedError | undefined
+): string | undefined {
+  if (capabilityId !== "core.file.edit") return undefined;
+  const details = error?.details;
+  if (!details || typeof details !== "object" || Array.isArray(details)) return undefined;
+  if (String((details as JsonObject).originalCode ?? "") !== "EDIT_PRECONDITION_FAILED") return undefined;
+  const path = typeof toolInput.path === "string" ? normalizeEvidencePath(toolInput.path) : "";
+  return path || undefined;
+}
+
+function mutationExactRefreshInputAllowed(
+  state: MutationExactRefreshState,
+  toolInput: JsonObject
+): boolean {
+  if (state.consumed) return false;
+  const path = typeof toolInput.path === "string" ? normalizeEvidencePath(toolInput.path) : "";
+  if (path !== state.targetPath) return false;
+  return typeof toolInput.offset === "number" && Number.isFinite(toolInput.offset) && toolInput.offset >= 0 &&
+    typeof toolInput.limit === "number" && Number.isFinite(toolInput.limit) && toolInput.limit > 0;
 }
 
 function isPlaceholderMutationText(value: string): boolean {
@@ -4155,7 +4915,10 @@ function readyStageControlStageForReviewedEvidence(input: {
   }
   const currentAllowedCapabilityIds = (input.readyStage.allowedTools ?? []).map(String);
   const currentProgress = new Set(progressCapabilityIdsForWorkflowStage(input.readyStage.kind, currentAllowedCapabilityIds));
-  if (readyStageNeedsDiagnosticEvidenceReview(input.readyStage.kind, input.readyStageState.inputRefs ?? [], input.refs ?? [])) {
+  if (
+    input.readyStageState.outputRefs.length === 0 &&
+    readyStageNeedsDiagnosticEvidenceReview(input.readyStage.kind, input.readyStageState.inputRefs ?? [], input.refs ?? [])
+  ) {
     return undefined;
   }
   if (readyStageOwnProgressShouldWin(input.readyStage.kind, currentProgress) && input.readyStageState.outputRefs.length === 0) {
@@ -4375,11 +5138,14 @@ function workflowGateOverrideRequiredCapabilityIds(requiredNextAction: string): 
   }
   if (requiredNextAction === "standard-test-command") return ["core.test.run"];
   if (requiredNextAction === "standard-test-command-or-bounded-blocker") return ["core.test.run", "core.shell.run"];
+  if (requiredNextAction === "exact-target-refresh-or-source-edit-or-bounded-blocker") {
+    return ["core.file.read", "core.file.edit", "core.patch.apply"];
+  }
   if (requiredNextAction === "focused-read-or-source-edit-or-bounded-blocker") {
     return ["core.file.read", "core.search.text", "core.file.edit", "core.patch.apply"];
   }
   if (requiredNextAction === "focused-read-or-source-edit-or-test-or-return-control") {
-    return ["core.file.read", "core.search.text", "core.file.edit", "core.patch.apply", "core.test.run"];
+    return ["core.file.read", "core.search.text", "core.file.edit", "core.patch.apply", "core.test.run", "core.shell.run"];
   }
   if (requiredNextAction === "source-edit-or-test-or-bounded-blocker" || requiredNextAction === "source-edit-or-test-or-blocker") {
     return ["core.file.edit", "core.patch.apply", "core.test.run"];

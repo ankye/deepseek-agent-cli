@@ -37,8 +37,8 @@ describe("mutation repair routing", () => {
       limits: { maxModelIterations: 5, maxToolCalls: 8 }
     }));
 
-    assert.deepEqual(gateway.visibleToolNamesForRequest(1), ["core_file_edit", "core_file_read", "core_search_text"]);
-    assert.equal(workflowGateForModelRequest(events, 1)?.requiredNextAction, "focused-read-or-source-edit-or-bounded-blocker");
+    assert.deepEqual(gateway.visibleToolNamesForRequest(1), ["core_file_edit", "core_file_read", "core_patch_apply"]);
+    assert.equal(workflowGateForModelRequest(events, 1)?.requiredNextAction, "exact-target-refresh-or-source-edit-or-bounded-blocker");
     assert.equal(events.some((event) =>
       event.kind === "workflow.required-action.missed" &&
       event.data.requestedCapabilityId === "core.file.read"
@@ -75,8 +75,8 @@ describe("mutation repair routing", () => {
     }));
 
     assert.deepEqual(gateway.visibleToolNamesForRequest(0), ["core_file_edit"]);
-    assert.deepEqual(gateway.visibleToolNamesForRequest(1), ["core_file_edit", "core_file_read", "core_search_text"]);
-    assert.equal(workflowGateForModelRequest(events, 1)?.requiredNextAction, "focused-read-or-source-edit-or-bounded-blocker");
+    assert.deepEqual(gateway.visibleToolNamesForRequest(1), ["core_file_edit", "core_file_read", "core_patch_apply"]);
+    assert.equal(workflowGateForModelRequest(events, 1)?.requiredNextAction, "exact-target-refresh-or-source-edit-or-bounded-blocker");
     assert.equal(events.some((event) =>
       event.kind === "model.tool.result" &&
       event.data.toolName === "core.file.edit" &&
@@ -86,12 +86,12 @@ describe("mutation repair routing", () => {
     await kernel.shutdown();
   });
 
-  it("allows one focused evidence refresh after a failed mutation precondition", async () => {
+  it("normalizes one exact-target evidence refresh after a failed mutation precondition", async () => {
     const deps = createDeterministicRuntimeDependencies();
     await deps.platform.writeFile("/workspace/README.md", "stage evidence\n");
     const gateway = new SequentialToolCallModelGateway([
       { id: "call-edit-stale", name: "core.file.edit", input: { path: "README.md", expected: "missing evidence", replacement: "changed evidence" } },
-      { id: "call-refresh-search", name: "core.search.text", input: { pattern: "stage evidence", glob: "README.md", outputMode: "content", contextLines: 1 } },
+      { id: "call-refresh-read", name: "core.file.read", input: { path: "README.md" } },
       { id: "call-edit-fresh", name: "core.file.edit", input: { path: "README.md", expected: "stage evidence", replacement: "changed evidence" } }
     ]);
     const loopDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
@@ -109,16 +109,16 @@ describe("mutation repair routing", () => {
       limits: { maxModelIterations: 6, maxToolCalls: 8 }
     }));
 
-    assert.deepEqual(gateway.visibleToolNamesForRequest(1), ["core_file_edit", "core_file_read", "core_search_text"]);
-    assert.equal(workflowGateForModelRequest(events, 1)?.requiredNextAction, "focused-read-or-source-edit-or-bounded-blocker");
+    assert.deepEqual(gateway.visibleToolNamesForRequest(1), ["core_file_edit", "core_file_read", "core_patch_apply"]);
+    assert.equal(workflowGateForModelRequest(events, 1)?.requiredNextAction, "exact-target-refresh-or-source-edit-or-bounded-blocker");
     assert.equal(events.some((event) =>
       event.kind === "model.tool.result" &&
-      event.data.toolName === "core.search.text" &&
+      event.data.toolName === "core.file.read" &&
       event.data.terminalKind === "capability.completed"
     ), true);
     assert.equal(events.some((event) =>
       event.kind === "model.tool.result" &&
-      event.data.toolName === "core.search.text" &&
+      event.data.toolName === "core.file.read" &&
       event.data.terminalKind === "workflow-required-action.rejected"
     ), false);
     assert.equal(await deps.platform.readFile("/workspace/README.md"), "changed evidence\n");
@@ -149,6 +149,593 @@ describe("mutation repair routing", () => {
 
     assert.deepEqual(gateway.visibleToolNamesForRequest(0), ["core_file_read"]);
     assert.deepEqual(gateway.visibleToolNamesForRequest(1), ["core_file_edit"]);
+    await kernel.shutdown();
+  });
+
+  it("keeps a non-empty focused search open for a bounded source read", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await deps.platform.writeFile("/workspace/README.md", "stage evidence\nmore local context\n");
+    const gateway = new SequentialToolCallModelGateway([
+      { id: "call-hidden-search", name: "core.search.text", input: { pattern: "stage evidence", glob: "README.md" } },
+      { id: "call-focused-search", name: "core.search.text", input: { pattern: "stage evidence", glob: "README.md" } },
+      { id: "call-focused-read", name: "core.file.read", input: { path: "README.md", offset: 0, limit: 20 } },
+      { id: "call-real-edit", name: "core.file.edit", input: { path: "README.md", expected: "stage evidence", replacement: "changed evidence" } }
+    ]);
+    const loopDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
+    await registerRuntimeCoreTools(loopDeps, "/workspace");
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "use one focused search for missing mutation context, then edit",
+      caller: "runtime.mutation-repair-routing.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      toolProjection: "safe-all",
+      profilePolicy: officialDiagnosticMutationPolicy(),
+      limits: { maxModelIterations: 7, maxToolCalls: 9 }
+    }));
+
+    assert.deepEqual(gateway.visibleToolNamesForRequest(0), ["core_file_edit", "core_patch_apply"]);
+    assert.equal(events.some((event) =>
+      event.kind === "capability.started" &&
+      event.data.toolCallId === "call-hidden-search"
+    ), false);
+    assert.equal(events.some((event) =>
+      event.kind === "model.tool.result" &&
+      event.data.toolCallId === "call-hidden-search" &&
+      String(event.data.terminalKind ?? "").endsWith(".rejected")
+    ), true);
+    assert.equal(events.some((event) =>
+      event.kind === "workflow.stage-evidence.window.opened" &&
+      event.data.targetPath === "README.md"
+    ), true);
+    assert.match(requestMessagesText(gateway.requests[1]), /WORKFLOW_FOCUSED_EVIDENCE_WINDOW_OPENED/);
+    assert.match(requestMessagesText(gateway.requests[1]), /Target scope: README\.md/);
+    assert.match(requestMessagesText(gateway.requests[1]), /reissue the rejected focused request/i);
+    assert.deepEqual(gateway.visibleToolNamesForRequest(1), ["core_file_edit", "core_file_read", "core_patch_apply", "core_search_text"]);
+    const focusedSearch = events.find((event) =>
+      event.kind === "model.tool.result" &&
+      event.data.toolCallId === "call-focused-search"
+    );
+    assert.equal(focusedSearch?.data.terminalKind, "capability.completed");
+    assert.match(String(focusedSearch?.data.result ?? ""), /README\.md:1:\s*stage evidence/);
+    assert.equal(events.some((event) =>
+      event.kind === "workflow.stage-evidence.accepted" &&
+      event.data.capabilityId === "core.search.text"
+    ), true);
+    assert.equal(events.some((event) =>
+      event.kind === "model.tool.result" &&
+      event.data.toolCallId === "call-focused-read" &&
+      event.data.terminalKind === "capability.completed"
+    ), true);
+    assert.deepEqual(gateway.visibleToolNamesForRequest(2), ["core_file_edit", "core_file_read", "core_patch_apply", "core_search_text"]);
+    assert.equal(await deps.platform.readFile("/workspace/README.md"), "changed evidence\nmore local context\n");
+    await kernel.shutdown();
+  });
+
+  it("allows a third focused operation to refresh prior accepted source evidence", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await deps.platform.writeFile("/workspace/src/entry.py", "from .dependency import transform\n\ndef run(value):\n    return value\n");
+    await deps.platform.writeFile("/workspace/src/dependency.py", Array.from({ length: 260 }, (_, index) =>
+      index === 220 ? "def transform(value):" : `# dependency line ${index + 1}`
+    ).join("\n") + "\n");
+    const gateway = new SequentialToolCallModelGateway([
+      { id: "call-understand-entry", name: "core.file.read", input: { path: "src/entry.py", offset: 0, limit: 20 } },
+      { id: "call-hidden-dependency", name: "core.file.read", input: { path: "src/dependency.py", offset: 0, limit: 120 } },
+      { id: "call-dependency-first", name: "core.file.read", input: { path: "src/dependency.py", offset: 0, limit: 120 } },
+      { id: "call-dependency-second", name: "core.file.read", input: { path: "src/dependency.py", offset: 120, limit: 120 } },
+      { id: "call-entry-refresh", name: "core.file.read", input: { path: "src/entry.py", offset: 0, limit: 20 } },
+      { id: "call-real-edit", name: "core.file.edit", input: { path: "src/entry.py", expected: "    return value", replacement: "    return transform(value)" } }
+    ]);
+    const loopDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
+    await registerRuntimeCoreTools(loopDeps, "/workspace");
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "inspect a dependency and refresh the accepted mutation target before editing",
+      caller: "runtime.mutation-repair-routing.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      toolProjection: "safe-all",
+      profilePolicy: readThenMutationPolicy(),
+      limits: { maxModelIterations: 9, maxToolCalls: 12 }
+    }));
+
+    assert.equal(events.some((event) =>
+      event.kind === "model.tool.result" &&
+      event.data.toolCallId === "call-entry-refresh" &&
+      event.data.terminalKind === "capability.completed"
+    ), true);
+    assert.equal(events.some((event) =>
+      event.kind === "workflow.stage-evidence.accepted" &&
+      event.data.toolCallId === "call-entry-refresh" &&
+      event.data.acceptedOperations === 3
+    ), true);
+    assert.match(await deps.platform.readFile("/workspace/src/entry.py"), /return transform\(value\)/);
+    await kernel.shutdown();
+  });
+
+  it("keeps novel dependency evidence reachable after a path-scoped search and target refresh", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await deps.platform.writeFile("/workspace/astropy/io/ascii/rst.py", [
+      "from .fixedwidth import FixedWidth, FixedWidthData",
+      "",
+      "class SimpleRSTData(FixedWidthData):",
+      "    start_line = 3",
+      "",
+      "class RST(FixedWidth):",
+      "    def __init__(self, header_rows=None):",
+      "        super().__init__(header_rows=header_rows)",
+      ""
+    ].join("\n"));
+    await deps.platform.writeFile("/workspace/astropy/io/ascii/fixedwidth.py", Array.from({ length: 490 }, (_, index) => {
+      if (index === 344) return "        header_rows=None,";
+      if (index === 346) return "        if header_rows is None:";
+      if (index === 347) return "            header_rows = [\"name\"]";
+      if (index === 355) return "        if self.data.start_line is None:";
+      if (index === 356) return "            self.data.start_line = len(header_rows)";
+      if (index === 476) return "        header_rows=None,";
+      if (index === 486) return "            position_line = len(self.header.header_rows)";
+      return `# fixedwidth line ${index + 1}`;
+    }).join("\n") + "\n");
+    await deps.platform.writeFile("/workspace/astropy/io/ascii/unrelated.py", "header_rows = ['unrelated']\n");
+    const gateway = new SequentialToolCallModelGateway([
+      { id: "call-understand-rst", name: "core.file.read", input: { path: "astropy/io/ascii/rst.py", offset: 0, limit: 200 } },
+      { id: "call-hidden-dependency", name: "core.file.read", input: { path: "astropy/io/ascii/fixedwidth.py", offset: 0, limit: 200 } },
+      { id: "call-dependency-prefix", name: "core.file.read", input: { path: "astropy/io/ascii/fixedwidth.py", offset: 0, limit: 200 } },
+      { id: "call-focused-path-search", name: "core.search.text", input: { pattern: "header_rows", path: "astropy/io/ascii/fixedwidth.py" } },
+      { id: "call-rst-refresh", name: "core.file.read", input: { path: "astropy/io/ascii/rst.py" } },
+      { id: "call-dependency-continuation", name: "core.file.read", input: { path: "astropy/io/ascii/fixedwidth.py", limitBytes: 5_000 } },
+      { id: "call-real-edit", name: "core.file.edit", input: { path: "astropy/io/ascii/rst.py", expected: "        super().__init__(header_rows=header_rows)", replacement: "        super().__init__(header_rows=header_rows)\n        self.data.start_line = 2 + len(self.header.header_rows)" } }
+    ]);
+    const loopDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
+    await registerRuntimeCoreTools(loopDeps, "/workspace");
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+    const basePolicy = readThenMutationPolicyWithPatch();
+
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "inspect the direct base class behavior before applying the incremental subclass repair",
+      caller: "runtime.mutation-repair-routing.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      toolProjection: "safe-all",
+      profilePolicy: {
+        ...basePolicy,
+        workflowGovernanceMode: "evaluation",
+        workflowCapabilityIds: [...(basePolicy.workflowCapabilityIds ?? []), "core.search.text"]
+      },
+      limits: {
+        maxModelIterations: 10,
+        maxToolCalls: 14,
+        stageBudgets: [{ stageId: "stage:understand", maxModelIterations: 10, maxToolCalls: 12 }]
+      }
+    }));
+
+    const focusedSearch = events.find((event) =>
+      event.kind === "model.tool.result" && event.data.toolCallId === "call-focused-path-search"
+    );
+    assert.match(String(focusedSearch?.data.result ?? ""), /fixedwidth\.py:345:/);
+    assert.doesNotMatch(String(focusedSearch?.data.result ?? ""), /unrelated\.py/);
+    assert.equal(events.some((event) =>
+      event.kind === "model.tool.result" &&
+      event.data.toolCallId === "call-dependency-continuation" &&
+      event.data.terminalKind === "capability.completed"
+    ), true);
+    const continuationRange = events
+      .filter((event) => event.kind === "workflow.stage-evidence.accepted")
+      .find((event) => event.data.toolCallId === "call-dependency-continuation")
+      ?.data.coveredReadRanges as JsonObject[] | undefined;
+    assert.equal(continuationRange?.some((range) => range.start === 0 && range.end === 399), true);
+    assert.match(await deps.platform.readFile("/workspace/astropy/io/ascii/rst.py"), /self\.data\.start_line = 2 \+ len/);
+    await kernel.shutdown();
+  });
+
+  it("allows a focused search in the direct parent directory of reviewed source targets", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await deps.platform.writeFile("/workspace/pkg/rst.py", "from .fixedwidth import FixedWidth\n\nclass RST(FixedWidth):\n    pass\n");
+    await deps.platform.writeFile("/workspace/pkg/fixedwidth.py", "class FixedWidth:\n    pass\n");
+    await deps.platform.writeFile("/workspace/other/unrelated.py", "class RST:\n    pass\n");
+    const gateway = new SequentialToolCallModelGateway([
+      { id: "call-understand-rst", name: "core.file.read", input: { path: "pkg/rst.py", offset: 0, limit: 20 } },
+      { id: "call-hidden-dependency", name: "core.file.read", input: { path: "pkg/fixedwidth.py", offset: 0, limit: 20 } },
+      { id: "call-dependency-read", name: "core.file.read", input: { path: "pkg/fixedwidth.py", offset: 0, limit: 20 } },
+      { id: "call-parent-search", name: "core.search.text", input: { pattern: "class RST", path: "pkg" } },
+      { id: "call-real-edit", name: "core.file.edit", input: { path: "pkg/rst.py", expected: "    pass", replacement: "    value = 1" } }
+    ]);
+    const loopDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
+    await registerRuntimeCoreTools(loopDeps, "/workspace");
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+    const basePolicy = readThenMutationPolicyWithPatch();
+
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "inspect a direct dependency and find the reviewed subclass in the same package before editing",
+      caller: "runtime.mutation-repair-routing.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      toolProjection: "safe-all",
+      profilePolicy: {
+        ...basePolicy,
+        workflowGovernanceMode: "evaluation",
+        workflowCapabilityIds: [...(basePolicy.workflowCapabilityIds ?? []), "core.search.text"]
+      },
+      limits: { maxModelIterations: 8, maxToolCalls: 12 }
+    }));
+
+    const parentSearch = events.find((event) =>
+      event.kind === "model.tool.result" && event.data.toolCallId === "call-parent-search"
+    );
+    assert.equal(parentSearch?.data.terminalKind, "capability.completed");
+    assert.match(String(parentSearch?.data.result ?? ""), /pkg\/rst\.py:3:/);
+    assert.doesNotMatch(String(parentSearch?.data.result ?? ""), /other\/unrelated\.py/);
+    assert.match(await deps.platform.readFile("/workspace/pkg/rst.py"), /value = 1/);
+    await kernel.shutdown();
+  });
+
+  it("allows a direct-parent glob that covers a reviewed related source target", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await deps.platform.writeFile("/workspace/pkg/rst.py", "from .fixedwidth import FixedWidth\n\nclass RST(FixedWidth):\n    pass\n");
+    await deps.platform.writeFile("/workspace/pkg/fixedwidth.py", "class FixedWidth:\n    pass\n");
+    await deps.platform.writeFile("/workspace/other/unrelated.py", "class RST:\n    pass\n");
+    const gateway = new SequentialToolCallModelGateway([
+      { id: "call-understand-rst", name: "core.file.read", input: { path: "pkg/rst.py", offset: 0, limit: 20 } },
+      { id: "call-hidden-dependency", name: "core.file.read", input: { path: "pkg/fixedwidth.py", offset: 0, limit: 20 } },
+      { id: "call-dependency-read", name: "core.file.read", input: { path: "pkg/fixedwidth.py", offset: 0, limit: 20 } },
+      { id: "call-related-glob-search", name: "core.search.text", input: { pattern: "class RST", glob: "pkg/**/*.py" } },
+      { id: "call-real-edit", name: "core.file.edit", input: { path: "pkg/rst.py", expected: "    pass", replacement: "    value = 1" } }
+    ]);
+    const loopDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
+    await registerRuntimeCoreTools(loopDeps, "/workspace");
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+    const basePolicy = readThenMutationPolicyWithPatch();
+
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "find a reviewed subclass through a package-scoped glob before editing",
+      caller: "runtime.mutation-repair-routing.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      toolProjection: "safe-all",
+      profilePolicy: {
+        ...basePolicy,
+        workflowGovernanceMode: "evaluation",
+        workflowCapabilityIds: [...(basePolicy.workflowCapabilityIds ?? []), "core.search.text"]
+      },
+      limits: { maxModelIterations: 8, maxToolCalls: 12 }
+    }));
+
+    const relatedSearch = events.find((event) =>
+      event.kind === "model.tool.result" && event.data.toolCallId === "call-related-glob-search"
+    );
+    assert.equal(relatedSearch?.data.terminalKind, "capability.completed");
+    assert.match(String(relatedSearch?.data.result ?? ""), /pkg\/rst\.py:3:/);
+    assert.doesNotMatch(String(relatedSearch?.data.result ?? ""), /other\/unrelated\.py/);
+    assert.match(await deps.platform.readFile("/workspace/pkg/rst.py"), /value = 1/);
+    await kernel.shutdown();
+  });
+
+  it("rejects a repository-wide glob during focused related-source evidence", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await deps.platform.writeFile("/workspace/pkg/rst.py", "from .fixedwidth import FixedWidth\n\nclass RST(FixedWidth):\n    pass\n");
+    await deps.platform.writeFile("/workspace/pkg/fixedwidth.py", "class FixedWidth:\n    pass\n");
+    const gateway = new SequentialToolCallModelGateway([
+      { id: "call-understand-rst", name: "core.file.read", input: { path: "pkg/rst.py", offset: 0, limit: 20 } },
+      { id: "call-hidden-dependency", name: "core.file.read", input: { path: "pkg/fixedwidth.py", offset: 0, limit: 20 } },
+      { id: "call-dependency-read", name: "core.file.read", input: { path: "pkg/fixedwidth.py", offset: 0, limit: 20 } },
+      { id: "call-broad-glob-search", name: "core.search.text", input: { pattern: "class RST", glob: "**/*.py" } },
+      { id: "call-real-edit", name: "core.file.edit", input: { path: "pkg/rst.py", expected: "    pass", replacement: "    value = 1" } }
+    ]);
+    const loopDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
+    await registerRuntimeCoreTools(loopDeps, "/workspace");
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+    const basePolicy = readThenMutationPolicyWithPatch();
+
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "reject repository-wide discovery and then edit the reviewed source",
+      caller: "runtime.mutation-repair-routing.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      toolProjection: "safe-all",
+      profilePolicy: {
+        ...basePolicy,
+        workflowGovernanceMode: "evaluation",
+        workflowCapabilityIds: [...(basePolicy.workflowCapabilityIds ?? []), "core.search.text"]
+      },
+      limits: { maxModelIterations: 8, maxToolCalls: 12 }
+    }));
+
+    const broadSearch = events.find((event) =>
+      event.kind === "model.tool.result" && event.data.toolCallId === "call-broad-glob-search"
+    );
+    assert.equal(broadSearch?.data.terminalKind, "workflow-stage-evidence-wrong-target.rejected");
+    assert.equal(events.some((event) =>
+      event.kind === "capability.started" && event.data.toolCallId === "call-broad-glob-search"
+    ), false);
+    assert.match(await deps.platform.readFile("/workspace/pkg/rst.py"), /value = 1/);
+    await kernel.shutdown();
+  });
+
+  it("closes focused evidence after glob variants return the same search matches", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await deps.platform.writeFile("/workspace/src/entry.py", "class Target:\n    value = 1\n");
+    const gateway = new SequentialToolCallModelGateway([
+      { id: "call-hidden-search", name: "core.search.text", input: { pattern: "class Target", glob: "src/*.py", contextLines: 0 } },
+      { id: "call-first-search", name: "core.search.text", input: { pattern: "class Target", glob: "src/*.py", contextLines: 0 } },
+      { id: "call-equivalent-search", name: "core.search.text", input: { pattern: "class Target", glob: "**/src/*.py", contextLines: 5 } },
+      { id: "call-third-search", name: "core.search.text", input: { pattern: "class Target", glob: "src/*.py", contextLines: 10 } },
+      { id: "call-real-edit", name: "core.file.edit", input: { path: "src/entry.py", expected: "    value = 1", replacement: "    value = 2" } }
+    ]);
+    const loopDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
+    await registerRuntimeCoreTools(loopDeps, "/workspace");
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "stop focused inspection when search variants return equivalent source evidence",
+      caller: "runtime.mutation-repair-routing.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      toolProjection: "safe-all",
+      profilePolicy: officialDiagnosticMutationPolicy(),
+      limits: { maxModelIterations: 8, maxToolCalls: 12 }
+    }));
+
+    assert.equal(events.filter((event) =>
+      event.kind === "workflow.stage-evidence.accepted" && event.data.capabilityId === "core.search.text"
+    ).length, 1);
+    assert.equal(events.some((event) =>
+      event.kind === "workflow.stage-evidence.window.closed" && event.data.reason === "duplicate"
+    ), true);
+    assert.equal(events.some((event) =>
+      event.kind === "capability.started" && event.data.toolCallId === "call-third-search"
+    ), false);
+    assert.match(await deps.platform.readFile("/workspace/src/entry.py"), /value = 2/);
+    await kernel.shutdown();
+  });
+
+  it("keeps the focused evidence window open for one same-target read range extension", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    const source = Array.from({ length: 360 }, (_, index) =>
+      index === 244 ? "target evidence" : `line ${index + 1}`
+    ).join("\n") + "\n";
+    await deps.platform.writeFile("/workspace/src/example.py", source);
+    const gateway = new SequentialToolCallModelGateway([
+      { id: "call-hidden-read", name: "core.file.read", input: { path: "src/example.py", offset: 160, limit: 80 } },
+      { id: "call-first-read", name: "core.file.read", input: { path: "src/example.py", offset: 160, limit: 80 } },
+      { id: "call-extended-read", name: "core.file.read", input: { path: "src/example.py", offset: 160, limit: 200 } },
+      { id: "call-duplicate-read", name: "core.file.read", input: { path: "src/example.py", offset: 160, limit: 200 } },
+      { id: "call-real-edit", name: "core.file.edit", input: { path: "src/example.py", expected: "target evidence", replacement: "changed evidence" } }
+    ]);
+    const loopDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
+    await registerRuntimeCoreTools(loopDeps, "/workspace");
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "extend one bounded read to reach the mutation target, then edit",
+      caller: "runtime.mutation-repair-routing.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      toolProjection: "safe-all",
+      profilePolicy: officialDiagnosticMutationPolicy(),
+      limits: { maxModelIterations: 8, maxToolCalls: 10 }
+    }));
+
+    assert.equal(events.some((event) =>
+      event.kind === "capability.started" &&
+      event.data.toolCallId === "call-hidden-read"
+    ), false);
+    assert.deepEqual(gateway.visibleToolNamesForRequest(1), ["core_file_edit", "core_file_read", "core_patch_apply", "core_search_text"]);
+    assert.deepEqual(gateway.visibleToolNamesForRequest(2), ["core_file_edit", "core_file_read", "core_patch_apply", "core_search_text"]);
+    assert.equal(events.some((event) =>
+      event.kind === "model.tool.result" &&
+      event.data.toolCallId === "call-extended-read" &&
+      event.data.terminalKind === "capability.completed"
+    ), true);
+    assert.deepEqual(gateway.visibleToolNamesForRequest(3), ["core_file_edit", "core_file_read", "core_patch_apply", "core_search_text"]);
+    assert.equal(events.some((event) =>
+      event.kind === "capability.started" &&
+      event.data.toolCallId === "call-duplicate-read"
+    ), false);
+    assert.match(await deps.platform.readFile("/workspace/src/example.py"), /changed evidence/);
+    await kernel.shutdown();
+  });
+
+  it("allows one bounded read of a directly imported relative dependency", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await deps.platform.writeFile("/workspace/pkg/entry.py", [
+      "from .dependency import transform",
+      "",
+      "def run(value):",
+      "    return value",
+      ""
+    ].join("\n"));
+    await deps.platform.writeFile("/workspace/pkg/dependency.py", [
+      "def transform(value):",
+      "    return value + 1",
+      ""
+    ].join("\n"));
+    const gateway = new SequentialToolCallModelGateway([
+      { id: "call-hidden-read", name: "core.file.read", input: { path: "pkg/entry.py" } },
+      { id: "call-entry-read", name: "core.file.read", input: { path: "pkg/entry.py" } },
+      { id: "call-dependency-read", name: "core.file.read", input: { path: "pkg/dependency.py" } },
+      { id: "call-real-edit", name: "core.file.edit", input: { path: "pkg/entry.py", expected: "    return value", replacement: "    return transform(value)" } }
+    ]);
+    const loopDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
+    await registerRuntimeCoreTools(loopDeps, "/workspace");
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "inspect the directly imported helper, then apply the source change",
+      caller: "runtime.mutation-repair-routing.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      toolProjection: "safe-all",
+      profilePolicy: officialDiagnosticMutationPolicy(),
+      limits: { maxModelIterations: 7, maxToolCalls: 9 }
+    }));
+
+    assert.equal(events.some((event) =>
+      event.kind === "model.tool.result" &&
+      event.data.toolCallId === "call-dependency-read" &&
+      event.data.terminalKind === "capability.completed"
+    ), true);
+    assert.equal(events.some((event) =>
+      event.kind === "workflow.stage-evidence.accepted" &&
+      event.data.toolCallId === "call-dependency-read" &&
+      event.data.acceptedOperations === 2
+    ), true);
+    assert.match(await deps.platform.readFile("/workspace/pkg/entry.py"), /return transform\(value\)/);
+    await kernel.shutdown();
+  });
+
+  it("closes the focused evidence window after an empty search", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await deps.platform.writeFile("/workspace/README.md", "stage evidence\n");
+    const gateway = new SequentialToolCallModelGateway([
+      { id: "call-hidden-search", name: "core.search.text", input: { pattern: "missing symbol", glob: "README.md" } },
+      { id: "call-empty-search", name: "core.search.text", input: { pattern: "missing symbol", glob: "README.md" } },
+      { id: "call-search-variant", name: "core.search.text", input: { pattern: "missing symbol", glob: "**/README.md", contextLines: 10 } },
+      { id: "call-real-edit", name: "core.file.edit", input: { path: "README.md", expected: "stage evidence", replacement: "changed evidence" } }
+    ]);
+    const loopDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
+    await registerRuntimeCoreTools(loopDeps, "/workspace");
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "stop searching after one focused search returns no source evidence",
+      caller: "runtime.mutation-repair-routing.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      toolProjection: "safe-all",
+      profilePolicy: officialDiagnosticMutationPolicy(),
+      limits: { maxModelIterations: 7, maxToolCalls: 9 }
+    }));
+
+    assert.equal(events.some((event) =>
+      event.kind === "model.tool.result" &&
+      event.data.toolCallId === "call-empty-search" &&
+      event.data.terminalKind === "capability.completed"
+    ), true);
+    assert.deepEqual(gateway.visibleToolNamesForRequest(2), ["core_file_edit", "core_patch_apply"]);
+    assert.equal(events.some((event) =>
+      event.kind === "capability.started" &&
+      event.data.toolCallId === "call-search-variant"
+    ), false);
+    assert.equal(await deps.platform.readFile("/workspace/README.md"), "changed evidence\n");
+    await kernel.shutdown();
+  });
+
+  it("rejects a fully covered focused read before execution", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await deps.platform.writeFile("/workspace/README.md", "stage evidence\nmore local context\n");
+    const gateway = new SequentialToolCallModelGateway([
+      { id: "call-hidden-read", name: "core.file.read", input: { path: "README.md", offset: 0, limit: 2 } },
+      { id: "call-first-read", name: "core.file.read", input: { path: "README.md", offset: 0, limit: 2 } },
+      { id: "call-duplicate-read", name: "core.file.read", input: { path: "README.md", offset: 0, limit: 2 } },
+      { id: "call-real-edit", name: "core.file.edit", input: { path: "README.md", expected: "stage evidence", replacement: "changed evidence" } }
+    ]);
+    const loopDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
+    await registerRuntimeCoreTools(loopDeps, "/workspace");
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "reject a duplicate bounded read, then edit",
+      caller: "runtime.mutation-repair-routing.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      toolProjection: "safe-all",
+      profilePolicy: officialDiagnosticMutationPolicy(),
+      limits: { maxModelIterations: 7, maxToolCalls: 9 }
+    }));
+
+    assert.equal(events.some((event) =>
+      event.kind === "capability.started" &&
+      event.data.toolCallId === "call-duplicate-read"
+    ), false);
+    assert.equal(events.some((event) =>
+      event.kind === "model.tool.result" &&
+      event.data.toolCallId === "call-duplicate-read" &&
+      event.data.terminalKind === "workflow-stage-evidence-duplicate.rejected"
+    ), true);
+    assert.equal(events.some((event) =>
+      event.kind === "workflow.stage-evidence.window.closed" &&
+      event.data.reason === "duplicate"
+    ), true);
+    assert.deepEqual(gateway.visibleToolNamesForRequest(3), ["core_file_edit", "core_patch_apply"]);
+    assert.equal(await deps.platform.readFile("/workspace/README.md"), "changed evidence\nmore local context\n");
+    await kernel.shutdown();
+  });
+
+  it("applies the focused evidence window to standard primary staged workflows", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await deps.platform.writeFile("/workspace/README.md", "stage evidence\n");
+    const gateway = new SequentialToolCallModelGateway([
+      { id: "call-hidden-read", name: "core.file.read", input: { path: "README.md", offset: 0, limit: 1 } },
+      { id: "call-focused-read", name: "core.file.read", input: { path: "README.md", offset: 0, limit: 1 } },
+      { id: "call-real-edit", name: "core.file.edit", input: { path: "README.md", expected: "stage evidence", replacement: "changed evidence" } }
+    ]);
+    const loopDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
+    await registerRuntimeCoreTools(loopDeps, "/workspace");
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+    const profilePolicy = officialDiagnosticMutationPolicy();
+
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "use generic staged recovery outside evaluation mode",
+      caller: "runtime.mutation-repair-routing.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      toolProjection: "safe-all",
+      profilePolicy: { ...profilePolicy, workflowGovernanceMode: "standard" },
+      limits: { maxModelIterations: 6, maxToolCalls: 8 }
+    }));
+
+    assert.equal(events.some((event) => event.kind === "workflow.stage-evidence.window.opened"), true);
+    assert.deepEqual(gateway.visibleToolNamesForRequest(1), ["core_file_edit", "core_file_read", "core_patch_apply", "core_search_text"]);
+    assert.equal(await deps.platform.readFile("/workspace/README.md"), "changed evidence\n");
+    await kernel.shutdown();
+  });
+
+  it("normalizes focused unbounded reads into two bounded source windows", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    const source = Array.from({ length: 420 }, (_, index) =>
+      index === 244 ? "target evidence" : `line ${index + 1}`
+    ).join("\n") + "\n";
+    await deps.platform.writeFile("/workspace/src/example.py", source);
+    const gateway = new SequentialToolCallModelGateway([
+      { id: "call-hidden-read", name: "core.file.read", input: { path: "src/example.py" } },
+      { id: "call-first-read", name: "core.file.read", input: { path: "src/example.py" } },
+      { id: "call-second-read", name: "core.file.read", input: { path: "src/example.py", offset: 200 } },
+      { id: "call-real-edit", name: "core.file.edit", input: { path: "src/example.py", expected: "target evidence", replacement: "changed evidence" } }
+    ]);
+    const loopDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
+    await registerRuntimeCoreTools(loopDeps, "/workspace");
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "normalize missing read bounds while gathering focused mutation evidence",
+      caller: "runtime.mutation-repair-routing.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      toolProjection: "safe-all",
+      profilePolicy: officialDiagnosticMutationPolicy(),
+      limits: { maxModelIterations: 7, maxToolCalls: 9 }
+    }));
+
+    const acceptedRanges = events
+      .filter((event) => event.kind === "workflow.stage-evidence.accepted")
+      .flatMap((event) => Array.isArray(event.data.coveredReadRanges) ? event.data.coveredReadRanges : []) as JsonObject[];
+    assert.deepEqual(acceptedRanges.map((range) => [range.start, range.end]), [[0, 199], [0, 399]]);
+    assert.equal(await deps.platform.readFile("/workspace/src/example.py").then((content) => content.includes("changed evidence")), true);
     await kernel.shutdown();
   });
 
@@ -198,7 +785,7 @@ describe("mutation repair routing", () => {
     const gateway = new SequentialToolCallModelGateway([
       { id: "call-extra-read", name: "core.file.read", input: { path: "README.md" } },
       { id: "call-edit-stale-1", name: "core.file.edit", input: staleEdit },
-      { id: "call-repair-read-1", name: "core.file.read", input: { path: "README.md" } },
+      { id: "call-repair-read-1", name: "core.file.read", input: { path: "README.md", offset: 0, limit: 20 } },
       { id: "call-edit-stale-2", name: "core.file.edit", input: staleEdit },
       { id: "call-repair-read-2", name: "core.file.read", input: { path: "README.md" } },
       { id: "call-edit-stale-3", name: "core.file.edit", input: staleEdit }
@@ -273,7 +860,7 @@ describe("mutation repair routing", () => {
     const staleEdit = { path: "README.md", expected: "missing evidence", replacement: "changed evidence" };
     const gateway = new SequentialToolCallModelGateway([
       { id: "call-edit-stale-1", name: "core.file.edit", input: staleEdit },
-      { id: "call-refresh", name: "core.file.read", input: { path: "README.md" } },
+      { id: "call-refresh", name: "core.file.read", input: { path: "README.md", offset: 0, limit: 20 } },
       { id: "call-edit-stale-2", name: "core.file.edit", input: staleEdit },
       { id: "call-edit-stale-3", name: "core.file.edit", input: staleEdit }
     ]);
@@ -307,7 +894,7 @@ describe("mutation repair routing", () => {
     await deps.platform.writeFile("/workspace/README.md", "stage evidence\n");
     const gateway = new SequentialToolCallModelGateway([
       { id: "call-edit-stale-1", name: "core.file.edit", input: { path: "README.md", expected: "missing one", replacement: "changed evidence" } },
-      { id: "call-repair-read", name: "core.file.read", input: { path: "README.md" } },
+      { id: "call-repair-read", name: "core.file.read", input: { path: "README.md", offset: 0, limit: 20 } },
       { id: "call-edit-stale-2", name: "core.file.edit", input: { path: "README.md", expected: "missing two", replacement: "changed evidence" } },
       { id: "call-edit-stale-3", name: "core.file.edit", input: { path: "README.md", expected: "missing three", replacement: "changed evidence" } },
       { id: "call-edit-fresh", name: "core.file.edit", input: { path: "README.md", expected: "stage evidence", replacement: "changed evidence" } }
@@ -328,10 +915,10 @@ describe("mutation repair routing", () => {
     }));
 
     assert.deepEqual(gateway.visibleToolNamesForRequest(0), ["core_file_edit"]);
-    assert.deepEqual(gateway.visibleToolNamesForRequest(1), ["core_file_edit", "core_file_read", "core_search_text"]);
-    assert.deepEqual(gateway.visibleToolNamesForRequest(3), ["core_file_edit"]);
-    assert.equal(workflowGateForModelRequest(events, 1)?.requiredNextAction, "focused-read-or-source-edit-or-bounded-blocker");
-    assert.equal(workflowGateForModelRequest(events, 3)?.requiredNextAction, "core.file.edit");
+    assert.deepEqual(gateway.visibleToolNamesForRequest(1), ["core_file_edit", "core_file_read", "core_patch_apply"]);
+    assert.deepEqual(gateway.visibleToolNamesForRequest(3), ["core_file_edit", "core_file_read", "core_patch_apply"]);
+    assert.equal(workflowGateForModelRequest(events, 1)?.requiredNextAction, "exact-target-refresh-or-source-edit-or-bounded-blocker");
+    assert.equal(workflowGateForModelRequest(events, 3)?.requiredNextAction, "exact-target-refresh-or-source-edit-or-bounded-blocker");
     assert.equal(events.some((event) =>
       event.kind === "model.tool.result" &&
       event.data.toolName === "core.file.edit" &&
@@ -341,12 +928,12 @@ describe("mutation repair routing", () => {
     await kernel.shutdown();
   });
 
-  it("requires patch-capable recovery after multiple distinct stale exact edits", async () => {
+  it("keeps exact-target recovery after multiple distinct stale exact edits", async () => {
     const deps = createDeterministicRuntimeDependencies();
     await deps.platform.writeFile("/workspace/README.md", "stage evidence\n");
     const gateway = new SequentialToolCallModelGateway([
       { id: "call-edit-stale-1", name: "core.file.edit", input: { path: "README.md", expected: "missing one", replacement: "changed evidence" } },
-      { id: "call-refresh", name: "core.file.read", input: { path: "README.md" } },
+      { id: "call-refresh", name: "core.file.read", input: { path: "README.md", offset: 0, limit: 20 } },
       { id: "call-edit-stale-2", name: "core.file.edit", input: { path: "README.md", expected: "missing two", replacement: "changed evidence" } },
       { id: "call-edit-stale-3", name: "core.file.edit", input: { path: "README.md", expected: "missing three", replacement: "changed evidence" } }
     ]);
@@ -365,27 +952,25 @@ describe("mutation repair routing", () => {
       limits: { maxModelIterations: 6, maxToolCalls: 8 }
     }));
 
-    assert.equal(workflowGateForModelRequest(events, 3)?.requiredNextAction, "core.patch.apply|core.file.edit");
-    assert.deepEqual(gateway.visibleToolNamesForRequest(3), ["core_file_edit", "core_patch_apply"]);
+    assert.equal(workflowGateForModelRequest(events, 3)?.requiredNextAction, "exact-target-refresh-or-source-edit-or-bounded-blocker");
+    assert.deepEqual(gateway.visibleToolNamesForRequest(3), ["core_file_edit", "core_file_read", "core_patch_apply"]);
     await kernel.shutdown();
   });
 
-  it("requires patch-only recovery after repeated distinct stale exact edits", async () => {
+  it("fails closed after repeating an exact-target refresh", async () => {
     const deps = createDeterministicRuntimeDependencies();
     await deps.platform.writeFile("/workspace/README.md", "stage evidence\n");
     const gateway = new SequentialToolCallModelGateway([
       { id: "call-edit-stale-1", name: "core.file.edit", input: { path: "README.md", expected: "missing one", replacement: "changed evidence" } },
-      { id: "call-refresh", name: "core.file.read", input: { path: "README.md" } },
-      { id: "call-edit-stale-2", name: "core.file.edit", input: { path: "README.md", expected: "missing two", replacement: "changed evidence" } },
-      { id: "call-edit-stale-3", name: "core.file.edit", input: { path: "README.md", expected: "missing three", replacement: "changed evidence" } },
-      { id: "call-edit-stale-4", name: "core.file.edit", input: { path: "README.md", expected: "missing four", replacement: "changed evidence" } }
+      { id: "call-refresh", name: "core.file.read", input: { path: "README.md", offset: 0, limit: 20 } },
+      { id: "call-refresh-again", name: "core.file.read", input: { path: "README.md", offset: 0, limit: 20 } }
     ]);
     const loopDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
     await registerRuntimeCoreTools(loopDeps, "/workspace");
     const kernel = await createDefaultRuntimeKernel(loopDeps);
 
     const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
-      prompt: "switch to patch-only after repeated stale exact edits",
+      prompt: "fail closed after repeating the one-shot exact-target refresh",
       caller: "runtime.mutation-repair-routing.test",
       workspaceRoot: "/workspace",
       outputMode: "jsonl",
@@ -395,12 +980,12 @@ describe("mutation repair routing", () => {
       limits: { maxModelIterations: 7, maxToolCalls: 9 }
     }));
 
-    assert.equal(workflowGateForModelRequest(events, 4)?.requiredNextAction, "core.patch.apply");
-    assert.deepEqual(gateway.visibleToolNamesForRequest(4), ["core_patch_apply"]);
+    const repeatedRefresh = events.find((event) =>
+      event.kind === "model.tool.result" && event.data.toolCallId === "call-refresh-again"
+    );
+    assert.equal(repeatedRefresh?.data.terminalKind, "workflow-mutation-recovery-exhausted");
     assert.equal(events.some((event) =>
-      event.kind === "workflow.required-action.missed" &&
-      event.data.requestedCapabilityId === "core.file.edit" &&
-      event.data.iteration === 5
+      event.kind === "agent.loop.failed" && event.data.reason === "flow-mutation-recovery-exhausted"
     ), true);
     await kernel.shutdown();
   });
@@ -409,12 +994,8 @@ describe("mutation repair routing", () => {
     const deps = createDeterministicRuntimeDependencies();
     await deps.platform.writeFile("/workspace/README.md", "stage evidence\n");
     const gateway = new SequentialToolCallModelGateway([
-      { id: "call-edit-stale-1", name: "core.file.edit", input: { path: "README.md", expected: "missing one", replacement: "changed evidence" } },
-      { id: "call-refresh", name: "core.file.read", input: { path: "README.md" } },
-      { id: "call-edit-stale-2", name: "core.file.edit", input: { path: "README.md", expected: "missing two", replacement: "changed evidence" } },
-      { id: "call-edit-stale-3", name: "core.file.edit", input: { path: "README.md", expected: "missing three", replacement: "changed evidence" } },
       { id: "call-patch-stale", name: "core.patch.apply", input: { patch: "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-missing patch\n+changed evidence\n" } },
-      { id: "call-read-after-patch-failure", name: "core.file.read", input: { path: "README.md" } },
+      { id: "call-read-after-patch-failure", name: "core.file.read", input: { path: "README.md", offset: 0, limit: 20 } },
       { id: "call-edit-fresh", name: "core.file.edit", input: { path: "README.md", expected: "stage evidence", replacement: "changed evidence" } }
     ]);
     const loopDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
@@ -432,10 +1013,8 @@ describe("mutation repair routing", () => {
       limits: { maxModelIterations: 9, maxToolCalls: 10 }
     }));
 
-    assert.equal(workflowGateForModelRequest(events, 4)?.requiredNextAction, "core.patch.apply");
-    assert.deepEqual(gateway.visibleToolNamesForRequest(4), ["core_patch_apply"]);
-    assert.equal(workflowGateForModelRequest(events, 5)?.requiredNextAction, "focused-read-or-source-edit-or-bounded-blocker");
-    assert.deepEqual(gateway.visibleToolNamesForRequest(5), ["core_file_edit", "core_file_read", "core_search_text"]);
+    assert.equal(workflowGateForModelRequest(events, 1)?.requiredNextAction, "focused-read-or-source-edit-or-bounded-blocker");
+    assert.deepEqual(gateway.visibleToolNamesForRequest(1), ["core_file_edit", "core_file_read", "core_patch_apply", "core_search_text"]);
     assert.equal(events.some((event) =>
       event.kind === "model.tool.result" &&
       event.data.toolName === "core.file.read" &&
@@ -455,10 +1034,10 @@ describe("mutation repair routing", () => {
     await deps.platform.writeFile("/workspace/README.md", "stage evidence\n");
     const gateway = new SequentialToolCallModelGateway([
       { id: "call-edit-stale-1", name: "core.file.edit", input: { path: "README.md", expected: "missing one", replacement: "changed evidence" } },
-      { id: "call-refresh", name: "core.file.read", input: { path: "README.md" } },
+      { id: "call-refresh", name: "core.file.read", input: { path: "README.md", offset: 0, limit: 20 } },
       { id: "call-edit-stale-2", name: "core.file.edit", input: { path: "README.md", expected: "missing two", replacement: "changed evidence" } },
       { id: "call-patch-stale", name: "core.patch.apply", input: { patch: "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-missing patch\n+changed evidence\n" } },
-      { id: "call-refresh-after-patch", name: "core.file.read", input: { path: "README.md" } },
+      { id: "call-refresh-after-patch", name: "core.file.read", input: { path: "README.md", offset: 0, limit: 20 } },
       { id: "call-edit-stale-3", name: "core.file.edit", input: { path: "README.md", expected: "missing three", replacement: "changed evidence" } },
       { id: "call-patch-stale-2", name: "core.patch.apply", input: { patch: "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-missing patch again\n+changed evidence\n" } },
       { id: "call-edit-stale-4", name: "core.file.edit", input: { path: "README.md", expected: "missing four", replacement: "changed evidence" } }
@@ -807,8 +1386,8 @@ describe("mutation repair routing", () => {
       limits: { maxModelIterations: 5, maxToolCalls: 7 }
     }));
 
-    assert.equal(workflowGateForModelRequest(events, 2)?.requiredNextAction, "core.patch.apply|core.file.edit");
-    assert.deepEqual(gateway.visibleToolNamesForRequest(2), ["core_file_edit", "core_patch_apply"]);
+    assert.equal(workflowGateForModelRequest(events, 2)?.requiredNextAction, "exact-target-refresh-or-source-edit-or-bounded-blocker");
+    assert.deepEqual(gateway.visibleToolNamesForRequest(2), ["core_file_edit", "core_file_read", "core_patch_apply"]);
     assert.equal(events.some((event) =>
       event.kind === "workflow.required-action.missed" &&
       event.data.requestedCapabilityId === "core.search.text" &&
@@ -917,22 +1496,9 @@ describe("mutation repair routing", () => {
     );
     const gateway = new SequentialToolCallModelGateway([
       { id: "call-large-stale-edit", name: "core.file.edit", input: { path: "separable.py", expected: "def _missing_cstack():\n    pass", replacement: correctedBlock } },
-      { id: "call-full-read-1", name: "core.file.read", input: { path: "separable.py" } },
       { id: "call-refresh-read-1", name: "core.file.read", input: { path: "separable.py", offset: 0, limit: 20 } },
-      { id: "call-noop-edit", name: "core.file.edit", input: { path: "separable.py", expected: "placeholder", replacement: "placeholder" } },
-      { id: "call-stale-edit-1", name: "core.file.edit", input: { path: "separable.py", expected: "missing evidence", replacement: correctedBlock } },
-      { id: "call-placeholder-edit", name: "core.file.edit", input: { path: "separable.py", expected: currentBlock, replacement: "PLACEHOLDER" } },
-      { id: "call-stale-edit-2", name: "core.file.edit", input: { path: "separable.py", expected: "missing evidence", replacement: correctedBlock } },
-      {
-        id: "call-stale-patch",
-        name: "core.patch.apply",
-        input: {
-          patch: "--- a/separable.py\n+++ b/separable.py\n@@ -99,3 +99,3 @@\n-missing evidence\n+changed evidence\n"
-        }
-      },
-      { id: "call-full-read-2", name: "core.file.read", input: { path: "separable.py" } },
-      { id: "call-refresh-read-2", name: "core.file.read", input: { path: "separable.py", offset: 0, limit: 20 } },
       { id: "call-stale-expected-edit", name: "core.file.edit", input: { path: "separable.py", expected: staleExpectedBlock, replacement: correctedBlock } },
+      { id: "call-refresh-read-2", name: "core.file.read", input: { path: "separable.py", offset: 0, limit: 20 } },
       { id: "call-fresh-edit", name: "core.file.edit", input: { path: "separable.py", expected: currentBlock, replacement: correctedBlock } }
     ]);
     const loopDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
@@ -1156,7 +1722,7 @@ describe("mutation repair routing", () => {
     await deps.platform.writeFile("/workspace/README.md", "stage evidence\n");
     const gateway = new SequentialToolCallModelGateway([
       { id: "call-stale-edit", name: "core.file.edit", input: { path: "README.md", expected: "missing evidence", replacement: "changed evidence" } },
-      { id: "call-refresh-search", name: "core.search.text", input: { pattern: "stage evidence", glob: "README.md", outputMode: "content", contextLines: 1 } },
+      { id: "call-refresh-read", name: "core.file.read", input: { path: "README.md", offset: 0, limit: 20 } },
       { id: "call-real-edit", name: "core.file.edit", input: { path: "README.md", expected: "stage evidence", replacement: "changed evidence" } }
     ]);
     const loopDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
@@ -1174,11 +1740,11 @@ describe("mutation repair routing", () => {
       limits: { maxModelIterations: 5, maxToolCalls: 7 }
     }));
 
-    assert.equal(workflowGateForModelRequest(events, 1)?.requiredNextAction, "focused-read-or-source-edit-or-bounded-blocker");
-    assert.deepEqual(gateway.visibleToolNamesForRequest(1), ["core_file_edit", "core_file_read", "core_search_text"]);
+    assert.equal(workflowGateForModelRequest(events, 1)?.requiredNextAction, "exact-target-refresh-or-source-edit-or-bounded-blocker");
+    assert.deepEqual(gateway.visibleToolNamesForRequest(1), ["core_file_edit", "core_file_read", "core_patch_apply"]);
     assert.equal(events.some((event) =>
       event.kind === "model.tool.result" &&
-      event.data.toolName === "core.search.text" &&
+      event.data.toolName === "core.file.read" &&
       event.data.terminalKind === "capability.completed"
     ), true);
     assert.equal(await deps.platform.readFile("/workspace/README.md"), "changed evidence\n");
@@ -1210,7 +1776,7 @@ describe("mutation repair routing", () => {
     }));
 
     assert.equal(workflowGateForModelRequest(events, 2)?.requiredNextAction, "focused-read-or-source-edit-or-bounded-blocker");
-    assert.deepEqual(gateway.visibleToolNamesForRequest(2), ["core_file_edit", "core_file_read", "core_search_text"]);
+    assert.deepEqual(gateway.visibleToolNamesForRequest(2), ["core_file_edit", "core_file_read", "core_patch_apply", "core_search_text"]);
     assert.equal(events.some((event) =>
       event.kind === "model.tool.result" &&
       event.data.toolName === "core.search.text" &&
@@ -1376,6 +1942,7 @@ describe("mutation repair routing", () => {
       { id: "call-placeholder-edit", name: "core.file.edit", input: { path: "README.md", expected: "placeholder", replacement: "placeholder" } },
       { id: "call-refresh", name: "core.file.read", input: { path: "README.md" } },
       { id: "call-stale-edit", name: "core.file.edit", input: { path: "README.md", expected: "missing evidence", replacement: "changed evidence" } },
+      { id: "call-exact-refresh", name: "core.file.read", input: { path: "README.md", offset: 0, limit: 20 } },
       { id: "call-noop-after-nearest", name: "core.file.edit", input: { path: "README.md", expected: "stage evidence", replacement: "stage evidence" } },
       { id: "call-real-edit", name: "core.file.edit", input: { path: "README.md", expected: "stage evidence", replacement: "changed evidence" } }
     ]);
@@ -1398,8 +1965,8 @@ describe("mutation repair routing", () => {
       event.kind === "agent.loop.failed" &&
       event.data.reason === "workflow-mutation-input-stalled"
     ), false);
-    assert.equal(workflowGateForModelRequest(events, 4)?.requiredNextAction, "core.patch.apply|core.file.edit");
-    assert.deepEqual(gateway.visibleToolNamesForRequest(4), ["core_file_edit", "core_patch_apply"]);
+    assert.equal(workflowGateForModelRequest(events, 5)?.requiredNextAction, "core.patch.apply|core.file.edit");
+    assert.deepEqual(gateway.visibleToolNamesForRequest(5), ["core_file_edit", "core_patch_apply"]);
     assert.equal(await deps.platform.readFile("/workspace/README.md"), "changed evidence\n");
     await kernel.shutdown();
   });
@@ -2078,6 +2645,50 @@ function reviewedEvidenceMutationPolicy(options: { readonly includeFocusedSearch
             diagnostics: []
           }
         ]
+      }
+    }
+  };
+}
+
+function officialDiagnosticMutationPolicy(): AgentLoopProfilePolicyMetadata {
+  const policy = reviewedEvidenceMutationPolicy({
+    includeFocusedSearch: true,
+    includePatch: true,
+    includeReadInChange: true
+  });
+  const workflow = policy.stagedTaskWorkflow!;
+  const diagnosticRef = {
+    schemaVersion: "1.0.0" as const,
+    refId: "ref:official-diagnostic",
+    type: "diagnostic" as const,
+    producerStageId: "stage:understand",
+    scope: "task" as const,
+    compatibility: { schemaVersion: "1.0.0" as const, minReaderVersion: "1.0.0" as const },
+    redaction: { class: "internal" as const }
+  };
+  return {
+    ...policy,
+    workflowGovernanceMode: "evaluation",
+    stagedTaskWorkflow: {
+      ...workflow,
+      refCount: workflow.refCount + 1,
+      graph: {
+        ...workflow.graph,
+        refs: [...workflow.graph.refs, diagnosticRef],
+        stages: workflow.graph.stages.map((stage) =>
+          stage.stageId === "stage:change"
+            ? { ...stage, inputRefs: [...stage.inputRefs, diagnosticRef.refId] }
+            : stage
+        )
+      },
+      runState: {
+        ...workflow.runState,
+        refs: [...workflow.runState.refs, diagnosticRef],
+        stageStates: workflow.runState.stageStates.map((stage) =>
+          stage.stageId === "stage:change"
+            ? { ...stage, inputRefs: [...stage.inputRefs, diagnosticRef.refId] }
+            : stage
+        )
       }
     }
   };

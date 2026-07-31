@@ -48,6 +48,83 @@ export function readyStageRequiredActionCorrectionMessage(
   };
 }
 
+export function officialRepairRequiredActionCorrectionMessage(
+  control: JsonObject | undefined,
+  correctionAttempt: number,
+  error: RedactedError
+): ModelChatMessage {
+  const stage = control ?? {};
+  const requiredNextAction = String(stage.requiredNextAction ?? "core.file.edit|core.patch.apply");
+  const progressCapabilityIds = Array.isArray(stage.progressCapabilityIds)
+    ? stage.progressCapabilityIds.map(String).join(", ")
+    : "core.file.edit, core.patch.apply";
+  const visibleFunctionNames = Array.isArray(stage.progressCapabilityIds)
+    ? stage.progressCapabilityIds.map((capabilityId) => safeToolFunctionName(String(capabilityId))).join(", ")
+    : "core_file_edit, core_patch_apply";
+  return {
+    role: "user",
+    content: [
+      "WORKFLOW_OFFICIAL_REPAIR_ACTION_REQUIRED.",
+      `Correction attempt: ${correctionAttempt}/${READY_STAGE_REQUIRED_ACTION_CORRECTION_LIMIT}.`,
+      `Active stage: ${String(stage.stageId ?? "unknown")}.`,
+      `Required next action: ${requiredNextAction}.`,
+      "Official harness repair evidence has already been projected into this stage; additional read/search/list calls are not progress.",
+      "Apply a minimal source mutation to the active code path that the failing behavior executes, or report a bounded blocker if the evidence is insufficient.",
+      "Do not add unused parallel classes, duplicate adapters, or code that is not wired into the registered runtime path.",
+      "When the failure is an unexpected keyword argument, update the receiving class/function or its forwarding path instead of only adding helper code.",
+      `Progress capabilities: ${progressCapabilityIds}.`,
+      `Visible function names: ${visibleFunctionNames}.`,
+      `Diagnostic: ${error.code}: ${error.message}`,
+      "Call one visible governed mutation tool now. Do not answer with text-only output for this stage."
+    ].join("\n")
+  };
+}
+
+export function mutationExactRefreshCorrectionMessage(
+  control: JsonObject | undefined,
+  targetPath: string,
+  error: RedactedError
+): ModelChatMessage {
+  const stage = control ?? {};
+  return {
+    role: "user",
+    content: [
+      "WORKFLOW_MUTATION_EXACT_REFRESH_REQUIRED.",
+      `Active stage: ${String(stage.stageId ?? "unknown")}.`,
+      `Exact refresh target: ${targetPath}.`,
+      "The exact-match edit precondition failed. One bounded core.file.read of this target is available before the next corrected edit or patch.",
+      "Do not read another path, search broadly, or request a second refresh.",
+      `Diagnostic: ${error.code}: ${error.message}`,
+      "Read the exact target with offset and limit, or apply a corrected source edit/patch now."
+    ].join("\n")
+  };
+}
+
+export function standardTestRepairRequiredActionCorrectionMessage(
+  control: JsonObject | undefined,
+  correctionAttempt: number,
+  error: RedactedError,
+  requiredNextActionOverride?: string
+): ModelChatMessage {
+  const stage = control ?? {};
+  const requiredNextAction = requiredNextActionOverride ?? String(stage.requiredNextAction ?? "core.file.edit|core.patch.apply|core.test.run");
+  return {
+    role: "user",
+    content: [
+      "WORKFLOW_STANDARD_TEST_REPAIR_ACTION_REQUIRED.",
+      `Correction attempt: ${correctionAttempt}/${READY_STAGE_REQUIRED_ACTION_CORRECTION_LIMIT}.`,
+      `Active stage: ${String(stage.stageId ?? "unknown")}.`,
+      `Required next action: ${requiredNextAction}.`,
+      "A standard repository test has already failed after the current source change, and focused repair context has already been refreshed.",
+      "Do not call read/search/list/glob again. The next action must either edit/patch the source using the refreshed context, rerun the narrow standard test, or report a bounded blocker.",
+      "Prefer core_file_edit or core_patch_apply when the failed test shows the current patch is wrong; use core_test_run only after a meaningful correction or when no correction is possible.",
+      "Visible function names: core_file_edit, core_patch_apply, core_test_run.",
+      `Diagnostic: ${error.code}: ${error.message}`,
+      "Call one visible governed tool now. Do not answer with text-only output for this stage."
+    ].join("\n")
+  };
+}
+
 export function readyStageRequiredActionMeaning(control: JsonObject | undefined): string {
   const stage = control ?? {};
   const stageKind = String(stage.stageKind ?? "");

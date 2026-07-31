@@ -109,12 +109,21 @@ function applyProviderCacheToolProjection(
   profilePolicy: AgentLoopProfilePolicyMetadata | undefined
 ): readonly CapabilityManifest[] {
   if (!profilePolicy) return capabilities;
+  if (shouldForceNarrowProviderToolsForWorkflowGate(profilePolicy)) {
+    return projectWorkflowGateOverrideTools(capabilities, profilePolicy.workflowGateOverride, {
+      preferCanonicalCoreActions: true,
+      strict: true
+    });
+  }
   const workflowBoundary = shouldProjectWorkflowBoundary(profilePolicy)
     ? workflowCapabilityBoundary(profilePolicy)
     : new Set<string>();
   if (profilePolicy.workflowGateOverride) {
+    const declaredWorkflowBoundary = workflowCapabilityBoundary(profilePolicy);
     for (const capabilityId of canonicalWorkflowGateCapabilityIds(profilePolicy.workflowGateOverride.requiredNextAction)) {
-      workflowBoundary.add(capabilityId);
+      if (capabilityId !== "core.shell.run" || declaredWorkflowBoundary.has(capabilityId)) {
+        workflowBoundary.add(capabilityId);
+      }
     }
   }
   const workflowCapabilities = capabilities.filter((manifest) => workflowBoundary.has(String(manifest.id)));
@@ -126,6 +135,15 @@ function applyProviderCacheToolProjection(
     });
   }
   return capabilities;
+}
+
+function shouldForceNarrowProviderToolsForWorkflowGate(profilePolicy: AgentLoopProfilePolicyMetadata): boolean {
+  const override = profilePolicy.workflowGateOverride;
+  if (!override) return false;
+  if (override.requiredNextAction === "exact-target-refresh-or-source-edit-or-bounded-blocker") return true;
+  if (override.terminalKind !== "workflow-official-repair.refreshed") return false;
+  const requiredActions = override.requiredNextAction.split("|").map((part) => part.trim()).filter(Boolean);
+  return requiredActions.length > 0 && requiredActions.every(isCanonicalSourceMutationAction);
 }
 
 function applyWorkflowGateToolProjection(
@@ -164,7 +182,11 @@ function projectProviderWorkflowGateOverrideTools(
 ): readonly CapabilityManifest[] {
   const override = profilePolicy.workflowGateOverride;
   if (!override) return capabilities;
-  const preferred = new Set(canonicalWorkflowGateCapabilityIds(override.requiredNextAction));
+  const workflowBoundary = workflowCapabilityBoundary(profilePolicy);
+  const preferred = new Set(
+    [...canonicalWorkflowGateCapabilityIds(override.requiredNextAction)]
+      .filter((capabilityId) => capabilityId !== "core.shell.run" || workflowBoundary.has(capabilityId))
+  );
   for (const capabilityId of providerWorkflowGateContextCapabilityIds(profilePolicy, override)) {
     preferred.add(capabilityId);
   }
@@ -182,9 +204,35 @@ function providerWorkflowGateContextCapabilityIds(
 ): readonly string[] {
   const workflowBoundary = workflowCapabilityBoundary(profilePolicy);
   if (!providerGateNeedsWorkflowContext(profilePolicy, override, workflowBoundary)) return [];
+  const focusedEvidenceRefreshBounded =
+    (
+      override.terminalKind === "workflow-standard-test-repair.refreshed" ||
+      override.terminalKind === "workflow-official-repair.refreshed"
+    ) &&
+    (
+      override.requiredNextAction === "source-edit-or-test-or-bounded-blocker" ||
+      override.requiredNextAction === "source-edit-or-test-or-blocker"
+    ) ||
+    (
+      override.terminalKind === "workflow-standard-test-repair.refreshed" &&
+      !workflowGateCapabilitySatisfies("core.file.read", override.requiredNextAction) &&
+      !workflowGateCapabilitySatisfies("core.search.text", override.requiredNextAction)
+    ) ||
+    (
+      override.terminalKind === "workflow-mutation-repair.refreshed" &&
+      !workflowGateCapabilitySatisfies("core.file.read", override.requiredNextAction) &&
+      !workflowGateCapabilitySatisfies("core.search.text", override.requiredNextAction)
+    ) ||
+    (
+      override.terminalKind === "workflow-official-repair.refreshed" &&
+      !workflowGateCapabilitySatisfies("core.file.read", override.requiredNextAction) &&
+      !workflowGateCapabilitySatisfies("core.search.text", override.requiredNextAction)
+    );
   return [...workflowBoundary].filter((capabilityId) =>
-    capabilityId === "core.file.read" ||
-    capabilityId === "core.search.text" ||
+    (!focusedEvidenceRefreshBounded && (
+      capabilityId === "core.file.read" ||
+      capabilityId === "core.search.text"
+    )) ||
     capabilityId === "core.file.edit" ||
     capabilityId === "core.git.diff" ||
     capabilityId === "core.test.run"
@@ -254,7 +302,10 @@ function activeReadyStageCapabilityBoundary(policy: AgentLoopProfilePolicyMetada
     readyState.status === "running" &&
     readyState.evaluation?.status === "needs-review"
   ) {
-    if (readyStageNeedsDiagnosticEvidenceReview(stage?.kind, readyState.inputRefs ?? [], workflow.runState.refs ?? [])) {
+    if (
+      readyState.outputRefs.length === 0 &&
+      readyStageNeedsDiagnosticEvidenceReview(stage?.kind, readyState.inputRefs ?? [], workflow.runState.refs ?? [])
+    ) {
       return progress;
     }
     if (readyStageOwnProgressShouldWin(stage?.kind, progress) && readyState.outputRefs.length === 0) {
@@ -264,6 +315,16 @@ function activeReadyStageCapabilityBoundary(policy: AgentLoopProfilePolicyMetada
     if (downstream.length > 0 || stage?.kind === "collect-evidence") {
       return new Set(downstream);
     }
+  }
+  if (
+    mode === "supervisor" &&
+    policy.workflowGovernanceMode === "evaluation" &&
+    (stage?.kind === "produce" || stage?.kind === "materialize" || stage?.kind === "repair") &&
+    readyStageHasDiagnosticInput(readyState.inputRefs ?? [], workflow.runState.refs ?? [])
+  ) {
+    const workflowCapabilityIds = expandAllowedToolIdsToCapabilityIds((policy.workflowCapabilityIds ?? []).map(String));
+    const supporting = focusedSourceRefreshCapabilityIds(workflowCapabilityIds);
+    return new Set([...progress, ...supporting]);
   }
   return progress;
 }
@@ -289,6 +350,15 @@ function activeReadyStageControlCapabilityBoundary(
     const supporting = supportingCapabilityIdsForWorkflowStage(stageKind, workflowCapabilityIds);
     return new Set([...progress, ...supporting]);
   }
+  if (
+    policy.workflowGovernanceMode === "evaluation" &&
+    (stageKind === "produce" || stageKind === "materialize" || stageKind === "repair") &&
+    readyStageControlHasDiagnosticInput(control)
+  ) {
+    const workflowCapabilityIds = expandAllowedToolIdsToCapabilityIds((policy.workflowCapabilityIds ?? []).map(String));
+    const supporting = focusedSourceRefreshCapabilityIds(workflowCapabilityIds);
+    return new Set([...progress, ...supporting]);
+  }
   return new Set(progress);
 }
 
@@ -302,12 +372,37 @@ function readyStageNeedsDiagnosticEvidenceReview(
   return inputRefs.some((refId) => refsById.get(refId)?.type === "diagnostic");
 }
 
+function readyStageHasDiagnosticInput(
+  inputRefs: readonly string[],
+  refs: readonly { readonly refId: string; readonly type?: string }[]
+): boolean {
+  const refsById = new Map(refs.map((ref) => [ref.refId, ref]));
+  return inputRefs.some((refId) => refsById.get(refId)?.type === "diagnostic");
+}
+
+function readyStageControlHasDiagnosticInput(control: JsonObject): boolean {
+  const inputRefs = Array.isArray(control.inputRefs) ? control.inputRefs.map(String) : [];
+  const refs = Array.isArray(control.refs)
+    ? control.refs.filter((ref): ref is JsonObject => typeof ref === "object" && ref !== null)
+    : [];
+  return inputRefs.some((refId) =>
+    refs.some((ref) => String(ref.refId ?? "") === refId && String(ref.type ?? "") === "diagnostic")
+  );
+}
+
 function supportingCapabilityIdsForWorkflowStage(
   stageKind: string | undefined,
   allowedCapabilityIds: readonly string[]
 ): readonly string[] {
   if (stageKind !== "produce" && stageKind !== "materialize" && stageKind !== "repair") return [];
   return allowedCapabilityIds.filter(isSourceInspectionSupportCapabilityId);
+}
+
+function focusedSourceRefreshCapabilityIds(allowedCapabilityIds: readonly string[]): readonly string[] {
+  return allowedCapabilityIds.filter((capabilityId) =>
+    capabilityId === "core.file.read" ||
+    capabilityId === "core.search.text"
+  );
 }
 
 function isSourceInspectionSupportCapabilityId(capabilityId: string): boolean {
@@ -368,11 +463,14 @@ function workflowGateCapabilitySatisfies(capabilityId: string, requiredNextActio
   if (requiredNextAction === "standard-test-command-or-bounded-blocker") {
     return isStandardTestExecutionCapabilityId(capabilityId);
   }
+  if (requiredNextAction === "exact-target-refresh-or-source-edit-or-bounded-blocker") {
+    return capabilityId === "core.file.read" || isMutationCapabilityId(capabilityId);
+  }
   if (requiredNextAction === "repo-local-python-test-runner") {
     return capabilityId === "core.shell.run";
   }
   if (requiredNextAction === "focused-read-or-source-edit-or-test-or-return-control") {
-    return isFocusedEvidenceRefreshCapabilityId(capabilityId) || isMutationCapabilityId(capabilityId) || isTestCapabilityId(capabilityId);
+    return isFocusedEvidenceRefreshCapabilityId(capabilityId) || isMutationCapabilityId(capabilityId) || isStandardTestExecutionCapabilityId(capabilityId);
   }
   if (requiredNextAction === "focused-read-or-source-edit-or-bounded-blocker") {
     return isFocusedEvidenceRefreshCapabilityId(capabilityId) || isMutationCapabilityId(capabilityId);
@@ -401,14 +499,17 @@ function canonicalWorkflowGateCapabilityIds(requiredNextAction: string): Readonl
   if (requiredNextAction === "standard-test-command-or-bounded-blocker") {
     return new Set(["core.test.run", "core.shell.run"]);
   }
+  if (requiredNextAction === "exact-target-refresh-or-source-edit-or-bounded-blocker") {
+    return new Set(["core.file.read", "core.file.edit", "core.patch.apply"]);
+  }
   if (requiredNextAction === "repo-local-python-test-runner") {
     return new Set(["core.shell.run"]);
   }
   if (requiredNextAction === "focused-read-or-source-edit-or-test-or-return-control") {
-    return new Set(["core.file.read", "core.search.text", "core.file.edit", "core.patch.apply", "core.test.run"]);
+    return new Set(["core.file.read", "core.search.text", "core.file.edit", "core.patch.apply", "core.test.run", "core.shell.run"]);
   }
   if (requiredNextAction === "focused-read-or-source-edit-or-bounded-blocker") {
-    return new Set(["core.file.read", "core.search.text", "core.file.edit"]);
+    return new Set(["core.file.read", "core.search.text", "core.file.edit", "core.patch.apply"]);
   }
   return new Set();
 }
@@ -467,13 +568,23 @@ export function workflowCapabilityBoundaryGuard(input: {
       }
     };
   }
+  if ((activeStageKind === "verify" || activeStageKind === "score") && evaluationReproductionAllowed) return undefined;
   if (!isGovernedWorkflowBoundary(policy)) return undefined;
-  if (policy.workflowGateOverride && workflowGateCapabilitySatisfies(input.capabilityId, policy.workflowGateOverride.requiredNextAction)) return undefined;
+  if (policy.workflowGateOverride && workflowGateCapabilitySatisfies(input.capabilityId, policy.workflowGateOverride.requiredNextAction)) {
+    const workflowBoundary = workflowCapabilityBoundary(policy);
+    if (input.capabilityId !== "core.shell.run" || workflowBoundary.has(input.capabilityId)) return undefined;
+  }
+  if (allowsMutationRepairFocusedContextRefresh(policy, input.capabilityId)) return undefined;
+  if (allowsDiagnosticRepairFocusedRefresh(policy, input.workflowReadyStageControl, input.capabilityId)) return undefined;
   const activeStageAllowed = activeReadyStageCapabilityBoundary(policy);
   if (activeStageAllowed.size > 0 && !activeStageAllowed.has(input.capabilityId)) {
+    const gateRequiredNextAction = policy.workflowGateOverride?.requiredNextAction;
+    const gateSuffix = gateRequiredNextAction
+      ? ` Active workflow gate requires ${gateRequiredNextAction}.`
+      : "";
     return {
       code: "WORKFLOW_CAPABILITY_BOUNDARY_REJECTED",
-      message: `WORKFLOW_CAPABILITY_BOUNDARY_ENFORCED: ${input.capabilityId} is outside the active workflow stage boundary for ${policy.profileId}. Use the current stage progress capability or report a bounded blocker.`,
+      message: `WORKFLOW_CAPABILITY_BOUNDARY_ENFORCED: ${input.capabilityId} is outside the active workflow stage boundary for ${policy.profileId}. Use the current stage progress capability or report a bounded blocker.${gateSuffix}`,
       retryable: false,
       redaction: { class: "internal", fields: ["details"] },
       details: {
@@ -484,6 +595,7 @@ export function workflowCapabilityBoundaryGuard(input: {
         rejectedToolName: input.toolName,
         rejectedCapabilityId: input.capabilityId,
         rejectedInput: input.toolInput,
+        ...(gateRequiredNextAction ? { requiredNextAction: gateRequiredNextAction } : {}),
         allowedCapabilityIds: [...activeStageAllowed].sort()
       }
     };
@@ -508,6 +620,37 @@ export function workflowCapabilityBoundaryGuard(input: {
   };
 }
 
+function allowsMutationRepairFocusedContextRefresh(
+  policy: AgentLoopProfilePolicyMetadata,
+  capabilityId: string
+): boolean {
+  const override = policy.workflowGateOverride;
+  if (override?.terminalKind !== "workflow-mutation-repair.required") return false;
+  if (capabilityId !== "core.file.read" && capabilityId !== "core.search.text") return false;
+  return workflowCapabilityBoundary(policy).has(capabilityId);
+}
+
+function allowsDiagnosticRepairFocusedRefresh(
+  policy: AgentLoopProfilePolicyMetadata,
+  control: JsonObject | undefined,
+  capabilityId: string
+): boolean {
+  if (policy.workflowGovernanceMode !== "evaluation") return false;
+  if (capabilityId !== "core.file.read" && capabilityId !== "core.search.text") return false;
+  const override = policy.workflowGateOverride;
+  if (!override || !workflowGateCapabilitySatisfies(capabilityId, override.requiredNextAction)) return false;
+  const stageKind = typeof control?.stageKind === "string" ? control.stageKind : activeReadyStageKind(policy);
+  if (stageKind !== "produce" && stageKind !== "materialize" && stageKind !== "repair") return false;
+  const stageId = typeof control?.stageId === "string" ? control.stageId : undefined;
+  const workflow = policy.stagedTaskWorkflow;
+  const stageState = workflow?.runState.stageStates.find((stage) =>
+    stageId ? stage.stageId === stageId : stage.status === "ready"
+  );
+  const refsById = new Map((workflow?.runState.refs ?? []).map((ref) => [ref.refId, ref]));
+  return (workflow?.runState.refs ?? []).some((ref) => ref.type === "diagnostic") ||
+    (stageState?.inputRefs ?? []).some((refId) => refsById.get(refId)?.type === "diagnostic");
+}
+
 export function isAllowedEvaluationReproductionToolInput(input: {
   readonly profilePolicy?: AgentLoopProfilePolicyMetadata;
   readonly capabilityId: string;
@@ -529,21 +672,31 @@ function isAllowedEvaluationReproductionCommand(
   commandText: string
 ): boolean {
   if (policy.workflowGovernanceMode !== "evaluation") return false;
-  if (capabilityId !== "core.test.run") return false;
+  if (capabilityId !== "core.test.run" && capabilityId !== "core.shell.run") return false;
   const intent = typeof toolInput.intent === "string" ? toolInput.intent.toLowerCase() : "";
   if (intent && !/\b(?:reproduce|reproduction|regression|verify|verification)\b/.test(intent)) return false;
-  const command = commandText.trim();
+  const workspaceRoot = typeof toolInput.workspaceRoot === "string" ? toolInput.workspaceRoot : undefined;
+  const command = normalizeEvaluationReproductionCommand(commandText, workspaceRoot);
   if (command.length === 0 || command.length > 12_000 || command.includes("\0")) return false;
   if (!/^(?:python(?:3(?:\.\d+)?)?|py)\s+-c(?:\s|$)/i.test(command)) return false;
   if (/&&|\|\||`|\$\(/.test(command)) return false;
   return !hasMutationCapablePython(command);
 }
 
+function normalizeEvaluationReproductionCommand(commandText: string, workspaceRoot?: string): string {
+  const command = commandText.trim();
+  const cdPrefix = /^cd\s+(?:"([^"]+)"|'([^']+)'|(\S+))\s*&&\s*/i.exec(command);
+  if (!cdPrefix) return command;
+  const target = cdPrefix[1] ?? cdPrefix[2] ?? cdPrefix[3] ?? "";
+  if (target !== "/workspace" && (!workspaceRoot || target !== workspaceRoot)) return command;
+  return command.slice(cdPrefix[0].length).trim();
+}
+
 function hasMutationCapablePython(command: string): boolean {
   return /\b(?:shutil|subprocess)\b/i.test(command) ||
     /\bos\.system\s*\(/i.test(command) ||
     /\bopen\s*\([^)]*,\s*["'][^"']*[wax+]/i.test(command) ||
-    /\.(?:write|write_text|write_bytes|unlink|remove|rename|replace|chmod|mkdir|makedirs|rmdir|removedirs)\s*\(/i.test(command) ||
+    /\.(?:write_text|write_bytes|unlink|remove|rename|replace|chmod|mkdir|makedirs|rmdir|removedirs)\s*\(/i.test(command) ||
     /\b(?:rm|mv|cp|chmod|mkdir|touch)\s+(?:-[^\s]+\s+)*[^\s]/i.test(command);
 }
 
@@ -854,7 +1007,10 @@ function supervisorDownstreamStageFromReviewedEvidence(input: {
   if (!reviewState) return undefined;
   const reviewStage = input.workflow.graph.stages.find((stage) => stage.stageId === reviewState.stageId);
   if (!reviewStage) return undefined;
-  if (readyStageNeedsDiagnosticEvidenceReview(reviewStage.kind, reviewState.inputRefs ?? [], input.workflow.runState.refs ?? [])) {
+  if (
+    reviewState.outputRefs.length === 0 &&
+    readyStageNeedsDiagnosticEvidenceReview(reviewStage.kind, reviewState.inputRefs ?? [], input.workflow.runState.refs ?? [])
+  ) {
     return undefined;
   }
   const downstream = input.workflow.graph.stages.find((stage) =>

@@ -176,6 +176,7 @@ describe("SWE-bench prediction adapter", () => {
     const prediction = summary.predictions[0];
     const written = JSON.parse(await platform.readFile("/workspace/predictions/glm.jsonl")) as JsonObject;
     const child = platform.executedCommands.find((entry) => entry.command === process.execPath);
+    const childPrompt = child?.args[(child?.args ?? []).indexOf("run") + 1] ?? "";
 
     assert.equal(summary.status, "pass");
     assert.equal(prediction?.instance_id, "demo__repo-1");
@@ -189,6 +190,9 @@ describe("SWE-bench prediction adapter", () => {
     assert.equal(child?.args.includes("glm-5.1"), true);
     assert.equal(child?.args.includes("--tool-projection"), true);
     assert.equal(child?.args.includes("all"), true);
+    assert.equal(childPrompt.includes("Modify the active code path"), true);
+    assert.equal(childPrompt.includes("unexpected keyword argument"), true);
+    assert.equal(childPrompt.includes("Do not add unused parallel classes"), true);
     assert.equal(JSON.stringify(summary).includes("GLM_ANTHROPIC_API_KEY"), false);
   });
 
@@ -315,6 +319,8 @@ describe("SWE-bench prediction adapter", () => {
     assert.equal(prompt.includes("Previous supervised attempt feedback"), false);
     assert.equal(context.includes("Previous supervised attempt feedback"), true);
     assert.equal(context.includes("Previous patch status: non-empty patchBytes=624"), true);
+    assert.equal(context.includes("The previous patch is already applied in the current checkout"), true);
+    assert.equal(context.includes("Do not replay the previous patch"), true);
     assert.equal(context.includes("tests/test_demo.py::test_expected_fix"), true);
     assert.equal(context.includes("Official harness failure excerpts"), true);
     assert.equal(context.includes("ValueError: could not convert string to float: 'no'"), true);
@@ -990,10 +996,13 @@ describe("SWE-bench prediction adapter", () => {
   it("extracts bounded official harness failure excerpts from test output", async () => {
     const platform = new FakeSweBenchPlatform("fake");
     platform.harnessTestOutputByInstanceId.set("demo__repo-2", [
-      "tests/test_demo.py::test_fixed FAILED",
-      "",
+      "tests/test_demo.py .F",
       "=================================== FAILURES ===================================",
       "_______________________________ test_fixed __________________________________",
+      "",
+      "    def test_fixed():",
+      "        value = 'no'",
+      ">       parse_value(value)",
       "",
       "tests/test_demo.py:42: in test_fixed",
       "    parse_value('no')",
@@ -1035,6 +1044,51 @@ describe("SWE-bench prediction adapter", () => {
     assert.equal(excerpt?.testId, "tests/test_demo.py::test_fixed");
     assert.equal(text.includes("tests/test_demo.py:42: in test_fixed"), true);
     assert.equal(text.includes("ValueError: could not convert string to float: 'no'"), true);
+    assert.equal(text.includes("def test_fixed():"), true);
+    assert.equal(text.length < 5_000, true);
+  });
+
+  it("extracts official harness internal errors when test output omits test ids", async () => {
+    const platform = new FakeSweBenchPlatform("fake");
+    platform.harnessTestOutputByInstanceId.set("demo__repo-2", [
+      "+ : '>>>>> Start Test Output'",
+      "+ pytest -rA astropy/io/ascii/tests/test_rst.py",
+      "<frozen importlib._bootstrap>:228: RuntimeWarning: numpy.ndarray size changed",
+      "INTERNALERROR> Traceback (most recent call last):",
+      "INTERNALERROR>   File \"/testbed/astropy/io/ascii/rst.py\", line 99, in <module>",
+      "INTERNALERROR>     class SimpleRST(FixedWidth):",
+      "INTERNALERROR> astropy.io.registry.base.IORegistryError: Reader for format 'ascii.rst' and class 'Table' is already defined",
+      "+ : '>>>>> End Test Output'",
+      ""
+    ].join("\n"));
+    await platform.writeFile("/workspace/predictions/glm.jsonl", [
+      JSON.stringify({
+        instance_id: "demo__repo-2",
+        model_name_or_path: "glm-5.1",
+        model_patch: "diff --git a/src/example.py b/src/example.py\n"
+      }),
+      ""
+    ].join("\n"));
+
+    const summary = await collectSweBenchPrediction({
+      action: "evaluate",
+      dryRun: false,
+      live: false,
+      outputPath: "/workspace/predictions/glm.jsonl",
+      reportDir: "/workspace/harness",
+      runId: "glm-internal-error",
+      instanceIds: ["demo__repo-2"],
+      harnessPython: "/workspace/.deepseek/swebench-venv/bin/python",
+      extraArgs: [],
+      platform
+    });
+
+    const excerpt = summary.evaluation?.instances[0]?.failureExcerpts?.[0] as JsonObject | undefined;
+    const text = typeof excerpt?.excerpt === "string" ? excerpt.excerpt : "";
+
+    assert.equal(excerpt?.testId, "tests/test_demo.py::test_fixed");
+    assert.equal(text.includes("INTERNALERROR> Traceback"), true);
+    assert.equal(text.includes("IORegistryError: Reader for format 'ascii.rst'"), true);
     assert.equal(text.length < 2_000, true);
   });
 

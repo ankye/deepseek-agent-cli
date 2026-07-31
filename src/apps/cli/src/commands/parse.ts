@@ -193,6 +193,7 @@ export function parseCliArgs(args: readonly string[], _terminal: CliTerminalFlag
       prompt: "",
       output,
       live,
+      ...(approvalMode ? { approvalMode } : {}),
       ...(modelProvider ? { modelProvider } : {}),
       ...(model ? { model } : {}),
       ...(toolProjection ? { toolProjection } : {}),
@@ -596,6 +597,7 @@ function extraDiagnosticsArgs(args: readonly string[], knownBooleanFlags: Readon
       value === "--output" ||
       value === "--max-records" ||
       value === "--tool-projection" ||
+      value === "--approval-mode" ||
       value === "--provider" ||
       value === "--model-provider" ||
       value === "--model" ||
@@ -633,6 +635,7 @@ function extraDiagnosticsArgs(args: readonly string[], knownBooleanFlags: Readon
     }
     if (value === "--allow-external-baseline") continue;
     if (value === "--live") continue;
+    if (value === "--trusted") continue;
     if (value === "--external" || value === "--fake-secret" || knownBooleanFlags.has(value)) continue;
     extras.push(value);
   }

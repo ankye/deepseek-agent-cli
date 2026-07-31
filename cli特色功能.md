@@ -68,6 +68,7 @@ DeepSeek CLI 记录有界的 intent、context selection、tool intent、verifica
 | --- | --- | --- | --- |
 | 一个内核，多端适配 | CLI、TUI、VSCode、Server/SDK 共享运行时 | 不为每个端重复写状态机，所有端消费同一条事件流 | 平台架构已形成，非 CLI host 按 thin adapter 推进 |
 | 能力即 Agent | tool、skill、plugin、MCP、hook、command、subagent 都进入统一 capability/agent 模型 | 不是“工具列表”，而是可治理、可路由、可组合、可审计的能力网络 | 核心契约已建立，编排能力持续增强 |
+| Agent Loop 模式 | evidence、verification、repair、delegation 和 model iteration 都有运行时预算与事件 | 不是模型无限循环，而是平台治理的可收敛执行循环 | CLI mode controls、agent loop、repair/verification budget 已形成基础产品面 |
 | 运行时编排工作流 | 用户意图先进入 workflow graph，再调度能力、验证和修复 | 模型建议工作，平台决定拆解、依赖、调度、取消、重试和合并 | 作为最高优先级能力持续强化 |
 | 受治理执行信封 | 每次能力调用都有 envelope、policy、sandbox、timeout、audit metadata | 防止能力绕过权限、沙箱和审计路径 | 已作为 runtime/kernel 基础能力 |
 | Profile 作为工作流角色 | profile 表达环境和任务角色，组合通用能力 | 不是硬编码特权开关，也不是 benchmark 定制提示词 | 已按 workflow composition 方向调整 |
@@ -119,6 +120,29 @@ CLI 成败的关键不只是模型强弱，而是平台能否把任务拆成可�
 边界：
 
 - 这是当前最高优先级方向，仍需用更多可执行 pipeline 和评测证据证明默认收益。
+
+### Agent Loop 模式与运行时预算
+
+DeepSeek CLI 的 loop mode 不是“让模型一直试到成功”，而是由 runtime 管理的执行循环：证据收集、计划、执行、验证、修复、委派和合成都有预算、阶段、事件和终止原因。它是通用 runtime 能力，可用于日常 CLI 任务、仓库修复、发布检查、诊断和评测治理；SWE-bench 只是最适合展示压力和闭环治理的代表场景之一。用户可以通过 `/mode`、`/agent`、`/workers`、`/verify`、`/plan` 以及 scriptable `deepseek mode ...` 查看或控制当前运行模式。
+
+为什么独特：
+
+- 模式控制是本地产品控制，不是藏在 prompt 里的软提示。
+- evidence loop、verification loop、repair attempts、delegation fan-out 和 model iteration caps 被分开记录，方便治理成本和失败原因。
+- required next action、workflow gate、repair loop 和 verifier verdict 都进入 runtime event stream，text、JSON、JSONL 和 TUI 可以看到同一套事实。
+- loop 可以收敛到明确结果：完成、验证失败、预算耗尽、边界拒绝、需要修复或有界 blocker，而不是无限重试。
+
+可展示证据：
+
+- `src/apps/cli/README.md`
+- `src/apps/cli/src/commands/chat-mode-controls.ts`
+- `src/packages/runtime/src/agent-loop.ts`
+- `docs/architecture/execution-model.md`
+
+边界：
+
+- 不宣传“任意任务都能自动跑到成功”；loop mode 强调可治理、可观察和可收敛，不承诺模型能力本身。
+- 不把 reasoning effort 和 loop budget 混为一谈；前者是 provider/model 参数，后者是 runtime 产品策略。
 
 ### Contract-first 多端平台
 
@@ -289,6 +313,8 @@ SWE-bench Lite 被用作 runtime 能力体检：不仅看 resolved，还看 cach
 - Execution envelope
 - Policy sandbox
 - Tool intent preflight
+- Agent loop mode
+- Evidence / verification / repair loop budgets
 - Workflow orchestration
 - Concurrency scheduling
 - Agent namespace、quota、lineage
@@ -377,6 +403,7 @@ SWE-bench Lite 被用作 runtime 能力体检：不仅看 resolved，还看 cach
 | 一次 governed tool call | execution envelope、policy、audit、timeout | tool trace、diagnostics JSON |
 | 一次 prompt replay | stable prefix、dynamic tail、fingerprint、cache hint | prompt assembly JSONL |
 | 一次 profile workflow | parent dispatch、managed child run、capability route | CLI trace、OpenSpec task |
+| 一次 loop mode 收敛 | mode control、phase plan、loop budget、required next action、repair/verify gate | `/mode` 输出、agent loop JSONL、diagnostics summary |
 | 一次 SWE-bench canary | attempt、patch、test、harness、reason code | summary.json、trace JSONL |
 | 一次插件贡献 | descriptor、composition record、TUI/help/diagnostics 投影 | plugin manifest、palette 截图 |
 | 一次 Workbench 操作 | transcript、reasoning rail、inspector、activity feed | TUI 截图或录屏 |
@@ -397,6 +424,11 @@ SWE-bench Lite 被用作 runtime 能力体检：不仅看 resolved，还看 cach
 | 名称 | 推荐解释 | 适用文案 |
 | --- | --- | --- |
 | Agent Runtime | 管理 Agent 上下文、能力、权限、执行、缓存、诊断和验证的本地运行时 | 官网、README、路演 |
+| Agent Loop | 由 runtime 管理的 Agent 执行循环，串联证据、执行、验证、修复和合成，并记录每一步事件 | 官网、README、演示 |
+| Loop Budget | evidence、verification、repair、delegation、model iteration 等循环预算，用来限制成本并解释终止原因 | 技术文章、企业治理、评测复盘 |
+| Mode Controls | `/mode`、`/agent`、`/workers`、`/verify`、`/plan` 等本地产品控制，用结构化事件管理交互模式和 Agent 模式 | CLI 文档、Workbench 演示 |
+| Verification Loop | 由 runtime 管理的验证循环，要求标准测试命令或有界 blocker，并把结果写入证据链 | README、评测复盘 |
+| Repair Loop | 对可修复失败进行分类、计划、反馈和再验证的有界闭环 | 技术文章、诊断说明 |
 | Capability Agent | 每个工具/技能/插件/MCP/子 Agent 都是有输入输出和运行逻辑的可编排能力 | 架构文章、插件文档 |
 | Execution Envelope | 每次能力调用的治理信封，携带 policy、sandbox、timeout、audit 和 lineage | 技术白皮书、企业场景 |
 | Workflow Role | profile 表达的任务/环境角色，用来组合通用能力和流程 | 产品文案、工作流介绍 |
@@ -412,9 +444,13 @@ SWE-bench Lite 被用作 runtime 能力体检：不仅看 resolved，还看 cach
 
 DeepSeek CLI 是面向 Coding Agent 的本地工程运行时。它把工具、技能、插件、MCP、Hook、命令和子 Agent 统一建模为可编排能力，用同一个 runtime kernel 处理上下文、权限、缓存、诊断、执行和验证，让 CLI 不再只是聊天入口，而是可治理、可回放、可扩展的 Agent 工作台。
 
+DeepSeek CLI 的 Agent Loop 由 runtime 治理：证据、验证、修复、委派和模型迭代都有预算、事件和终止原因。它让 Agent 不只是“继续尝试”，而是在可观察、可回放、可收敛的工程循环里工作。
+
 ### 技术版
 
 DeepSeek CLI 采用 contract-first TypeScript monorepo 架构。CLI、TUI、VSCode 和未来 Server/SDK 都是 thin host adapter；共享 runtime kernel、communication protocol、capability registry、policy sandbox、context pipeline、prompt assembly、workflow orchestration 和 diagnostics。每个能力调用都通过统一 execution envelope，所有关键输出都有事件、证据、fingerprint 和 replay path。
+
+Agent Loop、mode controls 和 workflow gates 由 runtime 持有，不依赖 prompt 约定来维持秩序。evidence loop、verification loop、repair loop、delegation fan-out 和 model iteration caps 分开计量，并通过 trace、diagnostics 和 replay evidence 暴露给 CLI、JSON/JSONL 和 Workbench。
 
 ### SWE-bench 版
 

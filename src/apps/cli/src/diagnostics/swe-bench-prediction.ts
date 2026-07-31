@@ -65,6 +65,13 @@ export interface SweBenchHarnessFailureExcerpt extends JsonObject {
   readonly redaction: { readonly class: "internal"; readonly fields?: readonly string[] };
 }
 
+export interface SweBenchLocalTestSourceExcerpt extends JsonObject {
+  readonly testId: string;
+  readonly filePath: string;
+  readonly excerpt: string;
+  readonly redaction: { readonly class: "internal"; readonly fields?: readonly string[] };
+}
+
 export interface SweBenchEvaluationTestStatus extends JsonObject {
   readonly success: number;
   readonly failure: number;
@@ -75,9 +82,21 @@ export interface SweBenchEvaluationTestStatus extends JsonObject {
 export interface SweBenchRepairContext extends JsonObject {
   readonly attemptNumber: number;
   readonly previousRunId: string;
+  readonly failureKind?: "official-harness-unresolved" | "pre-harness-generation";
   readonly failingTests: readonly string[];
   readonly failureExcerpts?: readonly SweBenchHarnessFailureExcerpt[];
+  readonly localTestSourceExcerpts?: readonly SweBenchLocalTestSourceExcerpt[];
   readonly previousPatchBytes?: number;
+  readonly problemStatement?: string;
+  readonly previousPatchExcerpt?: string;
+  readonly restoredFromAttempt?: number;
+  readonly discardedRegressedAttempt?: number;
+  readonly previousStageId?: string;
+  readonly previousTerminalKind?: string;
+  readonly previousTerminalReason?: string;
+  readonly previousSourceMutationCount?: number;
+  readonly previousTestCommandCount?: number;
+  readonly requiredNextAction?: string;
   readonly redaction: { readonly class: "internal"; readonly fields?: readonly string[] };
 }
 
@@ -1190,10 +1209,18 @@ async function readHarnessFailureExcerpts(
   const outputPath = join(dirname(reportPath), "test_output.txt");
   const output = await platform.readFile(outputPath).catch(() => "");
   if (!output.trim()) return [];
-  return failingTests
+  const excerpts = failingTests
     .slice(0, 12)
     .map((testId) => harnessFailureExcerpt(testId, output))
     .filter((excerpt): excerpt is SweBenchHarnessFailureExcerpt => excerpt !== undefined);
+  if (excerpts.length > 0) return excerpts;
+  const generalExcerpt = harnessGeneralFailureExcerpt(output);
+  if (!generalExcerpt) return [];
+  return [{
+    testId: failingTests[0] as string,
+    excerpt: generalExcerpt,
+    redaction: { class: "internal", fields: ["excerpt"] }
+  }];
 }
 
 function harnessFailureExcerpt(testId: string, output: string): SweBenchHarnessFailureExcerpt | undefined {
@@ -1201,7 +1228,9 @@ function harnessFailureExcerpt(testId: string, output: string): SweBenchHarnessF
   const index = findHarnessFailureLine(lines, testId);
   if (index < 0) return undefined;
   const start = Math.max(0, index - 4);
-  const end = Math.min(lines.length, index + 36);
+  const summaryOffset = lines.slice(index + 1).findIndex((line) => /short test summary info/i.test(line));
+  const summaryBoundary = summaryOffset >= 0 ? index + 1 + summaryOffset : lines.length;
+  const end = Math.min(lines.length, summaryBoundary, index + 80);
   const excerpt = boundedFailureExcerpt(lines.slice(start, end).join("\n"));
   return {
     testId,
@@ -1211,15 +1240,34 @@ function harnessFailureExcerpt(testId: string, output: string): SweBenchHarnessF
 }
 
 function findHarnessFailureLine(lines: readonly string[], testId: string): number {
-  const exact = lines.findIndex((line) => line.includes(testId));
-  if (exact >= 0) return exact;
   const testName = testId.split("::").at(-1);
   if (!testName) return -1;
+  const failureStart = lines.findIndex((line) => /^=+\s*FAILURES\s*=+$/.test(line.trim()));
+  if (failureStart >= 0) {
+    const failureEndOffset = lines.slice(failureStart + 1).findIndex((line) => /short test summary info/i.test(line));
+    const failureEnd = failureEndOffset >= 0 ? failureStart + 1 + failureEndOffset : lines.length;
+    const detailedOffset = lines.slice(failureStart, failureEnd).findIndex((line) => line.includes(testName));
+    if (detailedOffset >= 0) return failureStart + detailedOffset;
+  }
+  const exact = lines.findIndex((line) => line.includes(testId));
+  if (exact >= 0) return exact;
   return lines.findIndex((line) => line.includes(testName));
 }
 
+function harnessGeneralFailureExcerpt(output: string): string | undefined {
+  const lines = output.split(/\r?\n/).map((line) => stripAnsi(line).slice(0, 300));
+  const index = lines.findIndex((line) =>
+    /\b(?:INTERNALERROR|Traceback|FAILED|ERROR)\b/.test(line) ||
+    /\b(?:AssertionError|TypeError|ValueError|ImportError|IORegistryError)\b/.test(line)
+  );
+  if (index < 0) return undefined;
+  const start = Math.max(0, index - 4);
+  const end = Math.min(lines.length, index + 60);
+  return boundedFailureExcerpt(lines.slice(start, end).join("\n"));
+}
+
 function boundedFailureExcerpt(value: string): string {
-  return value.length <= 1_600 ? value : `${value.slice(0, 1_600)}\n... truncated ...`;
+  return value.length <= 4_000 ? value : `${value.slice(0, 4_000)}\n... truncated ...`;
 }
 
 function stripAnsi(value: string): string {
@@ -1679,6 +1727,9 @@ function sweBenchPrompt(instance: SweBenchInstance): string {
     "- After patch, run that reproduction or an equivalent focused regression before broad public tests.",
     "- Verification cost budget: use the cheapest command that can falsify the patch first.",
     "- Verification ladder: reproduction or changed-file focused test, then affected module or package subset, then broad suite only if focused evidence is inconclusive and request budget remains.",
+    "- Modify the active code path that the failing API actually uses. Do not add unused parallel classes, alternate writers, or helper types unless the registered implementation calls them.",
+    "- If the problem statement includes a traceback such as TypeError: ... unexpected keyword argument, update the receiving class/function on that call path to accept and implement that argument's behavior.",
+    "- If the problem statement includes an executable example, construct and run a focused local reproduction from that example before relying on unrelated existing tests.",
     "- Before final answer, run at least one model-authored standard test command that exercises the checkout, such as pytest, python -m pytest, python -m unittest, tox, nox, or the repository package test runner.",
     "- Prefer the narrowest focused test or reproduction related to the changed files before broad suites.",
     "- After a passing focused standard test, stop local testing and leave broader scoring to the supervisor harness unless official repair feedback requires another focused check.",
@@ -1701,10 +1752,32 @@ function sweBenchPrompt(instance: SweBenchInstance): string {
 function repairFeedbackContent(repairContext: SweBenchRepairContext): string {
   return [
     "Previous supervised attempt feedback:",
-    `- Attempt ${repairContext.attemptNumber - 1} official harness did not resolve the instance.`,
+    `- Repair attempt number: ${repairContext.attemptNumber}.`,
+    repairContext.failureKind === "pre-harness-generation"
+      ? `- Attempt ${repairContext.attemptNumber - 1} stopped before official harness readiness.`
+      : `- Attempt ${repairContext.attemptNumber - 1} official harness did not resolve the instance.`,
     `- Previous evaluation run: ${repairContext.previousRunId}.`,
+    ...(repairContext.previousStageId ? [`- Failed stage: ${repairContext.previousStageId}.`] : []),
+    ...(repairContext.previousTerminalKind ? [`- Terminal kind: ${repairContext.previousTerminalKind}.`] : []),
+    ...(repairContext.previousTerminalReason ? [`- Terminal reason: ${repairContext.previousTerminalReason}.`] : []),
+    ...(typeof repairContext.previousSourceMutationCount === "number" ? [
+      `- Source mutation count: ${repairContext.previousSourceMutationCount}.`
+    ] : []),
+    ...(typeof repairContext.previousTestCommandCount === "number" ? [
+      `- Standard test command count: ${repairContext.previousTestCommandCount}.`
+    ] : []),
+    ...(repairContext.requiredNextAction ? [`- Required next action: ${repairContext.requiredNextAction}.`] : []),
     ...(typeof repairContext.previousPatchBytes === "number" ? [
       `- Previous patch status: ${repairContext.previousPatchBytes > 0 ? "non-empty" : "empty"} patchBytes=${repairContext.previousPatchBytes}.`
+    ] : []),
+    ...(typeof repairContext.previousPatchBytes === "number" && repairContext.previousPatchBytes > 0 ? [
+      "- The previous patch is already applied in the current checkout and is the baseline for this repair attempt.",
+      "- Do not replay the previous patch. Diagnose the remaining failure and make only the incremental source change needed beyond that baseline.",
+      "- If the previous patch delegates behavior to a base class or helper, inspect that exact symbol or direct dependency instead of rereading unrelated file prefixes."
+    ] : []),
+    ...(typeof repairContext.restoredFromAttempt === "number" ? [
+      `- Restored best candidate from attempt ${repairContext.restoredFromAttempt}.`,
+      `- Discarded regressed attempt ${repairContext.discardedRegressedAttempt ?? repairContext.attemptNumber - 1}.`
     ] : []),
     "- Failing tests:",
     ...repairContext.failingTests.slice(0, 12).map((test) => `  - ${test}`),
@@ -1712,6 +1785,24 @@ function repairFeedbackContent(repairContext: SweBenchRepairContext): string {
       "- Official harness failure excerpts:",
       ...repairContext.failureExcerpts.slice(0, 6).flatMap(formatRepairFailureExcerpt)
     ] : []),
+    ...(repairContext.localTestSourceExcerpts && repairContext.localTestSourceExcerpts.length > 0 ? [
+      "- Local failing test source excerpts:",
+      ...repairContext.localTestSourceExcerpts.slice(0, 6).flatMap(formatLocalTestSourceExcerpt)
+    ] : []),
+    ...(repairContext.problemStatement ? [
+      "- Original problem statement:",
+      ...repairContext.problemStatement.split(/\r?\n/).slice(0, 80).map((line) => `  ${line.slice(0, 240)}`)
+    ] : []),
+    ...(repairContext.previousPatchExcerpt ? [
+      "- Previous patch excerpt:",
+      ...repairContext.previousPatchExcerpt.split(/\r?\n/).slice(0, 80).map((line) => `  ${line.slice(0, 240)}`)
+    ] : []),
+    "- Low-fidelity official feedback handling:",
+    "  - Official fail-to-pass tests may be hidden or injected by the harness; passing the existing public test file alone is not sufficient repair evidence.",
+    "  - If the failing test is not present locally, construct and run a focused python -c reproduction from the official excerpt or original problem statement before trusting the patch.",
+    "  - If no official failure excerpt is available, construct and run a focused local reproduction from the original problem statement before editing again.",
+    "  - Modify the active code path used by the failing API. Do not add unused parallel classes or alternate implementations that are not registered or called.",
+    "  - If the original traceback reports an unexpected keyword argument, update the receiving class/function to accept and implement that argument's behavior.",
     "- Repair the current checkout based on local source and these test failures; do not look up upstream fix commits.",
     ""
   ].join("\n");
@@ -1722,7 +1813,17 @@ function formatRepairFailureExcerpt(excerpt: SweBenchHarnessFailureExcerpt): rea
     `  - ${excerpt.testId}:`,
     ...excerpt.excerpt
       .split(/\r?\n/)
-      .slice(0, 18)
+      .slice(0, 80)
+      .map((line) => `    ${line.slice(0, 240)}`)
+  ];
+}
+
+function formatLocalTestSourceExcerpt(excerpt: SweBenchLocalTestSourceExcerpt): readonly string[] {
+  return [
+    `  - ${excerpt.testId} (${excerpt.filePath}):`,
+    ...excerpt.excerpt
+      .split(/\r?\n/)
+      .slice(0, 80)
       .map((line) => `    ${line.slice(0, 240)}`)
   ];
 }

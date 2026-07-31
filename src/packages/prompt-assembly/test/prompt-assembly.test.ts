@@ -654,6 +654,49 @@ describe("prompt assembly", () => {
     assert.equal(dynamicTail.some((message) => message.content.includes("tool result 0")), false);
   });
 
+  it("preserves the two latest successful source inspection windows", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const prompt = "Resolve SWE-bench instance demo__repo-1.";
+    const source = (marker: string) => [
+      "def target():",
+      "    " + "leading context ".repeat(280),
+      `    ${marker}`,
+      "    " + "trailing context ".repeat(280)
+    ].join("\n");
+    const history: ModelChatMessage[] = [{ role: "user", content: prompt }];
+    for (let index = 1; index <= 3; index += 1) {
+      const id = `read-${index}`;
+      history.push({
+        role: "assistant",
+        content: "",
+        toolCalls: [{ id, name: "core_file_read", input: { path: `file-${index}.py`, offset: 0, limit: 400 } }]
+      });
+      history.push({
+        role: "tool",
+        toolCallId: id,
+        toolName: "core.file.read",
+        content: source(`TARGET_MARKER_${index}`)
+      });
+    }
+
+    const result = await assembler.assemble(input({
+      prompt,
+      history,
+      contextPipelineManifest: pipelineManifest(),
+      availableTools: [capability("core.file.read"), capability("core.file.edit", "write")]
+    }));
+    const toolMessages = result.messages.filter((message) => message.role === "tool");
+    const first = toolMessages.find((message) => message.toolCallId === "read-1");
+    const second = toolMessages.find((message) => message.toolCallId === "read-2");
+    const third = toolMessages.find((message) => message.toolCallId === "read-3");
+
+    assert.equal(first?.content.startsWith("compacted source tool result"), true);
+    assert.equal(second?.content.startsWith("compacted source tool result"), false);
+    assert.equal(third?.content.startsWith("compacted source tool result"), false);
+    assert.equal(second?.content.includes("TARGET_MARKER_2"), true);
+    assert.equal(third?.content.includes("TARGET_MARKER_3"), true);
+  });
+
   it("surfaces a deterministic task intent contract in the stable provider prefix", async () => {
     const assembler = createDefaultPromptAssembler();
     const first = await assembler.assemble(input({
@@ -1216,8 +1259,31 @@ describe("prompt assembly", () => {
     const visible = result.messages.map((message) => message.content).join("\n");
 
     assert.equal(visible.includes("Required next action overrides broader allowed capability lists."), true);
-    assert.equal(visible.includes("Verification-only stage: call core.test.run with a standard repository test command now."), true);
-    assert.equal(visible.includes("Do not call read, search, list, glob, shell, git diff, or mutation tools for this verification action."), true);
+    assert.equal(visible.includes("Verification-only stage: call core_test_run (capability core.test.run) with a standard repository test command now."), true);
+    assert.equal(visible.includes("Do not call core_shell_run, read, search, list, glob, git diff, or mutation tools for this verification action."), true);
+  });
+
+  it("maps standard test command gates to the model-visible test function", async () => {
+    const assembler = createDefaultPromptAssembler();
+    const result = await assembler.assemble(input({
+      prompt: "verify the accepted source fix",
+      schedulingNextAction: schedulingNextAction({
+        actionClass: "standard-verification",
+        stageId: "verify",
+        requiredNextAction: "standard-test-command",
+        allowedCapabilityIds: ["core.test.run"],
+        acceptedEvidenceRefs: ["evidence:patch"]
+      }),
+      availableTools: [
+        capability("core.test.run", "process"),
+        capability("core.shell.run", "process"),
+        capability("core.file.read")
+      ]
+    }));
+    const visible = result.messages.map((message) => message.content).join("\n");
+
+    assert.equal(visible.includes("Verification-only stage: call core_test_run (capability core.test.run) with a standard repository test command now."), true);
+    assert.equal(visible.includes("Do not call core_shell_run, read, search, list, glob, git diff, or mutation tools for this verification action."), true);
   });
 
   it("tells focused-evidence stages to prefer bounded focused reads", async () => {

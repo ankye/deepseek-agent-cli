@@ -1248,7 +1248,7 @@ it("rejects model tools outside the primary profile workflow capability boundary
     await registerRuntimeCoreTools(loopDeps, "/workspace");
     await loopDeps.platform.writeFile("/workspace/package.json", "{\"type\":\"module\"}\n");
     const kernel = await createDefaultRuntimeKernel(loopDeps);
-    await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
       prompt: "生成 docs/USAGE.md 和 examples/config.json",
       caller: "runtime.test",
       workspaceRoot: "/workspace",
@@ -1271,6 +1271,55 @@ it("rejects model tools outside the primary profile workflow capability boundary
     assert.equal(providerMessageText(gateway.requests[1] as ModelRequest).includes("Agent profile workflow state:"), true);
     assert.equal(providerMessageText(gateway.requests[1] as ModelRequest).includes("Tool decision board summary:"), true);
     assert.equal(providerMessageText(gateway.requests[1] as ModelRequest).includes("Tool visibility policy:"), true);
+    await kernel.shutdown();
+  });
+
+  it("compacts long source inspection results before provider dispatch to reduce dynamic cache tails", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    const gateway = new SequentialToolCallModelGateway([
+      { id: "call-read-one", name: "core.file.read", input: { path: "src/one.py", limitBytes: 7_000 } },
+      { id: "call-read-two", name: "core.file.read", input: { path: "src/two.py", limitBytes: 7_000 } },
+      { id: "call-read-three", name: "core.file.read", input: { path: "src/three.py", limitBytes: 7_000 } }
+    ]);
+    const loopDeps = {
+      ...deps,
+      models: gateway
+    };
+    await registerRuntimeCoreTools(loopDeps, "/workspace");
+    const longSource = (marker: string) => [
+      "def target():",
+      "    " + "leading source context ".repeat(120),
+      `    ${marker}`,
+      "    " + "trailing source context ".repeat(120)
+    ].join("\n");
+    await loopDeps.platform.writeFile("/workspace/src/one.py", longSource("TARGET_MARKER_1"));
+    await loopDeps.platform.writeFile("/workspace/src/two.py", longSource("TARGET_MARKER_2"));
+    await loopDeps.platform.writeFile("/workspace/src/three.py", longSource("TARGET_MARKER_3"));
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+    await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "Resolve source issue with focused reads.",
+      caller: "runtime.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      toolProjection: "read-only",
+      contextPipeline: { enabled: true },
+      limits: { maxModelIterations: 4 }
+    }));
+
+    const finalProviderRequest = gateway.requests[3] as ModelRequest;
+    const dynamicToolMessages = (finalProviderRequest.messages ?? []).filter((message) => message.role === "tool");
+    const dynamicToolChars = dynamicToolMessages.reduce((total, message) => total + message.content.length, 0);
+    const providerText = providerMessageText(finalProviderRequest);
+    const secondLatestSourceMessage = dynamicToolMessages.find((message) => message.toolCallId === "call-read-two");
+    const latestSourceMessage = dynamicToolMessages.find((message) => message.toolCallId === "call-read-three");
+
+    assert.equal(providerText.includes("compacted source tool result"), true);
+    assert.equal(providerText.includes("TARGET_MARKER_2"), true);
+    assert.equal(providerText.includes("TARGET_MARKER_3"), true);
+    assert.equal(secondLatestSourceMessage?.content.startsWith("compacted source tool result"), false);
+    assert.equal(latestSourceMessage?.content.startsWith("compacted source tool result"), false);
+    assert.equal(dynamicToolChars < 16_000, true);
     await kernel.shutdown();
   });
 
@@ -2269,6 +2318,55 @@ it("rejects model tools outside the primary profile workflow capability boundary
     await kernel.shutdown();
   });
 
+  it("closes a terminal collect-evidence workflow capability with warning evidence instead of re-running it", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    const gateway = new SingleToolCallModelGateway("core.workflow.terminal", { status: "warn" });
+    const loopDeps = {
+      ...deps,
+      models: gateway
+    };
+    await registerRuntimeCoreTools(loopDeps, "/workspace");
+    await loopDeps.capabilities.register({
+      ...runtimeEchoCapability,
+      id: asId<"capability">("core.workflow.terminal"),
+      name: "Workflow Terminal",
+      sideEffect: "none",
+      permissions: []
+    }, async () => ({
+      ok: true,
+      value: {
+        evidence: {
+          status: "warn",
+          metadata: {
+            resolved: false
+          }
+        }
+      }
+    }));
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "Use the generic terminal staged workflow and report the unresolved score.",
+      caller: "runtime.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      profilePolicy: stagedWorkflowTerminalCollectEvidenceProfilePolicy(),
+      limits: { maxModelIterations: 3 }
+    }));
+
+    assert.equal(events.some((event) => event.kind === "capability.completed" && event.data.capabilityId === "core.workflow.terminal"), true);
+    assert.equal(events.filter((event) => event.kind === "model.tool.intent").length, 1);
+    assert.equal(events.filter((event) => event.kind === "model.requested").length, 1);
+    assert.equal(events.filter((event) => event.kind === "agent.loop.completed").length, 1);
+    assert.equal(events.at(-1)?.kind, "agent.loop.completed");
+    assert.equal(events.at(-1)?.data.reason, "terminal-tool-completed");
+    const terminalTool = events.at(-1)?.data.terminalTool as JsonObject | undefined;
+    assert.equal(terminalTool?.terminalKind, "capability.completed");
+    assert.equal(terminalTool?.feedbackStatus, "success");
+    assert.equal(gateway.requests.length, 1);
+    await kernel.shutdown();
+  });
+
   it("requires stage evaluation before successful tool evidence can advance downstream workflow stages", async () => {
     const deps = createDeterministicRuntimeDependencies();
     const gateway = new SingleToolCallModelGateway("core.file.read", { path: "README.md" });
@@ -2604,6 +2702,45 @@ it("rejects model tools outside the primary profile workflow capability boundary
       gateway.requests[2]?.messages?.some((message) => message.role === "tool" && message.toolCallId === "call-workflow-failed-test" && message.content.includes("failed")),
       true
     );
+    await kernel.shutdown();
+  });
+
+  it("allows repeated focused source reads after a failed projected verify command", async () => {
+    const deps = createDeterministicRuntimeDependencies({ platform: new FailedTestFakePlatformRuntime() });
+    const gateway = new SequentialToolCallModelGateway([
+      { id: "call-workflow-understand-read", name: "core.file.read", input: { path: "README.md" } },
+      { id: "call-workflow-failed-test", name: "core.test.run", input: { command: "python", args: ["-m", "pytest", "tests/test_demo.py"], intent: "unit" } },
+      { id: "call-workflow-refresh-read", name: "core.file.read", input: { path: "src/example.py" } },
+      { id: "call-workflow-second-refresh-read", name: "core.file.read", input: { path: "src/example.py", offset: 1, limit: 20 } }
+    ]);
+    const loopDeps = {
+      ...deps,
+      models: gateway
+    };
+    await registerRuntimeCoreTools(loopDeps, "/workspace");
+    await loopDeps.platform.writeFile("/workspace/README.md", "workflow evidence\n");
+    await loopDeps.platform.writeFile("/workspace/src/example.py", "value = 1\n");
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "Use the staged workflow and repair after the failing test.",
+      caller: "runtime.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      profilePolicy: stagedWorkflowProgressProfilePolicy(),
+      limits: { maxModelIterations: 6 }
+    }));
+
+    assert.equal(events.some((event) =>
+      event.kind === "workflow.required-action.missed" &&
+      event.data.requestedCapabilityId === "core.file.read" &&
+      event.data.stageId === "stage:verify"
+    ), false);
+    assert.equal(events.some((event) =>
+      event.kind === "model.tool.result" &&
+      event.data.toolCallId === "call-workflow-second-refresh-read" &&
+      event.data.terminalKind === "capability.completed"
+    ), true);
     await kernel.shutdown();
   });
 
@@ -3219,6 +3356,65 @@ it("rejects model tools outside the primary profile workflow capability boundary
     assert.equal(control?.stageKind, "collect-evidence");
     assert.equal(String(control?.requiredNextAction).includes("core.file.read"), true);
     assert.deepEqual(visibleToolNames(gateway.requests[0] as ModelRequest), ["core_file_read"]);
+    await kernel.shutdown();
+  });
+
+  it("advances diagnostic repair review after source evidence is collected", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    const gateway = new SequentialToolCallModelGateway([
+      {
+        id: "call-diagnostic-review-read",
+        name: "core.file.read",
+        input: { path: "src/example.py", offset: 0, limit: 20 }
+      }
+    ]);
+    const loopDeps = {
+      ...deps,
+      approvals: new HeadlessApprovalBroker(true),
+      policy: allowAllPolicyEngine(),
+      models: gateway
+    };
+    await registerRuntimeCoreTools(loopDeps, "/workspace");
+    await loopDeps.platform.writeFile("/workspace/src/example.py", "value = 1\n");
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+    const diagnosticReviewPolicy = supervisedRepairWorkflowWithDiagnosticReviewProfilePolicy();
+    const diagnosticReviewWorkflow = diagnosticReviewPolicy.stagedTaskWorkflow!;
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "Review official harness failure evidence before editing.",
+      caller: "runtime.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      profilePolicy: {
+        ...diagnosticReviewPolicy,
+        stagedTaskWorkflow: {
+          ...diagnosticReviewWorkflow,
+          runState: {
+            ...diagnosticReviewWorkflow.runState,
+            stageStates: diagnosticReviewWorkflow.runState.stageStates.map((stage) =>
+              stage.stageId === "stage:understand"
+                ? {
+                    stageId: stage.stageId,
+                    status: "ready" as const,
+                    attempts: 0,
+                    inputRefs: stage.inputRefs,
+                    outputRefs: [],
+                    diagnostics: []
+                  }
+                : stage
+            )
+          }
+        }
+      },
+      limits: { maxModelIterations: 2, maxToolCalls: 4 }
+    }));
+
+    const nextControl = events
+      .filter((event) => event.kind === "model.requested")[1]
+      ?.data.workflowReadyStageControl as JsonObject | undefined;
+
+    assert.equal(nextControl?.stageId, "stage:change");
+    assert.equal(nextControl?.projectedFromReviewedStage, true);
     await kernel.shutdown();
   });
 });function workflowBoundaryProfilePolicy(capabilityIds: readonly string[]): AgentLoopProfilePolicyMetadata {
@@ -4285,6 +4481,68 @@ function stagedWorkflowTerminalFailureProfilePolicy(): AgentLoopProfilePolicyMet
         profileId: "test/workflow-terminal-failure.v1",
         stageStates: [{
           stageId: "stage:terminal",
+          status: "ready",
+          attempts: 0,
+          inputRefs: [],
+          outputRefs: [],
+          diagnostics: []
+        }],
+        refs: [],
+        events: [],
+        compatibility: { schemaVersion: "1.0.0", minReaderVersion: "1.0.0" },
+        redaction: { class: "internal" }
+      },
+      redaction: { class: "internal" }
+    }
+  };
+}
+
+function stagedWorkflowTerminalCollectEvidenceProfilePolicy(): AgentLoopProfilePolicyMetadata {
+  return {
+    ...workflowBoundaryProfilePolicy(["core.workflow.terminal"]),
+    stagedTaskWorkflow: {
+      schemaVersion: "1.0.0",
+      profileId: "test/workflow-terminal-collect-evidence.v1",
+      graphId: "graph:test.workflow-terminal-collect-evidence",
+      fingerprint: "fnv1a:test-terminal-collect-evidence",
+      stageCount: 1,
+      refCount: 1,
+      executorKinds: ["agent-loop"],
+      graph: {
+        schemaVersion: "1.0.0",
+        graphId: "graph:test.workflow-terminal-collect-evidence",
+        profileId: "test/workflow-terminal-collect-evidence.v1",
+        stages: [{
+          schemaVersion: "1.0.0",
+          stageId: "stage:dispatch",
+          kind: "collect-evidence",
+          executorKind: "agent-loop",
+          dependsOn: [],
+          inputRefs: [],
+          expectedOutputRefs: ["ref:workflow-dispatch-evidence"],
+          allowedTools: ["core.workflow.terminal"],
+          compatibility: { schemaVersion: "1.0.0", minReaderVersion: "1.0.0" },
+          redaction: { class: "internal" }
+        }],
+        refs: [{
+          schemaVersion: "1.0.0",
+          refId: "ref:workflow-dispatch-evidence",
+          type: "evidence",
+          producerStageId: "stage:dispatch",
+          scope: "task",
+          compatibility: { schemaVersion: "1.0.0", minReaderVersion: "1.0.0" },
+          redaction: { class: "internal" }
+        }],
+        compatibility: { schemaVersion: "1.0.0", minReaderVersion: "1.0.0" },
+        redaction: { class: "internal" }
+      },
+      runState: {
+        schemaVersion: "1.0.0",
+        taskRunId: "staged:graph:test.workflow-terminal-collect-evidence",
+        graphId: "graph:test.workflow-terminal-collect-evidence",
+        profileId: "test/workflow-terminal-collect-evidence.v1",
+        stageStates: [{
+          stageId: "stage:dispatch",
           status: "ready",
           attempts: 0,
           inputRefs: [],

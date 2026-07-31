@@ -53,7 +53,9 @@ const DEFAULT_PREVIEW_CHARS = 160;
 const STAGES: readonly PromptAssemblyStage[] = ["normalize", "collect-sections", "order-sections", "budget", "weave-messages", "project-tools", "trace"];
 const PROVIDER_HISTORY_DYNAMIC_MESSAGE_LIMIT = 6;
 const PROVIDER_HISTORY_COMPACT_TOOL_RESULT_CHARS = 360;
-const PROVIDER_HISTORY_SOURCE_RESULT_CHARS = 12_000;
+const PROVIDER_HISTORY_SOURCE_RESULT_CHARS = 1_800;
+const PROVIDER_HISTORY_LATEST_SOURCE_RESULT_CHARS = 12_000;
+const PROVIDER_HISTORY_LATEST_SOURCE_RESULT_COUNT = 2;
 const EMPTY_REDACTION = { class: "internal" as const };
 
 export function createDefaultPromptAssembler(options: PromptAssemblerOptions = {}): PromptAssembler {
@@ -307,8 +309,9 @@ function boundDynamicProviderHistory(history: readonly ModelChatMessage[]): read
 }
 
 function boundedTailWithToolPairs(tail: readonly ModelChatMessage[], limit: number): readonly ModelChatMessage[] {
-  const sourceEvidence = latestSuccessfulSourceEvidencePair(tail);
-  const recentLimit = Math.max(0, limit - (sourceEvidence ? 2 : 0));
+  const sourceEvidence = latestSuccessfulSourceEvidencePairs(tail, PROVIDER_HISTORY_LATEST_SOURCE_RESULT_COUNT);
+  const preservedSourceToolCallIds = new Set(sourceEvidence.map((evidence) => evidence.toolCallId));
+  const recentLimit = Math.max(0, limit - (sourceEvidence.length * 2));
   const selected: Array<{ readonly index: number; readonly message: ModelChatMessage }> = [];
   const selectedToolCallIds = new Set<string>();
   let recentToolResult = true;
@@ -316,7 +319,7 @@ function boundedTailWithToolPairs(tail: readonly ModelChatMessage[], limit: numb
     const message = tail[index];
     if (!message) continue;
     if (message.role === "tool") {
-      if (message.toolCallId === sourceEvidence?.toolCallId) continue;
+      if (message.toolCallId && preservedSourceToolCallIds.has(message.toolCallId)) continue;
       const pair = toolPairFor(tail, index, selectedToolCallIds);
       if (pair && selected.length + 2 <= recentLimit) {
         const toolMessage = compactToolResultMessage(message, recentToolResult);
@@ -336,10 +339,10 @@ function boundedTailWithToolPairs(tail: readonly ModelChatMessage[], limit: numb
     }
     selected.push({ index, message });
   }
-  if (sourceEvidence) {
+  for (const evidence of sourceEvidence) {
     selected.push(
-      { index: sourceEvidence.intentIndex, message: sourceEvidence.intent },
-      { index: sourceEvidence.toolIndex, message: compactToolResultMessage(sourceEvidence.tool, false) }
+      { index: evidence.intentIndex, message: evidence.intent },
+      { index: evidence.toolIndex, message: compactSourceInspectionResult(evidence.tool, PROVIDER_HISTORY_LATEST_SOURCE_RESULT_CHARS) }
     );
   }
   return selected
@@ -349,7 +352,7 @@ function boundedTailWithToolPairs(tail: readonly ModelChatMessage[], limit: numb
 
 function compactToolResultMessage(message: ModelChatMessage, recent: boolean): ModelChatMessage {
   if (message.role === "tool" && isSuccessfulSourceInspectionResult(message)) {
-    return compactSourceInspectionResult(message);
+    return compactSourceInspectionResult(message, PROVIDER_HISTORY_SOURCE_RESULT_CHARS);
   }
   if (message.role !== "tool" || message.content.length <= PROVIDER_HISTORY_COMPACT_TOOL_RESULT_CHARS) return message;
   const previewChars = Math.floor(PROVIDER_HISTORY_COMPACT_TOOL_RESULT_CHARS / 2);
@@ -367,9 +370,9 @@ function compactToolResultMessage(message: ModelChatMessage, recent: boolean): M
   };
 }
 
-function compactSourceInspectionResult(message: ModelChatMessage): ModelChatMessage {
-  if (message.content.length <= PROVIDER_HISTORY_SOURCE_RESULT_CHARS) return message;
-  const segmentChars = Math.floor(PROVIDER_HISTORY_SOURCE_RESULT_CHARS / 3);
+function compactSourceInspectionResult(message: ModelChatMessage, limitChars: number): ModelChatMessage {
+  if (message.content.length <= limitChars) return message;
+  const segmentChars = Math.floor(limitChars / 3);
   const middleStart = Math.max(0, Math.floor((message.content.length - segmentChars) / 2));
   return {
     ...message,
@@ -386,27 +389,36 @@ function compactSourceInspectionResult(message: ModelChatMessage): ModelChatMess
   };
 }
 
-function latestSuccessfulSourceEvidencePair(tail: readonly ModelChatMessage[]): {
+function latestSuccessfulSourceEvidencePairs(tail: readonly ModelChatMessage[], limit: number): readonly {
   readonly intent: ModelChatMessage;
   readonly intentIndex: number;
   readonly tool: ModelChatMessage;
   readonly toolIndex: number;
   readonly toolCallId: string;
-} | undefined {
-  for (let index = tail.length - 1; index >= 0; index -= 1) {
+}[] {
+  const evidence: Array<{
+    readonly intent: ModelChatMessage;
+    readonly intentIndex: number;
+    readonly tool: ModelChatMessage;
+    readonly toolIndex: number;
+    readonly toolCallId: string;
+  }> = [];
+  const selectedToolCallIds = new Set<string>();
+  for (let index = tail.length - 1; index >= 0 && evidence.length < limit; index -= 1) {
     const message = tail[index];
     if (!message || message.role !== "tool" || !isSuccessfulSourceInspectionResult(message)) continue;
-    const pair = toolPairFor(tail, index, new Set());
+    const pair = toolPairFor(tail, index, selectedToolCallIds);
     if (!pair) continue;
-    return {
+    evidence.push({
       intent: pair.intent,
       intentIndex: pair.intentIndex,
       tool: message,
       toolIndex: index,
       toolCallId: pair.toolCallId
-    };
+    });
+    selectedToolCallIds.add(pair.toolCallId);
   }
-  return undefined;
+  return evidence;
 }
 
 function isSuccessfulSourceInspectionResult(message: ModelChatMessage): boolean {

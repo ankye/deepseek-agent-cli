@@ -16,9 +16,12 @@ import type {
   ProcessRunObserver,
   ProcessRunOptions,
   RuntimeEvent,
+  SerializableResult,
+  ShellProviderDescriptor,
+  StagedTaskRef,
   ToolResultFeedback
 } from "@deepseek/platform-contracts";
-import { asId } from "@deepseek/platform-contracts";
+import { STAGED_TASK_COMPATIBILITY, STAGED_TASK_SCHEMA_VERSION, asId } from "@deepseek/platform-contracts";
 import {
   collectRuntimeEvents,
   createDefaultRuntimeKernel,
@@ -404,6 +407,19 @@ describe("agent loop typed tool feedback", () => {
     assert.equal(emptyFocusedSearch, undefined);
   });
 
+  it("does not complete collect-evidence stages from path-only focused search results", () => {
+    const pathOnlyFocusedSearch = advanceWorkflowStageFromToolEvidence({
+      profilePolicy: supervisorDiscoveryThenChangePolicy(),
+      capabilityId: "core.search.text",
+      toolCallId: "call-path-only-focused-search",
+      toolInput: { pattern: "RST", glob: "astropy/io/ascii/rst.py" },
+      terminal: completedCapabilityEvent({}, { text: "astropy/io/ascii/rst.py\n", lineCount: 1, truncated: false }),
+      at: "2026-07-06T00:00:00.000Z"
+    });
+
+    assert.equal(pathOnlyFocusedSearch, undefined);
+  });
+
   it("builds rejected dispatch result DTOs for event and decision-board callers", () => {
     const result = buildRejectedDispatchResult({
       toolCallId: "call-preflight",
@@ -635,7 +651,7 @@ describe("agent loop typed tool feedback", () => {
     await kernel.shutdown();
   });
 
-  it("flags repeated supervisor evidence inspection as non-progress while hiding supporting reads", async () => {
+  it("bounds repeated supervisor evidence inspection through focused evidence closure", async () => {
     const deps = createDeterministicRuntimeDependencies({ platform: new SuccessfulTestFakePlatformRuntime() });
     await deps.platform.writeFile("/workspace/README.md", "stage evidence\n");
     const gateway = new RepeatingReadToolCallGateway();
@@ -671,8 +687,12 @@ describe("agent loop typed tool feedback", () => {
       event.data.stageId === "stage:change" &&
       event.data.requestedCapabilityId === "core.file.read"
     );
-    assert.equal(readResults.length, 1, "supporting reads execute only in the evidence stage before progress-only tightening");
-    assert.ok(nonProgressMisses.length >= 1, "supporting reads must still be classified as non-progress");
+    assert.equal(readResults.length, 3, "initial, novel focused, and empty continuation reads execute within the bounded window");
+    assert.equal(nonProgressMisses.length, 1, "the hidden change-stage read must be classified as non-progress");
+    assert.equal(events.some((event) =>
+      event.kind === "workflow.stage-evidence.window.closed" &&
+      event.data.reason === "evidence-empty"
+    ), true);
     assert.equal(events.some((event) => event.kind === "agent.loop.failed" && event.data.reason === "test-understand-stage-budget"), false);
     await kernel.shutdown();
   });
@@ -705,12 +725,16 @@ describe("agent loop typed tool feedback", () => {
       event.data.toolName === "core.file.read" &&
       event.data.terminalKind === "workflow-capability-boundary.rejected"
     );
-    assert.equal(boundaryRejections.length, 2);
+    assert.equal(boundaryRejections.length, 1);
     assert.equal(events.filter((event) =>
       event.kind === "workflow.required-action.missed" &&
       event.data.stageId === "stage:change" &&
       event.data.requestedCapabilityId === "core.file.read"
-    ).length, 2);
+    ).length, 1);
+    assert.equal(events.some((event) =>
+      event.kind === "workflow.stage-evidence.accepted" &&
+      event.data.toolCallId === "call-read-3"
+    ), true);
     const providerToolsAfterCorrection = providerToolNames(gateway.requests[3]);
     assert.equal(providerToolsAfterCorrection.includes("core_file_read"), true);
     assert.equal(providerToolsAfterCorrection.includes("core_file_edit"), true);
@@ -759,6 +783,93 @@ describe("agent loop typed tool feedback", () => {
     assert.equal(visibleToolIds?.includes("core.file.edit"), true);
     assert.equal(override?.requiredNextAction, undefined);
     assert.equal(await deps.platform.readFile("/workspace/README.md"), "changed evidence\nmore context\n");
+    await kernel.shutdown();
+  });
+
+  it("clears stale source-inspection correction overrides after advancing to mutation", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await deps.platform.writeFile("/workspace/README.md", "stage evidence\n");
+    const gateway = new BatchedToolCallModelGateway([
+      [
+        { id: "call-initial-search", name: "core.search.text", input: { pattern: "stage", outputMode: "files_withMatches" } }
+      ],
+      [
+        { id: "call-read-progress", name: "core.file.read", input: { path: "README.md", offset: 0, limit: 2 } },
+        { id: "call-stale-search", name: "core.search.text", input: { pattern: "stage", outputMode: "files_withMatches" } }
+      ],
+      [
+        { id: "call-next-read", name: "core.file.read", input: { path: "README.md", offset: 0, limit: 2 } }
+      ],
+      [
+        { id: "call-edit", name: "core.file.edit", input: { path: "README.md", expected: "stage evidence", replacement: "changed evidence" } }
+      ]
+    ]);
+    const loopDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
+    await registerRuntimeCoreTools(loopDeps, "/workspace");
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "read evidence, then stale search should not keep mutation stage in read-only mode",
+      caller: "runtime.stage-stale-read-gate-clear.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      toolProjection: "safe-all",
+      profilePolicy: supervisorReadThenChangePolicy(),
+      limits: { maxModelIterations: 6, maxToolCalls: 8 }
+    }));
+
+    const thirdRequest = events
+      .filter((event) => event.kind === "model.requested")
+      .find((event) => event.data.iteration === 3);
+    const override = (thirdRequest?.data.profilePolicy as JsonObject | undefined)?.workflowGateOverride as JsonObject | undefined;
+
+    assert.equal(override?.requiredNextAction, undefined);
+    assert.equal(events.some((event) =>
+      event.kind === "model.tool.result" &&
+      event.data.toolCallId === "call-next-read" &&
+      event.data.terminalKind === "capability.completed"
+    ), false);
+    assert.equal(await deps.platform.readFile("/workspace/README.md"), "changed evidence\n");
+    await kernel.shutdown();
+  });
+
+  it("does not project source-inspection-only gates into mutation stages", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await deps.platform.writeFile("/workspace/README.md", "stage evidence\n");
+    const gateway = new RecordingSingleToolCallModelGateway("core.file.edit", {
+      path: "README.md",
+      expected: "stage evidence",
+      replacement: "changed evidence"
+    });
+    const loopDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
+    await registerRuntimeCoreTools(loopDeps, "/workspace");
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+    await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "change stage should ignore stale read-only correction gate",
+      caller: "runtime.stage-stale-read-gate-projection.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      toolProjection: "safe-all",
+      profilePolicy: {
+        ...workflowMutationStageProfilePolicy(),
+        workflowGateOverride: {
+          gate: "runtime-convergence" as const,
+          requiredNextAction: "core.file.read|core.file.list|core.search.text|core.workspace.glob",
+          rejectedCapabilityId: "core.search.text",
+          rejectedToolName: "core.search.text",
+          terminalKind: "workflow-required-action.rejected",
+          toolCallId: "call-stale-search"
+        }
+      },
+      limits: { maxModelIterations: 2, maxToolCalls: 4 }
+    }));
+
+    const firstProfilePolicy = gateway.requests[0]?.metadata?.profilePolicy as JsonObject | undefined;
+    const firstOverride = firstProfilePolicy?.workflowGateOverride as JsonObject | undefined;
+
+    assert.equal(firstOverride?.requiredNextAction, undefined);
+    assert.equal(await deps.platform.readFile("/workspace/README.md"), "changed evidence\n");
     await kernel.shutdown();
   });
 
@@ -829,8 +940,11 @@ describe("agent loop typed tool feedback", () => {
       event.data.requestedCapabilityId === "core.file.read"
     );
     const providerToolsAfterMiss = providerToolNames(gateway.requests[2]);
-
-    assert.equal(changeMisses.length, 2);
+    assert.equal(changeMisses.length, 1);
+    assert.equal(events.some((event) =>
+      event.kind === "workflow.stage-evidence.accepted" &&
+      event.data.toolCallId === "call-read-3"
+    ), true);
     assert.equal(providerToolsAfterMiss.includes("core_file_read"), true);
     assert.equal(providerToolsAfterMiss.includes("core_file_edit"), true);
     assert.equal(events.some((event) =>
@@ -932,6 +1046,170 @@ describe("agent loop typed tool feedback", () => {
     await kernel.shutdown();
   });
 
+  it("records a focused official repair refresh as non-progress before mutation", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await deps.platform.writeFile("/workspace/README.md", "stage evidence\n");
+    const gateway = new SequentialToolCallModelGateway([
+      { id: "call-official-repair-read", name: "core.file.read", input: { path: "README.md", offset: 0, limit: 20 } },
+      { id: "call-official-repair-edit", name: "core.file.edit", input: { path: "README.md", expected: "stage evidence", replacement: "repaired evidence" } }
+    ]);
+    const loopDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
+    await registerRuntimeCoreTools(loopDeps, "/workspace");
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "repair after official harness failure",
+      caller: "runtime.official-repair-focused-refresh.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      toolProjection: "safe-all",
+      profilePolicy: supervisorOfficialRepairChangePolicy(),
+      limits: { maxModelIterations: 4, maxToolCalls: 6 }
+    }));
+    assert.equal(events.some((event) =>
+      event.kind === "model.tool.result" &&
+      event.data.toolCallId === "call-official-repair-read" &&
+      event.data.terminalKind === "capability.completed"
+    ), true);
+    assert.equal(events.some((event) =>
+      event.kind === "workflow.required-action.missed" &&
+      event.data.requestedCapabilityId === "core.file.read" &&
+      event.data.terminalKind === "capability.completed" &&
+      event.data.requiredNextAction === "core.file.edit|core.patch.apply"
+    ), true);
+    assert.equal(await deps.platform.readFile("/workspace/README.md"), "repaired evidence\n");
+    await kernel.shutdown();
+  });
+
+  it("bounds official repair refresh to one read before mutation", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await deps.platform.writeFile("/workspace/README.md", "stage evidence\n");
+    const gateway = new SequentialToolCallModelGateway([
+      { id: "call-official-repair-read-1", name: "core.file.read", input: { path: "README.md", offset: 0, limit: 20 } },
+      { id: "call-official-repair-read-2", name: "core.file.read", input: { path: "README.md", offset: 0, limit: 20 } },
+      { id: "call-official-repair-edit", name: "core.file.edit", input: { path: "README.md", expected: "stage evidence", replacement: "repaired evidence" } }
+    ]);
+    const loopDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
+    await registerRuntimeCoreTools(loopDeps, "/workspace");
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "repair after official harness failure with too much inspection",
+      caller: "runtime.official-repair-focused-refresh-bound.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      toolProjection: "safe-all",
+      profilePolicy: supervisorOfficialRepairChangePolicy(),
+      limits: { maxModelIterations: 8, maxToolCalls: 10 }
+    }));
+    const missed = events.find((event) =>
+      event.kind === "workflow.required-action.missed" &&
+      event.data.requestedCapabilityId === "core.file.read"
+    );
+    assert.notEqual(missed, undefined);
+    assert.equal(missed?.data.gateRequiredNextAction ?? missed?.data.requiredNextAction, "core.file.edit|core.patch.apply");
+    assert.equal(events.some((event) =>
+      event.kind === "model.tool.result" &&
+      event.data.toolCallId === "call-official-repair-read-2" &&
+      event.data.terminalKind === "capability.completed"
+    ), false);
+    const rejectedResult = events.find((event) =>
+      event.kind === "model.tool.result" &&
+      event.data.toolCallId === "call-official-repair-read-2"
+    );
+    assert.match(String(rejectedResult?.data.result ?? ""), /core\.file\.edit\|core\.patch\.apply/);
+    const mutationRequestMessages = gateway.requests[2]?.messages ?? [];
+    assert.match(
+      mutationRequestMessages.map((message) => String(message.content ?? "")).join("\n"),
+      /WORKFLOW_REQUIRED_ACTION_MISSED[\s\S]*core\.file\.edit\|core\.patch\.apply/
+    );
+    assert.equal(providerToolNames(gateway.requests[2]).includes("core_file_read"), false);
+    assert.equal(await deps.platform.readFile("/workspace/README.md"), "repaired evidence\n");
+    await kernel.shutdown();
+  });
+
+  it("rejects a wrong-target refresh after an official repair edit precondition failure", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await deps.platform.writeFile("/workspace/README.md", "current repair target\n");
+    await deps.platform.writeFile("/workspace/OTHER.md", "unrelated source\n");
+    const gateway = new SequentialToolCallModelGateway([
+      { id: "call-official-read-1", name: "core.file.read", input: { path: "README.md", offset: 0, limit: 20 } },
+      {
+        id: "call-stale-edit",
+        name: "core.file.edit",
+        input: { path: "README.md", expected: "stale repair target", replacement: "fixed repair target" }
+      },
+      {
+        id: "call-wrong-target",
+        name: "core.file.read",
+        input: { path: "OTHER.md", offset: 0, limit: 20 }
+      }
+    ]);
+    const loopDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
+    await registerRuntimeCoreTools(loopDeps, "/workspace");
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "exhaust repair inspection, fail a stale edit, then refresh the exact target",
+      caller: "runtime.official-repair-exact-refresh-target.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      toolProjection: "safe-all",
+      profilePolicy: supervisorOfficialRepairChangePolicy(),
+      limits: { maxModelIterations: 8, maxToolCalls: 10 }
+    }));
+    const wrongTarget = events.find((event) =>
+      event.kind === "model.tool.result" && event.data.toolCallId === "call-wrong-target"
+    );
+    assert.equal(wrongTarget?.data.terminalKind, "workflow-mutation-recovery-target.rejected");
+    assert.equal(events.some((event) =>
+      event.kind === "capability.started" && event.data.toolCallId === "call-wrong-target"
+    ), false);
+    await kernel.shutdown();
+  });
+
+  it("allows one exact-target refresh after an official repair edit precondition failure", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await deps.platform.writeFile("/workspace/README.md", "current repair target\n");
+    const gateway = new SequentialToolCallModelGateway([
+      { id: "call-official-read-1", name: "core.file.read", input: { path: "README.md", offset: 0, limit: 20 } },
+      {
+        id: "call-stale-edit",
+        name: "core.file.edit",
+        input: { path: "README.md", expected: "stale repair target", replacement: "fixed repair target" }
+      },
+      {
+        id: "call-exact-refresh",
+        name: "core.file.read",
+        input: { path: "README.md", offset: 0, limit: 20 }
+      },
+      {
+        id: "call-corrected-edit",
+        name: "core.file.edit",
+        input: { path: "README.md", expected: "current repair target", replacement: "fixed repair target" }
+      }
+    ]);
+    const loopDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
+    await registerRuntimeCoreTools(loopDeps, "/workspace");
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "exhaust repair inspection, recover one stale edit, then mutate",
+      caller: "runtime.official-repair-exact-refresh.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      toolProjection: "safe-all",
+      profilePolicy: supervisorOfficialRepairChangePolicy(),
+      limits: { maxModelIterations: 10, maxToolCalls: 10 }
+    }));
+    const exactRefresh = events.find((event) =>
+      event.kind === "model.tool.result" && event.data.toolCallId === "call-exact-refresh"
+    );
+    assert.equal(exactRefresh?.data.terminalKind, "capability.completed");
+    assert.equal(await deps.platform.readFile("/workspace/README.md"), "fixed repair target\n");
+    await kernel.shutdown();
+  });
+
   it("keeps supervisor downstream mutation stages open for follow-up edits", async () => {
     const deps = createDeterministicRuntimeDependencies();
     await deps.platform.writeFile("/workspace/README.md", "stage evidence\n");
@@ -998,7 +1276,7 @@ describe("agent loop typed tool feedback", () => {
       });
     const override = (postFailureRequest?.data.profilePolicy as JsonObject | undefined)?.workflowGateOverride as JsonObject | undefined;
 
-    assert.equal(override?.requiredNextAction, "core.file.edit");
+    assert.equal(override?.requiredNextAction, "exact-target-refresh-or-source-edit-or-bounded-blocker");
     await kernel.shutdown();
   });
 
@@ -1185,6 +1463,40 @@ describe("agent loop typed tool feedback", () => {
     assert.deepEqual(
       projectProviderCacheToolSet(capabilities, request).map((tool) => String(tool.id)),
       ["core.file.read", "core.workspace.glob", "core.file.edit", "core.patch.apply", "core.test.run"]
+    );
+  });
+
+  it("narrows explicit-prefix provider tools after official repair refresh requires mutation", () => {
+    const capabilities = [
+      manifest("core.file.read", "read", []),
+      manifest("core.search.text", "read", []),
+      manifest("core.file.edit", "write", []),
+      manifest("core.patch.apply", "write", []),
+      manifest("core.test.run", "process", ["process:test"])
+    ];
+    const request = {
+      prompt: "repair after official harness failure",
+      caller: "runtime.provider-official-repair-projection.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl" as const,
+      profile: defaultGlmAnthropicProfile,
+      toolProjection: "safe-all" as const,
+      profilePolicy: {
+        ...supervisorOfficialRepairChangePolicy(),
+        workflowGateOverride: {
+          gate: "runtime-convergence" as const,
+          requiredNextAction: "core.file.edit|core.patch.apply",
+          rejectedCapabilityId: "core.file.read",
+          rejectedToolName: "core.file.read",
+          terminalKind: "workflow-official-repair.refreshed",
+          toolCallId: "call-official-refresh"
+        }
+      }
+    };
+
+    assert.deepEqual(
+      projectProviderCacheToolSet(capabilities, request).map((tool) => String(tool.id)),
+      ["core.file.edit", "core.patch.apply"]
     );
   });
 
@@ -2465,6 +2777,162 @@ describe("agent loop typed tool feedback", () => {
     assert.equal(progress, undefined);
   });
 
+  it("allows safe evaluation reproduction shell commands without completing verify", () => {
+    const policy = {
+      ...supervisorReadyVerifyPolicy(),
+      workflowGovernanceMode: "evaluation" as const
+    };
+    const toolInput = {
+      command: "cd /workspace && python -c \"from demo import reproduce; print(reproduce())\""
+    };
+    const error = workflowCapabilityBoundaryGuard({
+      profilePolicy: policy,
+      workflowReadyStageControl: {
+        stageId: "stage:verify",
+        stageKind: "verify",
+        requiredNextAction: "core.test.run"
+      },
+      capabilityId: "core.shell.run",
+      toolName: "core.shell.run",
+      toolInput
+    });
+    const progress = advanceWorkflowStageFromToolEvidence({
+      profilePolicy: policy,
+      capabilityId: "core.shell.run",
+      toolCallId: "call-evaluation-shell-reproduction",
+      toolInput,
+      terminal: completedCapabilityEvent(),
+      at: "2026-07-07T00:00:00.000Z"
+    });
+
+    assert.equal(error, undefined);
+    assert.equal(progress, undefined);
+  });
+
+  it("allows a safe reproduction prefixed by the exact governed checkout root", () => {
+    const policy = {
+      ...supervisorReadyVerifyPolicy(),
+      workflowGovernanceMode: "evaluation" as const
+    };
+    const toolInput = {
+      command: "cd /run/repo && python -c \"import sys; from demo import table; table.write(sys.stdout, header_rows=['name'])\"",
+      workspaceRoot: "/run/repo"
+    };
+    const error = workflowCapabilityBoundaryGuard({
+      profilePolicy: policy,
+      workflowReadyStageControl: {
+        stageId: "stage:verify",
+        stageKind: "verify",
+        requiredNextAction: "core.test.run"
+      },
+      capabilityId: "core.shell.run",
+      toolName: "core.shell.run",
+      toolInput
+    });
+    const progress = advanceWorkflowStageFromToolEvidence({
+      profilePolicy: policy,
+      capabilityId: "core.shell.run",
+      toolCallId: "call-checkout-root-reproduction",
+      toolInput,
+      terminal: completedCapabilityEvent(),
+      at: "2026-07-07T00:00:00.000Z"
+    });
+
+    assert.equal(error, undefined);
+    assert.equal(progress, undefined);
+  });
+
+  it("allows standard shell test commands during failed-test repair without completing verify", () => {
+    const policy = {
+      ...supervisorReadyVerifyPolicy(),
+      workflowGovernanceMode: "evaluation" as const,
+      workflowCapabilityIds: [
+        "core.file.read",
+        "core.search.text",
+        "core.file.edit",
+        "core.patch.apply",
+        "core.test.run",
+        "core.shell.run"
+      ],
+      workflowGateOverride: {
+        gate: "runtime-convergence" as const,
+        requiredNextAction: "focused-read-or-source-edit-or-test-or-return-control",
+        rejectedCapabilityId: "core.test.run",
+        rejectedToolName: "core.test.run",
+        terminalKind: "workflow-standard-test-failed",
+        toolCallId: "call-failed-pytest"
+      }
+    };
+    const toolInput = {
+      command: "python -m unittest astropy.io.ascii.tests.test_rst"
+    };
+    const error = workflowCapabilityBoundaryGuard({
+      profilePolicy: policy,
+      workflowReadyStageControl: {
+        stageId: "stage:verify",
+        stageKind: "verify",
+        requiredNextAction: "core.test.run"
+      },
+      capabilityId: "core.shell.run",
+      toolName: "core.shell.run",
+      toolInput
+    });
+    const progress = advanceWorkflowStageFromToolEvidence({
+      profilePolicy: policy,
+      capabilityId: "core.shell.run",
+      toolCallId: "call-shell-unittest",
+      toolInput,
+      terminal: completedCapabilityEvent(),
+      at: "2026-07-07T00:00:00.000Z"
+    });
+
+    assert.equal(error, undefined);
+    assert.equal(progress, undefined);
+  });
+
+  it("projects shell test execution during failed-test repair", () => {
+    const capabilities = [
+      manifest("core.file.read", "read", []),
+      manifest("core.search.text", "read", []),
+      manifest("core.file.edit", "write", []),
+      manifest("core.patch.apply", "write", []),
+      manifest("core.test.run", "process", ["process:test"]),
+      manifest("core.shell.run", "process", ["process:run"])
+    ];
+    const request = {
+      prompt: "repair after failed pytest",
+      caller: "runtime.provider-verification-repair-shell-projection.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl" as const,
+      profile: defaultDeepSeekProfile,
+      toolProjection: "safe-all" as const,
+      profilePolicy: {
+        ...supervisorReadyVerifyPolicy(),
+        workflowCapabilityIds: [
+          "core.file.read",
+          "core.search.text",
+          "core.file.edit",
+          "core.patch.apply",
+          "core.test.run",
+          "core.shell.run"
+        ],
+        workflowGateOverride: {
+          gate: "runtime-convergence" as const,
+          requiredNextAction: "focused-read-or-source-edit-or-test-or-return-control",
+          rejectedCapabilityId: "core.test.run",
+          rejectedToolName: "core.test.run",
+          terminalKind: "workflow-standard-test-failed",
+          toolCallId: "call-failed-pytest"
+        }
+      }
+    };
+
+    assert.deepEqual(
+      projectProviderCacheToolSet(capabilities, request).map((tool) => String(tool.id)),
+      ["core.file.read", "core.search.text", "core.file.edit", "core.patch.apply", "core.test.run", "core.shell.run"]
+    );
+  });
+
   it("projects focused repair capabilities after a successful evaluation reproduction", async () => {
     const deps = createDeterministicRuntimeDependencies({ platform: new SuccessfulTestFakePlatformRuntime() });
     await deps.platform.writeFile("/workspace/README.md", "repair target\n");
@@ -2551,7 +3019,7 @@ describe("agent loop typed tool feedback", () => {
         intent: "reproduce the reported regression before standard verification"
       }
     });
-    const shellError = workflowCapabilityBoundaryGuard({
+    const safeShellError = workflowCapabilityBoundaryGuard({
       profilePolicy: policy,
       workflowReadyStageControl: {
         stageId: "stage:verify",
@@ -2565,9 +3033,24 @@ describe("agent loop typed tool feedback", () => {
         intent: "reproduce the reported regression before standard verification"
       }
     });
+    const unsafeShellError = workflowCapabilityBoundaryGuard({
+      profilePolicy: policy,
+      workflowReadyStageControl: {
+        stageId: "stage:verify",
+        stageKind: "verify",
+        requiredNextAction: "core.test.run"
+      },
+      capabilityId: "core.shell.run",
+      toolName: "core.shell.run",
+      toolInput: {
+        command: "python -c \"from pathlib import Path; Path('result.txt').write_text('changed')\"",
+        intent: "reproduce the reported regression before standard verification"
+      }
+    });
 
     assert.equal(writeError?.code, "WORKFLOW_STANDARD_TEST_REQUIRED");
-    assert.equal(shellError?.code, "WORKFLOW_STANDARD_TEST_REQUIRED");
+    assert.equal(safeShellError, undefined);
+    assert.equal(unsafeShellError?.code, "WORKFLOW_STANDARD_TEST_REQUIRED");
   });
 
   it("rejects mixed side-effect test tool commands before verify execution", () => {
@@ -2723,15 +3206,75 @@ describe("agent loop typed tool feedback", () => {
     }));
 
     assert.deepEqual(providerToolNames(gateway.requests[1]), ["core_file_edit", "core_file_read", "core_git_diff", "core_patch_apply", "core_search_text", "core_test_run"]);
-    assert.deepEqual(providerToolNames(gateway.requests[2]), ["core_file_edit", "core_file_read", "core_git_diff", "core_patch_apply", "core_test_run"]);
+    assert.deepEqual(providerToolNames(gateway.requests[2]), ["core_file_edit", "core_file_read", "core_git_diff", "core_patch_apply", "core_search_text", "core_test_run"]);
     const thirdModelRequest = events.filter((event) => event.kind === "model.requested")[2];
     const thirdProfilePolicy = thirdModelRequest?.data.profilePolicy as {
       workflowGateOverride?: { requiredNextAction?: string };
     } | undefined;
     assert.equal(
       thirdProfilePolicy?.workflowGateOverride?.requiredNextAction,
-      "source-edit-or-test-or-bounded-blocker"
+      "focused-read-or-source-edit-or-test-or-return-control"
     );
+    await kernel.shutdown();
+  });
+
+  it("bounds focused evidence refreshes after failed standard-test repair", async () => {
+    const deps = createDeterministicRuntimeDependencies({ platform: new FailedTestFakePlatformRuntime() });
+    await deps.platform.writeFile("/workspace/README.md", "verify repair target\n");
+    const gateway = new SequentialToolCallModelGateway([
+      {
+        id: "call-standard-verify",
+        name: "core.test.run",
+        input: { command: "python", args: ["-m", "pytest", "tests/test_demo.py"] }
+      },
+      {
+        id: "call-read-1",
+        name: "core.file.read",
+        input: { path: "README.md", offset: 0, limit: 20 }
+      },
+      {
+        id: "call-search-2",
+        name: "core.search.text",
+        input: { pattern: "repair", glob: "README.md", outputMode: "content", contextLines: 1 }
+      },
+      {
+        id: "call-read-3",
+        name: "core.file.read",
+        input: { path: "README.md", offset: 0, limit: 20 }
+      },
+      {
+        id: "call-search-4",
+        name: "core.search.text",
+        input: { pattern: "target", glob: "README.md", outputMode: "content", contextLines: 1 }
+      },
+      {
+        id: "call-read-5",
+        name: "core.file.read",
+        input: { path: "README.md", offset: 0, limit: 20 }
+      }
+    ]);
+    const loopDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
+    await registerRuntimeCoreTools(loopDeps, "/workspace");
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "verify, inspect a few times, then repair or retest",
+      caller: "runtime.verify-standard-refresh-bound.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      toolProjection: "safe-all",
+      profilePolicy: supervisorReadyVerifyPolicy(),
+      limits: { maxModelIterations: 8, maxToolCalls: 8 }
+    }));
+
+    assert.deepEqual(providerToolNames(gateway.requests[5]), ["core_file_edit", "core_git_diff", "core_patch_apply", "core_test_run"]);
+    const rejectedRead = events.find((event) =>
+      event.kind === "model.tool.result" &&
+      event.data.toolCallId === "call-read-5" &&
+      event.data.terminalKind === "workflow-capability-boundary.rejected"
+    );
+    assert.notEqual(rejectedRead, undefined);
+    assert.match(String(rejectedRead?.data.result ?? ""), /core\.file\.edit\|core\.patch\.apply\|core\.test\.run/);
     await kernel.shutdown();
   });
 
@@ -2774,14 +3317,17 @@ describe("agent loop typed tool feedback", () => {
       limits: { maxModelIterations: 6, maxToolCalls: 6 }
     }));
 
-    assert.deepEqual(providerToolNames(gateway.requests[2]), ["core_file_edit", "core_file_read", "core_git_diff", "core_patch_apply", "core_test_run"]);
-    assert.deepEqual(providerToolNames(gateway.requests[3]), ["core_file_edit", "core_file_read", "core_git_diff", "core_patch_apply", "core_test_run"]);
+    assert.deepEqual(providerToolNames(gateway.requests[2]), ["core_file_edit", "core_file_read", "core_git_diff", "core_patch_apply", "core_search_text", "core_test_run"]);
+    assert.deepEqual(providerToolNames(gateway.requests[3]), ["core_file_edit", "core_file_read", "core_patch_apply"]);
     const fourthModelRequest = events.filter((event) => event.kind === "model.requested")[3];
     const fourthProfilePolicy = fourthModelRequest?.data.profilePolicy as {
       workflowGateOverride?: { requiredNextAction?: string; terminalKind?: string };
     } | undefined;
     assert.equal(fourthProfilePolicy?.workflowGateOverride?.terminalKind, "workflow-mutation-repair.required");
-    assert.equal(fourthProfilePolicy?.workflowGateOverride?.requiredNextAction, "core.patch.apply|core.file.edit");
+    assert.equal(
+      fourthProfilePolicy?.workflowGateOverride?.requiredNextAction,
+      "exact-target-refresh-or-source-edit-or-bounded-blocker"
+    );
     const staleEditMiss = events.find((event) =>
       event.kind === "workflow.required-action.missed" &&
       event.data.requestedCapabilityId === "core.file.edit"
@@ -2791,6 +3337,11 @@ describe("agent loop typed tool feedback", () => {
       "core.test.run",
       "failed source edits allowed by a repair gate must not be attributed to the verify-stage test action"
     );
+    assert.equal(events.some((event) =>
+      event.kind === "model.tool.result" &&
+      event.data.toolCallId === "call-repeat-read-after-edit-failure" &&
+      event.data.terminalKind === "capability.completed"
+    ), true);
     await kernel.shutdown();
   });
 
@@ -2827,6 +3378,24 @@ describe("agent loop typed tool feedback", () => {
     const loopDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
     await registerRuntimeCoreTools(loopDeps, "/workspace");
     const kernel = await createDefaultRuntimeKernel(loopDeps);
+    const baseProfilePolicy = supervisorReadyVerifyPolicy();
+    const baseWorkflow = baseProfilePolicy.stagedTaskWorkflow;
+    if (!baseWorkflow) throw new Error("Expected supervisorReadyVerifyPolicy to include staged workflow metadata.");
+    const profilePolicy: AgentLoopProfilePolicyMetadata = {
+      ...baseProfilePolicy,
+      workflowCapabilityIds: [...baseProfilePolicy.workflowCapabilityIds, "core.shell.run"],
+      stagedTaskWorkflow: {
+        ...baseWorkflow,
+        graph: {
+          ...baseWorkflow.graph,
+          stages: baseWorkflow.graph.stages.map((stage) =>
+            stage.stageId === "stage:verify"
+              ? { ...stage, allowedTools: [...(stage.allowedTools ?? []), "core.shell.run"] }
+              : stage
+          )
+        }
+      }
+    };
     const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
       prompt: "verify, refresh evidence, repair a failed edit, then verify again",
       caller: "runtime.verify-standard-repair-success-returns-to-test.test",
@@ -2834,17 +3403,310 @@ describe("agent loop typed tool feedback", () => {
       outputMode: "jsonl",
       profile: defaultDeepSeekProfile,
       toolProjection: "safe-all",
-      profilePolicy: supervisorReadyVerifyPolicy(),
+      profilePolicy,
       limits: { maxModelIterations: 8, maxToolCalls: 8 }
     }));
 
-    assert.deepEqual(providerToolNames(gateway.requests[4]), ["core_file_edit", "core_file_read", "core_git_diff", "core_test_run"]);
+    assert.deepEqual(providerToolNames(gateway.requests[4]), ["core_file_edit", "core_file_read", "core_git_diff", "core_shell_run", "core_test_run"]);
     const fifthModelRequest = events.filter((event) => event.kind === "model.requested")[4];
     const fifthProfilePolicy = fifthModelRequest?.data.profilePolicy as {
       workflowGateOverride?: { requiredNextAction?: string; terminalKind?: string };
     } | undefined;
-    assert.equal(fifthProfilePolicy?.workflowGateOverride?.requiredNextAction, "standard-test-command");
+    assert.equal(fifthProfilePolicy?.workflowGateOverride?.requiredNextAction, "standard-test-command-or-bounded-blocker");
     assert.equal(await deps.platform.readFile("/workspace/README.md"), "fixed repair target\n");
+    await kernel.shutdown();
+  });
+
+  it("keeps one standard-test closure turn after a repaired failed-test edit hits the model limit", async () => {
+    const deps = createDeterministicRuntimeDependencies({ platform: new FailingThenSuccessfulTestFakePlatformRuntime() });
+    await deps.platform.writeFile("/workspace/README.md", "verify repair target\n");
+    const gateway = new SequentialToolCallModelGateway([
+      {
+        id: "call-standard-verify",
+        name: "core.test.run",
+        input: { command: "python", args: ["-m", "pytest", "tests/test_demo.py"] }
+      },
+      {
+        id: "call-read-after-failed-test",
+        name: "core.file.read",
+        input: { path: "README.md", offset: 0, limit: 20 }
+      },
+      {
+        id: "call-stale-repair-edit",
+        name: "core.file.edit",
+        input: { path: "README.md", expected: "missing repair target", replacement: "fixed repair target" }
+      },
+      {
+        id: "call-fresh-repair-edit",
+        name: "core.file.edit",
+        input: { path: "README.md", expected: "verify repair target", replacement: "fixed repair target" }
+      },
+      {
+        id: "call-illegal-search-after-repair",
+        name: "core.search.text",
+        input: { pattern: "repair", glob: "README.md", outputMode: "content", contextLines: 1 }
+      },
+      {
+        id: "call-standard-verify-after-repair",
+        name: "core.test.run",
+        input: { command: "python", args: ["-m", "pytest", "tests/test_demo.py"] }
+      }
+    ]);
+    const loopDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
+    await registerRuntimeCoreTools(loopDeps, "/workspace");
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "verify, repair failed test, drift once, then verify again",
+      caller: "runtime.verify-standard-repair-limit-closure.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      toolProjection: "safe-all",
+      profilePolicy: supervisorReadyVerifyPolicy(),
+      limits: { maxModelIterations: 5, maxToolCalls: 8 }
+    }));
+
+    assert.equal(events.some((event) =>
+      event.kind === "model.tool.intent" &&
+      event.data.toolCallId === "call-standard-verify-after-repair"
+    ), true);
+    assert.equal(events.some((event) =>
+      event.kind === "agent.loop.completed" &&
+      event.data.reason === "terminal-tool-completed"
+    ), true);
+    await kernel.shutdown();
+  });
+
+  it("requires a problem reproduction before public test-only verification during official repair", async () => {
+    const deps = createDeterministicRuntimeDependencies({ platform: new SuccessfulTestWithShellFakePlatformRuntime() });
+    const gateway = new SequentialToolCallModelGateway([
+      {
+        id: "call-public-pytest-only",
+        name: "core.test.run",
+        input: { command: "python", args: ["-m", "pytest", "astropy/io/ascii/tests/test_rst.py"] }
+      },
+      {
+        id: "call-hidden-reproduction",
+        name: "core.shell.run",
+        input: {
+          command: "cd /workspace && python -c \"from io import StringIO; buf = StringIO(); buf.write('x'); print(buf.getvalue())\"",
+          intent: "reproduce hidden official fail-to-pass test"
+        }
+      },
+      {
+        id: "call-public-pytest-after-repro",
+        name: "core.test.run",
+        input: { command: "python", args: ["-m", "pytest", "astropy/io/ascii/tests/test_rst.py"] }
+      }
+    ]);
+    const loopDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
+    await registerRuntimeCoreTools(loopDeps, "/workspace");
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "official repair should reproduce hidden test before trusting public pytest",
+      caller: "runtime.official-repair-reproduction-required.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      toolProjection: "safe-all",
+      profilePolicy: supervisorOfficialRepairVerifyPolicy(),
+      limits: { maxModelIterations: 5, maxToolCalls: 6 }
+    }));
+
+    const publicOnlyMiss = events.find((event) =>
+      event.kind === "workflow.required-action.missed" &&
+      event.data.requestedCapabilityId === "core.test.run" &&
+      event.error?.message.includes("WORKFLOW_BEHAVIOR_REPRODUCTION_REQUIRED")
+    );
+
+    assert.notEqual(publicOnlyMiss, undefined);
+    assert.equal(events.some((event) =>
+      event.kind === "model.tool.intent" &&
+      event.data.toolCallId === "call-hidden-reproduction"
+    ), true);
+    const hiddenReproductionEvents = events.filter((event) =>
+      (event.kind === "model.tool.result" || event.kind === "workflow.required-action.missed") &&
+      (
+        event.data.toolCallId === "call-hidden-reproduction" ||
+        event.data.requestedCapabilityId === "core.shell.run"
+      )
+    );
+    assert.equal(events.some((event) =>
+      event.kind === "model.tool.result" &&
+      event.data.toolCallId === "call-hidden-reproduction" &&
+      event.data.terminalKind === "capability.completed"
+    ), true, JSON.stringify(hiddenReproductionEvents.map((event) => ({
+      kind: event.kind,
+      terminalKind: event.data.terminalKind,
+      requestedCapabilityId: event.data.requestedCapabilityId,
+      error: event.error?.message,
+      result: typeof event.data.result === "string" ? event.data.result : undefined
+    })), null, 2));
+    assert.equal(events.some((event) =>
+      event.kind === "workflow.required-action.missed" &&
+      event.data.requestedCapabilityId === "core.shell.run" &&
+      event.error?.message.includes("WORKFLOW_STANDARD_TEST_REQUIRED")
+    ), false);
+    assert.equal(events.some((event) =>
+      event.kind === "agent.loop.completed" &&
+      event.data.reason === "terminal-tool-completed"
+    ), true);
+    await kernel.shutdown();
+  });
+
+  it("requires a problem reproduction when an official-repair public test selects no tests", async () => {
+    const deps = createDeterministicRuntimeDependencies({ platform: new DeselectedThenSuccessfulTestWithShellFakePlatformRuntime() });
+    const gateway = new SequentialToolCallModelGateway([
+      {
+        id: "call-deselected-public-pytest",
+        name: "core.test.run",
+        input: { command: "python", args: ["-m", "pytest", "astropy/io/ascii/tests/test_write.py", "-k", "rst"] }
+      },
+      {
+        id: "call-required-reproduction",
+        name: "core.shell.run",
+        input: {
+          command: "python -c \"from io import StringIO; print(StringIO('x').read())\"",
+          intent: "reproduce hidden official fail-to-pass behavior"
+        }
+      },
+      {
+        id: "call-public-pytest-after-required-repro",
+        name: "core.test.run",
+        input: { command: "python", args: ["-m", "pytest", "astropy/io/ascii/tests/test_rst.py"] }
+      }
+    ]);
+    const loopDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
+    await registerRuntimeCoreTools(loopDeps, "/run/repo");
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "official repair must reproduce behavior when the selected public test runs nothing",
+      caller: "runtime.official-repair-deselected-reproduction-required.test",
+      workspaceRoot: "/run/repo",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      toolProjection: "safe-all",
+      profilePolicy: supervisorOfficialRepairVerifyPolicy(),
+      limits: { maxModelIterations: 5, maxToolCalls: 6 }
+    }));
+
+    assert.equal(events.some((event) =>
+      event.kind === "workflow.required-action.missed" &&
+      event.data.requestedCapabilityId === "core.test.run" &&
+      event.error?.message.includes("WORKFLOW_BEHAVIOR_REPRODUCTION_REQUIRED")
+    ), true);
+    const reproductionCorrection = JSON.stringify(gateway.requests[1]?.messages ?? []);
+    assert.match(reproductionCorrection, /Current governed checkout root: \/run\/repo/);
+    assert.match(reproductionCorrection, /omit cwd and do not prepend cd/i);
+    assert.equal(events.some((event) =>
+      event.kind === "model.tool.result" &&
+      event.data.toolCallId === "call-required-reproduction" &&
+      event.data.terminalKind === "capability.completed"
+    ), true);
+    assert.equal(events.some((event) =>
+      event.kind === "agent.loop.completed" && event.data.reason === "terminal-tool-completed"
+    ), true);
+    await kernel.shutdown();
+  });
+
+  it("requires initial SWE behavior reproduction before public test-only closure", async () => {
+    const deps = createDeterministicRuntimeDependencies({ platform: new SuccessfulTestWithShellFakePlatformRuntime() });
+    const gateway = new SequentialToolCallModelGateway([
+      {
+        id: "call-initial-public-pytest",
+        name: "core.test.run",
+        input: { command: "python", args: ["-m", "pytest", "tests/test_demo.py"] }
+      },
+      {
+        id: "call-initial-problem-reproduction",
+        name: "core.shell.run",
+        input: {
+          command: "cd /workspace && python -c \"from io import StringIO; print(StringIO('x').read())\"",
+          intent: "reproduce the problem-statement behavior without mutation"
+        }
+      },
+      {
+        id: "call-initial-public-pytest-after-repro",
+        name: "core.test.run",
+        input: { command: "python", args: ["-m", "pytest", "tests/test_demo.py"] }
+      }
+    ]);
+    const loopDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
+    await registerRuntimeCoreTools(loopDeps, "/workspace");
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+    const events = await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "verify the initial SWE behavior contract before public-test closure",
+      caller: "runtime.initial-swe-behavior-reproduction.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      toolProjection: "safe-all",
+      profilePolicy: supervisorInitialBehaviorContractVerifyPolicy(),
+      limits: { maxModelIterations: 5, maxToolCalls: 6 }
+    }));
+
+    const publicOnlyMiss = events.find((event) =>
+      event.kind === "workflow.required-action.missed" &&
+      event.data.requestedCapabilityId === "core.test.run" &&
+      event.error?.message.includes("WORKFLOW_BEHAVIOR_REPRODUCTION_REQUIRED")
+    );
+    assert.notEqual(publicOnlyMiss, undefined);
+    assert.equal(events.some((event) =>
+      event.kind === "model.tool.result" &&
+      event.data.toolCallId === "call-initial-problem-reproduction" &&
+      event.data.terminalKind === "capability.completed"
+    ), true);
+    assert.equal(events.some((event) =>
+      event.kind === "agent.loop.completed" && event.data.reason === "terminal-tool-completed"
+    ), true);
+    await kernel.shutdown();
+  });
+
+  it("uses targeted correction when failed-test repair keeps reading after refresh budget", async () => {
+    const deps = createDeterministicRuntimeDependencies();
+    await deps.platform.writeFile("/workspace/README.md", "stage evidence\n");
+    const gateway = new SequentialToolCallModelGateway([
+      { id: "call-stale-read", name: "core.file.read", input: { path: "README.md" } },
+      { id: "call-edit", name: "core.file.edit", input: { path: "README.md", expected: "stage evidence", replacement: "changed evidence" } }
+    ]);
+    const loopDeps = { ...deps, models: gateway, policy: new AllowAllPolicyEngine() };
+    await registerRuntimeCoreTools(loopDeps, "/workspace");
+    const kernel = await createDefaultRuntimeKernel(loopDeps);
+    await collectRuntimeEvents(runAgentLoop(loopDeps, kernel, {
+      prompt: "repair after failed test refresh budget",
+      caller: "runtime.standard-test-repair-action-required.test",
+      workspaceRoot: "/workspace",
+      outputMode: "jsonl",
+      profile: defaultDeepSeekProfile,
+      toolProjection: "safe-all",
+      profilePolicy: {
+        ...supervisorReadyVerifyPolicy(),
+        workflowCapabilityIds: [
+          "core.file.read",
+          "core.search.text",
+          "core.file.edit",
+          "core.patch.apply",
+          "core.test.run"
+        ],
+        workflowGateOverride: {
+          gate: "runtime-convergence" as const,
+          requiredNextAction: "core.file.edit|core.patch.apply|core.test.run",
+          rejectedCapabilityId: "core.search.text",
+          rejectedToolName: "core.search.text",
+          terminalKind: "workflow-standard-test-repair.refreshed",
+          toolCallId: "call-refresh-limit"
+        }
+      },
+      limits: { maxModelIterations: 3, maxToolCalls: 4 }
+    }));
+
+    const feedbackText = (gateway.requests[1]?.messages ?? [])
+      .map((message) => String(message.content ?? ""))
+      .join("\n");
+
+    assert.match(feedbackText, /WORKFLOW_STANDARD_TEST_REPAIR_ACTION_REQUIRED/);
+    assert.match(feedbackText, /core_file_edit/);
+    assert.equal(await deps.platform.readFile("/workspace/README.md"), "changed evidence\n");
     await kernel.shutdown();
   });
 
@@ -3891,6 +4753,188 @@ function supervisorReadyVerifyPolicy(): AgentLoopProfilePolicyMetadata {
   };
 }
 
+function supervisorOfficialRepairChangePolicy(): AgentLoopProfilePolicyMetadata {
+  const policy = supervisorReadChangeVerifyPolicy();
+  const workflow = policy.stagedTaskWorkflow;
+  if (!workflow) return policy;
+  const diagnosticRef: StagedTaskRef = {
+    schemaVersion: STAGED_TASK_SCHEMA_VERSION,
+    refId: "ref:runner:official-repair-feedback",
+    type: "diagnostic" as const,
+    producerStageId: "stage:understand",
+    scope: "task" as const,
+    metadata: { failingTestCount: 1 },
+    compatibility: STAGED_TASK_COMPATIBILITY,
+    redaction: { class: "internal" as const, fields: ["metadata"] }
+  };
+  return {
+    ...policy,
+    workflowGovernanceMode: "evaluation",
+    workflowCapabilityIds: ["core.file.read", "core.search.text", "core.file.edit", "core.patch.apply", "core.test.run", "core.git.diff"],
+    stagedTaskWorkflow: {
+      ...workflow,
+      graph: {
+        ...workflow.graph,
+        stages: workflow.graph.stages.map((stage) =>
+          stage.stageId === "stage:change"
+            ? { ...stage, allowedTools: ["core.file.read", "core.search.text", "core.file.edit", "core.patch.apply"] }
+            : stage
+        )
+      },
+      runState: {
+        ...workflow.runState,
+        refs: [
+          ...(workflow.runState.refs ?? []),
+          {
+            schemaVersion: STAGED_TASK_SCHEMA_VERSION,
+            refId: "ref:understand",
+            type: "evidence" as const,
+            producerStageId: "stage:understand",
+            scope: "task" as const,
+            compatibility: STAGED_TASK_COMPATIBILITY,
+            redaction: { class: "internal" as const }
+          },
+          diagnosticRef
+        ],
+        stageStates: workflow.runState.stageStates.map((stage) => {
+          if (stage.stageId === "stage:understand") {
+            return {
+              ...stage,
+              status: "succeeded" as const,
+              outputRefs: ["ref:understand"],
+              evaluation: {
+                schemaVersion: "1.0.0" as const,
+                evaluationId: "evaluation:stage:understand:test-passed",
+                stageId: "stage:understand",
+                evaluatorId: "runtime:test",
+                status: "passed" as const,
+                score: 1,
+                reason: "Prior evidence stage accepted before official repair.",
+                evidenceRefs: ["ref:understand"],
+                evaluatedAt: "2026-07-08T00:00:00.000Z",
+                compatibility: { schemaVersion: "1.0.0", minReaderVersion: "1.0.0" },
+                redaction: { class: "internal" as const }
+              }
+            };
+          }
+          if (stage.stageId === "stage:change") {
+            return {
+              ...stage,
+              status: "ready" as const,
+              inputRefs: ["ref:understand", diagnosticRef.refId],
+              outputRefs: []
+            };
+          }
+          return stage;
+        })
+      }
+    }
+  };
+}
+
+function supervisorOfficialRepairVerifyPolicy(): AgentLoopProfilePolicyMetadata {
+  const policy = supervisorReadChangeVerifyPolicy();
+  const workflow = policy.stagedTaskWorkflow;
+  if (!workflow) return policy;
+  const diagnosticRef: StagedTaskRef = {
+    schemaVersion: STAGED_TASK_SCHEMA_VERSION,
+    refId: "ref:runner:official-repair-feedback",
+    type: "diagnostic" as const,
+    producerStageId: "stage:understand",
+    scope: "task" as const,
+    metadata: { failingTestCount: 1, failureExcerptCount: 1 },
+    compatibility: STAGED_TASK_COMPATIBILITY,
+    redaction: { class: "internal" as const, fields: ["metadata"] }
+  };
+  return {
+    ...policy,
+    workflowGovernanceMode: "evaluation",
+    workflowCapabilityIds: ["core.file.read", "core.search.text", "core.file.edit", "core.patch.apply", "core.test.run", "core.shell.run", "core.git.diff"],
+    stagedTaskWorkflow: {
+      ...workflow,
+      graph: {
+        ...workflow.graph,
+        stages: workflow.graph.stages.map((stage) =>
+          stage.stageId === "stage:verify"
+            ? { ...stage, allowedTools: [...(stage.allowedTools ?? []), "core.shell.run"] }
+            : stage
+        )
+      },
+      runState: {
+        ...workflow.runState,
+        refs: [
+          ...(workflow.runState.refs ?? []),
+          {
+            schemaVersion: "1.0.0" as const,
+            refId: "ref:patch",
+            type: "artifact" as const,
+            producerStageId: "stage:change",
+            scope: "task" as const,
+            compatibility: STAGED_TASK_COMPATIBILITY,
+            redaction: { class: "internal" as const }
+          },
+          diagnosticRef
+        ],
+        stageStates: workflow.runState.stageStates.map((stage) => {
+          if (stage.stageId === "stage:understand" || stage.stageId === "stage:change") {
+            return {
+              ...stage,
+              status: "succeeded" as const,
+              outputRefs: stage.stageId === "stage:change" ? ["ref:patch"] : ["ref:understand"]
+            };
+          }
+          if (stage.stageId === "stage:verify") {
+            return {
+              ...stage,
+              status: "ready" as const,
+              inputRefs: ["ref:patch", diagnosticRef.refId],
+              outputRefs: []
+            };
+          }
+          return stage;
+        })
+      }
+    }
+  };
+}
+
+function supervisorInitialBehaviorContractVerifyPolicy(): AgentLoopProfilePolicyMetadata {
+  const policy = supervisorOfficialRepairVerifyPolicy();
+  const workflow = policy.stagedTaskWorkflow;
+  if (!workflow) return policy;
+  const behaviorRef: StagedTaskRef = {
+    schemaVersion: STAGED_TASK_SCHEMA_VERSION,
+    refId: "ref:runner:problem-behavior-contract",
+    type: "diagnostic",
+    producerStageId: "stage:understand",
+    scope: "task",
+    metadata: { source: "problem-statement", reproductionRequired: true },
+    compatibility: STAGED_TASK_COMPATIBILITY,
+    redaction: { class: "internal", fields: ["metadata"] }
+  };
+  return {
+    ...policy,
+    stagedTaskWorkflow: {
+      ...workflow,
+      runState: {
+        ...workflow.runState,
+        refs: [
+          ...(workflow.runState.refs ?? []).filter((ref) =>
+            ref.refId !== "ref:runner:official-repair-feedback"
+          ),
+          behaviorRef
+        ],
+        stageStates: workflow.runState.stageStates.map((stage) => ({
+          ...stage,
+          inputRefs: stage.inputRefs.map((refId) =>
+            refId === "ref:runner:official-repair-feedback" ? behaviorRef.refId : refId
+          )
+        }))
+      }
+    }
+  };
+}
+
 function supervisorReadyVerifyThenScorePolicy(): AgentLoopProfilePolicyMetadata {
   const policy = supervisorReadyVerifyPolicy();
   const workflow = policy.stagedTaskWorkflow;
@@ -4203,6 +5247,34 @@ class SequentialToolCallModelGateway implements ModelGateway {
   }
 }
 
+class BatchedToolCallModelGateway implements ModelGateway {
+  readonly requests: ModelRequest[] = [];
+  private index = 0;
+
+  constructor(private readonly batches: readonly (readonly { readonly id: string; readonly name: string; readonly input: JsonObject }[])[]) {}
+
+  async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    this.requests.push(request);
+    const batch = this.batches[this.index] ?? [];
+    this.index += 1;
+    if (batch.length > 0) {
+      for (const call of batch) {
+        yield { kind: "tool-call", id: call.id, name: call.name, input: call.input };
+      }
+      yield { kind: "finish", reason: "tool-call" };
+      yield { kind: "done" };
+      return;
+    }
+    yield { kind: "delta", text: "done" };
+    yield { kind: "finish", reason: "stop" };
+    yield { kind: "done" };
+  }
+
+  async countTokens(text: string): Promise<number> {
+    return text.trim() ? text.trim().split(/\s+/).length : 0;
+  }
+}
+
 function providerToolNames(request: ModelRequest | undefined): readonly string[] {
   return (request?.tools ?? [])
     .map((tool) => {
@@ -4239,6 +5311,36 @@ class FailedTestFakePlatformRuntime extends FakePlatformRuntime {
   }
 }
 
+class FailingThenSuccessfulTestFakePlatformRuntime extends FakePlatformRuntime {
+  private pytestRuns = 0;
+
+  override async runProcess(command: string, args: readonly string[], options: ProcessRunOptions = {}, observer?: ProcessRunObserver): Promise<ProcessResult> {
+    if (isFakePytestInvocation(command, args)) {
+      this.pytestRuns += 1;
+      const exitCode = this.pytestRuns === 1 ? 1 : 0;
+      const stdout = exitCode === 0
+        ? "PASSED tests/test_demo.py::test_expected_fix"
+        : "FAILED tests/test_demo.py::test_expected_fix";
+      observer?.onStdoutChunk?.(stdout);
+      observer?.onProcessExit?.();
+      return {
+        exitCode,
+        stdout,
+        stderr: "",
+        metadata: {
+          selectedProvider: "argv",
+          status: "available",
+          fallbackChain: [],
+          degradedReasons: [],
+          diagnostics: [],
+          redaction: { class: "internal" }
+        }
+      };
+    }
+    return super.runProcess(command, args, options, observer);
+  }
+}
+
 class SuccessfulTestFakePlatformRuntime extends FakePlatformRuntime {
   override async runProcess(command: string, args: readonly string[], options: ProcessRunOptions = {}, observer?: ProcessRunObserver): Promise<ProcessResult> {
     const commandLine = [command, ...args].join(" ").toLowerCase();
@@ -4259,6 +5361,54 @@ class SuccessfulTestFakePlatformRuntime extends FakePlatformRuntime {
           redaction: { class: "internal" }
         }
       };
+    }
+    return super.runProcess(command, args, options, observer);
+  }
+}
+
+class SuccessfulTestWithShellFakePlatformRuntime extends SuccessfulTestFakePlatformRuntime {
+  override async resolveShell(): Promise<SerializableResult<ShellProviderDescriptor>> {
+    return {
+      ok: true,
+      value: {
+        profile: "sh",
+        provider: "bash",
+        available: true,
+        status: "available",
+        command: "sh",
+        args: ["-lc"],
+        requiresShellSyntax: true,
+        diagnostics: [],
+        redaction: { class: "public" }
+      }
+    };
+  }
+}
+
+class DeselectedThenSuccessfulTestWithShellFakePlatformRuntime extends SuccessfulTestWithShellFakePlatformRuntime {
+  private pytestRuns = 0;
+
+  override async runProcess(command: string, args: readonly string[], options: ProcessRunOptions = {}, observer?: ProcessRunObserver): Promise<ProcessResult> {
+    if (isFakePytestInvocation(command, args)) {
+      this.pytestRuns += 1;
+      if (this.pytestRuns === 1) {
+        const stdout = "\u001b[33m\u001b[1m158 deselected\u001b[0m\u001b[33m in 0.09s\u001b[0m";
+        observer?.onStdoutChunk?.(stdout);
+        observer?.onProcessExit?.();
+        return {
+          exitCode: 5,
+          stdout,
+          stderr: "",
+          metadata: {
+            selectedProvider: "argv",
+            status: "available",
+            fallbackChain: [],
+            degradedReasons: [],
+            diagnostics: [],
+            redaction: { class: "internal" }
+          }
+        };
+      }
     }
     return super.runProcess(command, args, options, observer);
   }
