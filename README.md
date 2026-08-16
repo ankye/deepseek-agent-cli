@@ -21,6 +21,12 @@ DeepSeek CLI 是面向 Coding Agent 的本地工程运行时。它用同一个 r
 
 它不是把模型简单接到命令行；它是一个 contract-first 的 TypeScript 平台框架。CLI、TUI、VSCode 和未来 Server/SDK 都应该是 thin host adapter，共享同一套协议、运行时、能力模型和事件流。
 
+## 官方项目说明
+
+如果你要直接使用 DeepSeek 官方持续维护的 Agent 产品和运行时，请前往 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)。它是 DeepSeek AI 官方的开源 agent harness，提供 `dsh` CLI、Web UI、headless profile、插件组合、沙箱、会话持久化、ACP、TypeScript SDK 和 Python SDK。
+
+本仓库是独立的架构研究与实验项目，不是 `deepseek-harness` 的源码镜像，也不是官方产品的替代品。它保留了 terminal-first Workbench、evidence-first 诊断、SWE-bench 治理和 contract-first runtime 等设计探索，适合阅读、对比和二次实验；新用户不需要同时维护两套 Agent runtime。需要在官方 runtime 上定制时，优先将独有能力实现为 Harness 插件，或通过 ACP/JSON-RPC 做薄适配层。
+
 ---
 
 ## 为什么需要它
